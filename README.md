@@ -8,8 +8,6 @@ Corre dos hilos en paralelo:
 - **Hilo Generador**: cada `INTERVALO_GENERACION_SEG` segundos (60s por defecto) revisa si hay comprobantes por enviar.
 - **Hilo CDR**: monitorea en tiempo real la carpeta `RPTA` y procesa el ZIP en cuanto SUNAT responde.
 
-Ver [DOCUMENTACION.md](DOCUMENTACION.md) para el detalle línea por línea de `main.py`.
-
 ## Requisitos
 
 - Python 3.10+
