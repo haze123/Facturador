@@ -1,0 +1,36 @@
+module.exports = {
+  apps: [
+    {
+      name: "facturador",
+      script: "main.py",
+      interpreter: "python",
+      cwd: "C:\\FacturadorDaemon",
+      watch: false,
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 10,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        PYTHONIOENCODING: "utf-8",
+      },
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/error.log",
+      out_file: "logs/out.log",
+      merge_logs: true,
+    },
+    {
+      name: "sofia",
+      script: "node_modules/next/dist/bin/next",
+      args: "start",
+      cwd: "C:\\SOFIA\\sofia-front-local",
+      watch: false,
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 10,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/sofia-error.log",
+      out_file: "logs/sofia-out.log",
+      merge_logs: true,
+    },
+  ],
+};
