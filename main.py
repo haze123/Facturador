@@ -1,6 +1,6 @@
 """
 main.py — Daemon de Facturación Electrónica SUNAT (SFS v2.1)
-Gestionar con PM2: pm2 start ecosystem.config.js
+Gestionar con PM2: pm2 start sfs.config.js --only facturador
 
 Hilos:
   - Hilo Generador : cada INTERVALO_GENERACION_SEG segundos lee SQL Server,
@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import sqlite3
+import struct
 import sys
 import threading
 import time
@@ -20,7 +21,8 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import pyodbc
@@ -62,8 +64,31 @@ EMISOR_RUC_OVERRIDE = os.getenv("EMISOR_RUC", "").strip()
 
 # Estados SFS que se reintentan
 _ESTADOS_ERROR = ("05", "10")
-# Tipos soportados por SFS
-_TIPOS_SFS = {"01", "03", "07", "08", "RC", "RA"}
+# Tipos que el daemon envía hoy: factura, boleta y nota de crédito.
+# 08 (nota de débito), RC (resumen diario) y RA (comunicación de baja) quedan fuera
+# a propósito: por ahora no se emiten desde acá.
+_TIPOS_SFS = {"01", "03", "07"}
+
+# Un mismo documento no se reintenta antes de este lapso. Solo evita llamadas
+# repetidas dentro del mismo ciclo: debe ser MENOR al intervalo de generación para
+# que el ciclo siguiente pueda avanzar un documento que quedó a medio procesar.
+# El reenvío queda acotado por el estado, no por el tiempo: _activar_pendientes_sfs_bd()
+# solo mira IND_SITU '01'/'02' (aún sin enviar), y al pasar a '04'/'06' dejan de reintentarse.
+_COOLDOWN_REENVIO_SEG = 45
+_ultimo_intento: dict = {}
+
+# Estados de la columna Comprobantes.enviado.
+# Es un BIT: solo admite 0/1 (SQL Server convierte cualquier no-cero a 1), así que
+# NO sirve para un estado intermedio. El "entregado al SFS, esperando CDR" se
+# deduce de la BD del SFS — ver _docs_en_vuelo().
+ENVIADO_PENDIENTE = 0   # por generar / reintentar
+ENVIADO_ACEPTADO  = 1   # SUNAT devolvió un CDR de aceptación
+
+# Estados de CDR que dan por buena la emisión (SUNAT acepta con y sin observaciones)
+_CDR_ACEPTADOS = {"ACEPTADO", "OBSERVADO"}
+
+# Código ODBC de DATETIMEOFFSET: pyodbc no lo mapea solo (ver _handle_datetimeoffset)
+_SQL_DATETIMEOFFSET = -155
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -126,12 +151,26 @@ def _mover(ruta: str, carpeta: str):
 # Base de datos — SQL Server
 # ---------------------------------------------------------------------------
 
+def _handle_datetimeoffset(valor: bytes) -> datetime:
+    """
+    pyodbc no sabe convertir DATETIMEOFFSET y lo entrega crudo; sin este converter
+    cualquier SELECT que toque una columna de ese tipo revienta con HY106.
+    """
+    anio, mes, dia, hora, minu, seg, nanos, off_h, off_m = struct.unpack("<6hI2h", valor)
+    return datetime(
+        anio, mes, dia, hora, minu, seg, nanos // 1000,
+        timezone(timedelta(hours=off_h, minutes=off_m)),
+    )
+
+
 def conectar_bd():
     conn_str = (
         f"DRIVER={DB_CONFIG['driver']};SERVER={DB_CONFIG['server']};"
         f"DATABASE={DB_CONFIG['database']};Trusted_Connection={DB_CONFIG['trusted_connection']};"
     )
-    return pyodbc.connect(conn_str, timeout=DB_CONFIG["timeout"])
+    conn = pyodbc.connect(conn_str, timeout=DB_CONFIG["timeout"])
+    conn.add_output_converter(_SQL_DATETIMEOFFSET, _handle_datetimeoffset)
+    return conn
 
 
 def _fila_dict(cur, fila):
@@ -180,16 +219,12 @@ def _nombre_base(ruc: str, tipo: str, num: str) -> str:
 def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     comp_id   = comp["id"]
     num_comp  = str(comp.get("numeracion_comprobante", "")).strip()
-    tipo_comp = str(comp.get("tipo_comprobante", "")).strip() or "01"
+    # zfill(2) para que el nombre de archivo coincida con el tip_docu que se manda al SFS
+    tipo_comp = (str(comp.get("tipo_comprobante", "")).strip() or "01").zfill(2)
 
     base  = _nombre_base(ruc_emisor, tipo_comp, num_comp)
     os.makedirs(SFS_DATA_DIR, exist_ok=True)
     rutas = {e: os.path.join(SFS_DATA_DIR, f"{base}.{e}") for e in ("cab", "det", "tri", "ley", "PAG")}
-
-    enviado = comp.get("enviado")
-    faltan  = any(not os.path.exists(rutas[e]) for e in ("cab", "det", "tri", "ley"))
-    if not (enviado is None or enviado == 0 or faltan):
-        return False
 
     receptor     = obtener_receptor(conn, comp.get("ReceptorId"))
     tipo_doc_rec = str(receptor.get("tipo_documento",   "0")).strip() or "0"
@@ -246,8 +281,9 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     elif os.path.exists(rutas["det"]):
         os.remove(rutas["det"])
 
-    conn.cursor().execute("UPDATE Comprobantes SET enviado = 1 WHERE id = ?", (int(comp_id),))
-    conn.commit()
+    # OJO: no se toca Comprobantes.enviado acá. Generar los archivos no es haber
+    # enviado nada; el estado lo mueve ciclo_generacion() recién cuando el SFS
+    # confirma la recepción, y lo cierra el CDR de SUNAT.
     logger.info("Archivos SFS generados: %s", num_comp)
     return True
 
@@ -274,40 +310,94 @@ def _sfs_post(path: str, payload: dict):
         return None
 
 
-def activar_procesamiento_sfs(documentos: list):
+def _resumen_sfs(r) -> str:
+    """
+    Respuesta del SFS en una línea. Sin esto, un solo fallo vuelca al log toda la
+    bandeja (listaBandejaFacturador), que son decenas de miles de caracteres.
+    """
+    if not isinstance(r, dict):
+        return repr(r)
+    partes = [f"{k}={r[k]!r}" for k in ("validacion", "mensaje") if r.get(k)]
+    for clave, valor in r.items():
+        if isinstance(valor, list):
+            partes.append(f"{clave}=[{len(valor)} items]")
+    return ", ".join(partes) or repr(r)
+
+
+def _xml_generado(ruc: str, tip: str, num: str) -> bool:
+    """True si el SFS ya generó el XML del documento (FEC_GENE con valor)."""
+    if not os.path.exists(SFS_BD_PATH):
+        return True  # sin BD del SFS no se puede comprobar; no bloquear el envío
+    try:
+        with closing(sqlite3.connect(SFS_BD_PATH)) as sfs:
+            fila = sfs.execute(
+                "SELECT FEC_GENE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=?",
+                (ruc, tip, num),
+            ).fetchone()
+        return bool(fila and fila[0])
+    except sqlite3.Error:
+        return True
+
+
+def activar_procesamiento_sfs(documentos: list) -> list:
+    """Envía los documentos al SFS local. Devuelve solo los que el SFS aceptó."""
     if not documentos:
-        return
+        return []
     try:
         urllib.request.urlopen(f"{SFS_BASE_URL}/", timeout=3)
     except Exception:
         logger.warning("SFS no responde — envío automático desactivado.")
-        return
+        return []
 
+    enviados = []
+    ahora    = time.monotonic()
     for doc in documentos:
         tip   = str(doc.get("tip_docu", "")).strip()
-        label = f"{tip}-{doc['num_docu']}"
+        num   = str(doc.get("num_docu", "")).strip()
+        label = f"{tip}-{num}"
         if tip not in _TIPOS_SFS:
-            logger.info("[SFS] Tipo %s no soportado, omitido: %s", tip, label)
+            logger.info("[SFS] Tipo %s fuera de alcance, omitido: %s", tip, label)
             continue
+
+        previo = _ultimo_intento.get((tip, num))
+        if previo is not None and ahora - previo < _COOLDOWN_REENVIO_SEG:
+            continue
+        _ultimo_intento[(tip, num)] = ahora
+
         payload = {k: doc[k] for k in ("num_ruc", "tip_docu", "num_docu")}
 
         r1 = _sfs_post("api/GenerarComprobante.htm", payload)
         if not (r1 and r1.get("validacion") == "EXITO"):
-            logger.warning("[SFS] Error al generar XML para %s: %s", label, r1)
+            logger.warning("[SFS] Error al generar XML para %s: %s", label, _resumen_sfs(r1))
             continue
 
         time.sleep(2)
+        # El SFS trabaja en dos pasadas: la 1ra solo registra el archivo de DATA en
+        # su bandeja (IND_SITU='01'); recién la 2da genera el XML ('02'). Sin este
+        # segundo llamado, enviarXML responde "No existen datos que procesar".
+        if not _xml_generado(doc.get("num_ruc", ""), tip, num):
+            _sfs_post("api/GenerarComprobante.htm", payload)
+            time.sleep(2)
+
         r2 = _sfs_post("api/enviarXML.htm", payload)
-        if r2 and r2.get("validacion") == "EXITO":
-            logger.info("[SFS] Enviado a SUNAT: %s", label)
-        else:
+        if not (r2 and r2.get("validacion") == "EXITO"):
             time.sleep(3)
             r2 = _sfs_post("api/enviarXML.htm", payload)
-            if r2 and r2.get("validacion") == "EXITO":
-                logger.info("[SFS] Enviado a SUNAT (reintento): %s", label)
-            else:
-                logger.warning("[SFS] Error al enviar %s: %s", label, r2)
+
+        # OJO: "EXITO" solo dice que el SFS aceptó el pedido. NO garantiza que
+        # SUNAT lo haya recibido — el SFS puede dejarlo en IND_SITU='06' (p.ej.
+        # boletas de más de 5 días, que exigen resumen diario). Lo confirma el CDR.
+        if r2 and r2.get("validacion") == "EXITO":
+            logger.info("[SFS] Entregado al SFS: %s", label)
+            enviados.append(doc)
+        elif "no existen datos" in str((r2 or {}).get("mensaje", "")).lower():
+            # Primera pasada: el SFS aún no generó el XML. Es el flujo normal,
+            # no un error — el próximo ciclo lo retoma desde IND_SITU='01'.
+            logger.info("[SFS] %s aún sin XML; se completa en el próximo ciclo.", label)
+        else:
+            logger.warning("[SFS] Error al entregar %s: %s", label, _resumen_sfs(r2))
         time.sleep(1)
+    return enviados
 
 # ---------------------------------------------------------------------------
 # SFS BD SQLite — gestión de estados
@@ -317,7 +407,8 @@ def _registrar_en_sfs_bd(ruc_emisor: str, docs: list):
     if not os.path.exists(SFS_BD_PATH):
         return
     time.sleep(2)
-    with sqlite3.connect(SFS_BD_PATH) as sfs:
+    # closing() porque el context manager de sqlite3 hace commit/rollback pero NO cierra
+    with closing(sqlite3.connect(SFS_BD_PATH)) as sfs, sfs:
         for doc in docs:
             tip = str(doc.get("tip_docu", "")).strip()
             if tip not in _TIPOS_SFS:
@@ -329,10 +420,11 @@ def _registrar_en_sfs_bd(ruc_emisor: str, docs: list):
                 (ruc_emisor, tip, num),
             ).fetchone()
             if not existe:
+                # Estado pendiente, no '03'/aceptado: SUNAT todavía no respondió.
                 sfs.execute(
                     "INSERT INTO DOCUMENTO (NUM_RUC, TIP_DOCU, NUM_DOCU, NOM_ARCH, IND_SITU, DES_OBSE) "
                     "VALUES (?,?,?,?,?,?)",
-                    (ruc_emisor, tip, num, arch, "03", "Aceptado por SUNAT"),
+                    (ruc_emisor, tip, num, arch, "01", "Enviado al SFS, esperando CDR"),
                 )
 
 
@@ -355,11 +447,13 @@ def _activar_pendientes_sfs_bd(ruc_emisor: str, ya_procesados: list):
     if not os.path.exists(SFS_BD_PATH):
         return
     ya_keys = {(d["tip_docu"], d["num_docu"]) for d in ya_procesados}
-    with sqlite3.connect(SFS_BD_PATH) as sfs:
+    with closing(sqlite3.connect(SFS_BD_PATH)) as sfs, sfs:
+        tipos = sorted(_TIPOS_SFS)
         rows = sfs.execute(
             "SELECT TIP_DOCU, NUM_DOCU, NOM_ARCH FROM DOCUMENTO "
-            "WHERE NUM_RUC=? AND TIP_DOCU IN ('01','03','07','08') AND IND_SITU IN ('01','02')",
-            (ruc_emisor,),
+            f"WHERE NUM_RUC=? AND TIP_DOCU IN ({','.join('?' * len(tipos))}) "
+            "AND IND_SITU IN ('01','02')",
+            (ruc_emisor, *tipos),
         ).fetchall()
         docs_extra = []
         for tip, num, nom_arch in rows:
@@ -379,10 +473,32 @@ def _activar_pendientes_sfs_bd(ruc_emisor: str, ya_procesados: list):
         activar_procesamiento_sfs(docs_extra)
 
 
+def _docs_en_vuelo(ruc_emisor: str) -> set:
+    """
+    (tip_docu, num_docu) que el SFS ya tiene registrados y por lo tanto están
+    entregados o en proceso. Se usa para no reenviar a SUNAT un comprobante que
+    sigue en enviado=0 solo porque su CDR todavía no llegó.
+    """
+    if not os.path.exists(SFS_BD_PATH):
+        return set()
+    try:
+        with closing(sqlite3.connect(SFS_BD_PATH)) as sfs:
+            return {
+                (str(t).strip(), str(n).strip())
+                for t, n in sfs.execute(
+                    "SELECT TIP_DOCU, NUM_DOCU FROM DOCUMENTO WHERE NUM_RUC=?",
+                    (ruc_emisor,),
+                )
+            }
+    except sqlite3.Error:
+        logger.exception("No se pudo leer la BD del SFS; se omite el filtro de duplicados.")
+        return set()
+
+
 def resetear_rechazados(conn, ruc_emisor: str):
     if not os.path.exists(SFS_BD_PATH):
         return
-    with sqlite3.connect(SFS_BD_PATH) as sfs:
+    with closing(sqlite3.connect(SFS_BD_PATH)) as sfs, sfs:
         rows = sfs.execute(
             "SELECT NUM_DOCU, TIP_DOCU FROM DOCUMENTO WHERE NUM_RUC=? AND IND_SITU IN (?,?)",
             (ruc_emisor, *_ESTADOS_ERROR),
@@ -392,8 +508,8 @@ def resetear_rechazados(conn, ruc_emisor: str):
         cur = conn.cursor()
         for num_docu, tip_docu in rows:
             cur.execute(
-                "UPDATE Comprobantes SET enviado=0 WHERE numeracion_comprobante=? AND tipo_comprobante=?",
-                (num_docu, tip_docu),
+                "UPDATE Comprobantes SET enviado=? WHERE numeracion_comprobante=? AND tipo_comprobante=?",
+                (ENVIADO_PENDIENTE, num_docu, tip_docu),
             )
         sfs.execute(
             "DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND IND_SITU IN (?,?)",
@@ -453,13 +569,19 @@ def parsear_xml_cdr(fuente) -> dict:
         if not res["numeracion"] and isinstance(fuente, str):
             res["numeracion"] = _extraer_numeracion(os.path.basename(fuente))
 
-        codigo = (res["codigo"]      or "").lower()
+        codigo = (res["codigo"]      or "").strip()
         desc   = (res["descripcion"] or "").lower()
-        if "acept" in desc or codigo in {"0", "01", "0000"}:
+        # El ResponseCode manda: SUNAT solo devuelve 0 cuando acepta. Cualquier
+        # otro código es rechazo, aunque la descripción no diga "rechazado".
+        if codigo:
+            res["status"] = "ACEPTADO" if codigo.strip("0") == "" else "RECHAZADO"
+        elif "acept" in desc:
             res["status"] = "ACEPTADO"
         elif "rechaz" in desc or "error" in desc or "no autorizado" in desc:
             res["status"] = "RECHAZADO"
-        elif "observ" in desc:
+
+        # Aceptada con observaciones sigue siendo aceptada (ver _CDR_ACEPTADOS)
+        if res["status"] == "ACEPTADO" and "observ" in desc:
             res["status"] = "OBSERVADO"
 
     except Exception:
@@ -469,13 +591,13 @@ def parsear_xml_cdr(fuente) -> dict:
 
 
 def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
-    if not numeracion or parsed["status"] != "ACEPTADO":
+    if not numeracion or parsed["status"] not in _CDR_ACEPTADOS:
         return False
     try:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE Comprobantes SET enviado = 1 WHERE numeracion_comprobante = ?",
-            (numeracion,),
+            "UPDATE Comprobantes SET enviado = ? WHERE numeracion_comprobante = ?",
+            (ENVIADO_ACEPTADO, numeracion),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -517,9 +639,19 @@ def procesar_respuestas():
                 num = parsed["numeracion"]
                 logger.info("CDR %s | %s [%s]", nombre, num, parsed["status"])
 
-                if _actualizar_sql_cdr(conn, num, parsed):
-                    ok += 1
-                _mover(ruta, DIR_PROCESADOS)
+                if parsed["status"] in _CDR_ACEPTADOS:
+                    if _actualizar_sql_cdr(conn, num, parsed):
+                        ok += 1
+                    _mover(ruta, DIR_PROCESADOS)
+                else:
+                    # Un rechazo no se archiva como procesado: queda en errores/
+                    # para revisión manual y el comprobante NO pasa a aceptado.
+                    logger.error(
+                        "CDR %s de %s (%s) — código %s: %s",
+                        parsed["status"], num, nombre, parsed["codigo"], parsed["descripcion"],
+                    )
+                    _mover(ruta, DIR_ERRORES)
+                    err += 1
 
             except zipfile.BadZipFile:
                 logger.warning("ZIP corrupto: %s", nombre)
@@ -554,22 +686,53 @@ def ciclo_generacion():
 
         comprobantes = obtener_comprobantes_pendientes(conn)
         logger.info("%d comprobante(s) pendiente(s).", len(comprobantes))
+
+        en_vuelo = _docs_en_vuelo(ruc_emisor)
         docs_generados = []
+        omitidos = fuera_alcance = 0
         for comp in comprobantes:
             try:
+                tip = (str(comp.get("tipo_comprobante", "")).strip() or "01").zfill(2)
+                num = str(comp.get("numeracion_comprobante", "")).strip()
+                # Fuera de alcance: se descarta acá para no regenerar sus archivos
+                # en cada ciclo, ya que nunca van a entrar al SFS.
+                if tip not in _TIPOS_SFS:
+                    fuera_alcance += 1
+                    continue
+                # Sigue en enviado=0 pero el SFS ya lo tiene: esperando CDR, no reenviar.
+                if (tip, num) in en_vuelo:
+                    omitidos += 1
+                    continue
                 if procesar_comprobante(conn, comp, ruc_emisor):
                     docs_generados.append({
                         "num_ruc":  ruc_emisor,
-                        "tip_docu": str(comp.get("tipo_comprobante", "")).strip().zfill(2),
-                        "num_docu": str(comp.get("numeracion_comprobante", "")).strip(),
+                        "tip_docu": tip,
+                        "num_docu": num,
                     })
             except Exception:
                 logger.exception("Error procesando %r", comp.get("numeracion_comprobante"))
 
+        if fuera_alcance:
+            logger.info(
+                "%d comprobante(s) de tipo fuera de alcance (solo se emiten %s).",
+                fuera_alcance, ", ".join(sorted(_TIPOS_SFS)),
+            )
+        if omitidos:
+            logger.info("%d comprobante(s) ya entregados al SFS, esperando CDR.", omitidos)
+
         if docs_generados:
-            logger.info("%d comprobante(s) generados, enviando al SFS...", len(docs_generados))
-            activar_procesamiento_sfs(docs_generados)
-            _registrar_en_sfs_bd(ruc_emisor, docs_generados)
+            logger.info("%d comprobante(s) generados, entregando al SFS...", len(docs_generados))
+            # Solo se registra lo que el SFS confirmó; lo demás sigue en enviado=0
+            # y se reintenta en el próximo ciclo.
+            enviados = activar_procesamiento_sfs(docs_generados)
+            _registrar_en_sfs_bd(ruc_emisor, enviados)
+
+            no_enviados = len(docs_generados) - len(enviados)
+            if no_enviados:
+                logger.warning(
+                    "%d comprobante(s) no llegaron al SFS; se reintentan en el próximo ciclo.",
+                    no_enviados,
+                )
 
         _activar_pendientes_sfs_bd(ruc_emisor, docs_generados)
 
@@ -614,12 +777,9 @@ def hilo_cdr():
     observer.schedule(handler, path=SFS_RPTA_DIR, recursive=False)
     observer.start()
 
-    try:
-        while True:
-            time.sleep(10)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+    # Sin try/except KeyboardInterrupt: Python solo lo entrega al hilo principal.
+    while True:
+        time.sleep(10)
 
 # ---------------------------------------------------------------------------
 # Main — lanza ambos hilos
@@ -627,7 +787,7 @@ def hilo_cdr():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("  FACTURADOR SUNAT - v2.0")
+    logger.info("  FACTURADOR SUNAT - SFS v2.1")
     logger.info("  SFS DATA : %s", SFS_DATA_DIR)
     logger.info("  SFS RPTA : %s", SFS_RPTA_DIR)
     logger.info("  SQL SERVER: %s / %s", DB_CONFIG["server"], DB_CONFIG["database"])
