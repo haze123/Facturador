@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 logs/
 facturador.log
+reintentos.json
+migracion_ruc/
