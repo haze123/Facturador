@@ -2,7 +2,9 @@
 
 Daemon de Facturación Electrónica SUNAT (SFS v2.1).
 
-Corre en segundo plano y envía facturas/boletas a SUNAT automáticamente: lee los comprobantes pendientes de una base de datos SQL Server, genera los archivos que necesita el SFS (Sistema de Facturación SUNAT), los envía al facturador local y procesa las respuestas (CDR) de SUNAT.
+Corre en segundo plano y emite comprobantes electrónicos a SUNAT sin intervención: lee los pendientes de una base de datos SQL Server, genera los archivos que necesita el SFS (Sistema de Facturación SUNAT), los entrega al facturador local —que firma el XML y lo envía— y procesa las respuestas (CDR) de SUNAT para cerrar cada comprobante.
+
+Emite facturas, boletas, notas de crédito y notas de débito.
 
 Corre dos hilos en paralelo:
 - **Hilo Generador**: cada `INTERVALO_GENERACION_SEG` segundos (60s por defecto) revisa si hay comprobantes por enviar.
