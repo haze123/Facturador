@@ -8,6 +8,8 @@ Hilos:
   - Hilo CDR       : revisa sobre carpeta RPTA, procesa CDRs al instante.
 """
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -64,6 +66,33 @@ DIR_ERRORES    = os.path.join(SFS_RPTA_DIR, "errores")
 
 # Emisor override (opcional)
 EMISOR_RUC_OVERRIDE = os.getenv("EMISOR_RUC", "").strip()
+
+# Consulta a SUNAT del estado de un comprobante (servicio billConsultService).
+# Sirve para saber si un documento llegó cuando se cortó la conexión y no se sabe
+# si se envió: si está registrado devuelve su CDR, y si no, recién ahí se reenvía.
+# OJO: SUNAT solo publica este servicio en producción — en beta responde 404. Aun
+# así consultar no emite nada: es de solo lectura y es independiente del ambiente
+# al que el SFS manda los comprobantes.
+SUNAT_CONSULTA_URL = os.getenv(
+    "SUNAT_CONSULTA_URL",
+    "https://e-factura.sunat.gob.pe/ol-it-wsconscpegem/billConsultService",
+)
+SOL_USUARIO = os.getenv("SOL_USUARIO", "").strip()
+SOL_CLAVE   = os.getenv("SOL_CLAVE", "").strip()
+
+# Códigos que confirman que SUNAT NO tiene el comprobante, y por lo tanto habilitan
+# a reenviarlo. Es una lista blanca a propósito: verificado contra el servicio real,
+# el 0127 es el "no registrado" —aunque su texto diga "El ticket no existe", que es
+# un mensaje genérico reutilizado—. Cualquier otro código se toma como incierto.
+_CODIGOS_NO_REGISTRADO = ("0127",)
+
+# Cuánto esperar antes de preguntarle a SUNAT por un comprobante que ya se envió y
+# sigue sin CDR. Por debajo de esto lo más probable es que el CDR solo esté demorando.
+CONSULTA_SUNAT_TRAS_MIN = int(os.getenv("CONSULTA_SUNAT_TRAS_MIN", "10"))
+# Cada cuánto se puede volver a consultar el mismo documento, para no golpear el
+# servicio de SUNAT en cada ciclo por algo que sigue igual.
+_COOLDOWN_CONSULTA_SEG = 900
+_ultima_consulta: dict = {}
 
 # IND_SITU de la BD del SFS (sistema/facturador/util/Constantes del facturadorApp).
 _NOMBRE_SITU = {
@@ -661,6 +690,138 @@ def activar_procesamiento_sfs(documentos: list) -> list:
     return enviados
 
 # ---------------------------------------------------------------------------
+# Consulta directa a SUNAT — ¿el comprobante ya está registrado?
+# ---------------------------------------------------------------------------
+
+# Plantilla del sobre SOAP. La autenticación va como UsernameToken de WS-Security y
+# el usuario es el RUC pegado al usuario SOL secundario, sin separador.
+_SOBRE_CONSULTA = """<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:ser="http://service.sunat.gob.pe">
+  <soapenv:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsse:UsernameToken>
+        <wsse:Username>{usuario}</wsse:Username>
+        <wsse:Password>{clave}</wsse:Password>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </soapenv:Header>
+  <soapenv:Body>
+    <ser:getStatusCdr>
+      <rucComprobante>{ruc}</rucComprobante>
+      <tipoComprobante>{tipo}</tipoComprobante>
+      <serieComprobante>{serie}</serieComprobante>
+      <numeroComprobante>{numero}</numeroComprobante>
+    </ser:getStatusCdr>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+
+def _texto_de_nodo(xml: str, etiqueta: str) -> str:
+    """Contenido de un nodo de la respuesta SOAP, sin importar su prefijo."""
+    m = re.search(rf"<(?:\w+:)?{etiqueta}>(.*?)</(?:\w+:)?{etiqueta}>", xml, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def consultar_estado_sunat(ruc: str, tipo: str, numeracion: str):
+    """
+    Pregunta a SUNAT si un comprobante está registrado.
+
+    Devuelve (codigo, mensaje, cdr_zip) donde cdr_zip son los bytes del CDR cuando
+    SUNAT lo entrega, o None. Ante cualquier fallo devuelve (None, motivo, None):
+    quien llama debe tratar esa respuesta como "no sé", nunca como "no existe".
+    Reenviar un comprobante que en realidad sí llegó lo duplica ante SUNAT.
+    """
+    if not (SOL_USUARIO and SOL_CLAVE):
+        return None, "faltan SOL_USUARIO y SOL_CLAVE en el .env", None
+    if "-" not in numeracion:
+        return None, f"numeración sin serie: {numeracion!r}", None
+
+    serie, correlativo = numeracion.split("-", 1)
+    sobre = _SOBRE_CONSULTA.format(
+        usuario=f"{ruc}{SOL_USUARIO}",
+        clave=SOL_CLAVE,
+        ruc=ruc,
+        tipo=tipo,
+        serie=serie,
+        # SUNAT espera el correlativo como número, sin los ceros de la izquierda.
+        numero=correlativo.lstrip("0") or "0",
+    )
+    peticion = urllib.request.Request(
+        SUNAT_CONSULTA_URL,
+        data=sobre.encode("utf-8"),
+        # El SOAPAction no es opcional: sin él SUNAT despacha a getStatus —la consulta
+        # de tickets— y responde "El ticket no existe" para cualquier comprobante.
+        headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "urn:getStatusCdr"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(peticion, timeout=30) as r:
+            respuesta = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode("utf-8", "replace")
+        detalle = _texto_de_nodo(cuerpo, "faultstring") or f"HTTP {e.code}"
+        logger.warning("Consulta a SUNAT rechazada para %s-%s: %s", tipo, numeracion, detalle)
+        return None, detalle, None
+    except Exception as e:
+        logger.warning("No se pudo consultar a SUNAT por %s-%s: %s", tipo, numeracion, e)
+        return None, str(e), None
+
+    codigo  = _texto_de_nodo(respuesta, "statusCode")
+    mensaje = _texto_de_nodo(respuesta, "statusMessage")
+    b64     = _texto_de_nodo(respuesta, "content")
+    cdr = None
+    if b64:
+        try:
+            cdr = base64.b64decode(b64)
+        except (ValueError, binascii.Error):
+            logger.exception("SUNAT devolvió un CDR ilegible para %s-%s", tipo, numeracion)
+    return codigo or None, mensaje, cdr
+
+
+def estado_en_sunat(ruc: str, tipo: str, numeracion: str) -> str:
+    """
+    'registrado' | 'no_registrado' | 'desconocido', más el CDR si SUNAT lo entrega.
+
+    La distinción entre 'no_registrado' y 'desconocido' es lo importante: solo el
+    primero autoriza a reenviar. Cualquier código que no esté en la lista blanca se
+    trata como desconocido, porque reenviar algo que en realidad sí llegó lo duplica
+    ante SUNAT, y eso no se deshace sin una nota de crédito.
+    """
+    codigo, mensaje, cdr = consultar_estado_sunat(ruc, tipo, numeracion)
+    if codigo is None:
+        return "desconocido", None, mensaje
+    if cdr:
+        return "registrado", cdr, mensaje
+    if codigo in _CODIGOS_NO_REGISTRADO:
+        return "no_registrado", None, mensaje
+    logger.warning(
+        "SUNAT respondió por %s-%s un código que no sabemos interpretar (%s: %s); "
+        "no se reenvía por las dudas.", tipo, numeracion, codigo, mensaje,
+    )
+    return "desconocido", None, mensaje
+
+
+def _guardar_cdr(ruc: str, tipo: str, numeracion: str, cdr: bytes, mensaje: str):
+    """
+    Deja el CDR recuperado en RPTA, con el mismo nombre que le pondría el SFS.
+
+    No hace falta nada más: el hilo CDR ya vigila esa carpeta, así que lo procesa,
+    marca enviado=1 y lo archiva igual que si hubiera llegado por el camino normal.
+    Se escribe con nombre temporal y se renombra para que watchdog no lo levante
+    a medio escribir.
+    """
+    os.makedirs(SFS_RPTA_DIR, exist_ok=True)
+    destino = os.path.join(SFS_RPTA_DIR, f"R{ruc}-{tipo}-{numeracion}.zip")
+    with open(destino + ".tmp", "wb") as fh:
+        fh.write(cdr)
+    os.replace(destino + ".tmp", destino)
+    logger.info(
+        "CDR de %s-%s recuperado desde SUNAT (%s); queda en RPTA para procesar.",
+        tipo, numeracion, mensaje,
+    )
+
+# ---------------------------------------------------------------------------
 # SFS BD SQLite — gestión de estados
 # ---------------------------------------------------------------------------
 
@@ -756,6 +917,82 @@ def _activar_pendientes_sfs_bd(ruc_emisor: str, ya_procesados: list):
     if docs_extra:
         logger.info("%d doc(s) en SFS BD pendientes de activar.", len(docs_extra))
         activar_procesamiento_sfs(docs_extra)
+
+
+def _docs_enviados_sin_cdr(ruc_emisor: str) -> list:
+    """
+    Documentos que el SFS dice haber enviado y que siguen sin cerrarse, con cuántos
+    minutos llevan así. Son los únicos candidatos a consultarle a SUNAT: si no tienen
+    fecha de envío es que nunca salieron, y preguntar por ellos no tiene sentido.
+    """
+    if not os.path.exists(SFS_BD_PATH):
+        return []
+    marcas = _marcas(len(_ESTADOS_CERRADOS))
+    ahora = datetime.now()
+    pendientes = []
+    try:
+        with _sfs_bd() as sfs:
+            filas = sfs.execute(
+                "SELECT TIP_DOCU, NUM_DOCU, FEC_ENVI FROM DOCUMENTO "
+                f"WHERE NUM_RUC=? AND IND_SITU NOT IN ({marcas}) "
+                "AND FEC_ENVI IS NOT NULL AND FEC_ENVI <> ''",
+                (ruc_emisor, *_ESTADOS_CERRADOS),
+            ).fetchall()
+    except sqlite3.Error:
+        logger.exception("No se pudo leer la BD del SFS para buscar documentos sin CDR.")
+        return []
+
+    for tip, num, fec_envi in filas:
+        try:
+            enviado_el = datetime.strptime(_texto(fec_envi), "%d/%m/%Y %H:%M:%S")
+        except ValueError:
+            continue
+        pendientes.append((_texto(tip), _texto(num), (ahora - enviado_el).total_seconds() / 60))
+    return pendientes
+
+
+def recuperar_cdr_pendientes(ruc_emisor: str):
+    """
+    Para cada comprobante enviado que lleva rato sin CDR, le pregunta a SUNAT.
+
+    Es la salida al caso de la conexión cortada: el SFS mandó el documento pero la
+    respuesta nunca volvió, así que nadie sabe si llegó. Si SUNAT lo tiene, su CDR
+    queda en RPTA y el hilo CDR lo cierra solo. Si confirma que no lo tiene, se
+    borra de la bandeja del SFS para que el próximo ciclo lo regenere y reenvíe.
+    """
+    ahora = time.monotonic()
+    for tip, num, minutos in _docs_enviados_sin_cdr(ruc_emisor):
+        if minutos < CONSULTA_SUNAT_TRAS_MIN:
+            continue
+        if _tiene_cdr(ruc_emisor, tip, num):
+            continue  # el CDR ya está en disco, lo levanta el hilo CDR
+        previo = _ultima_consulta.get((tip, num))
+        if previo is not None and ahora - previo < _COOLDOWN_CONSULTA_SEG:
+            continue
+        _ultima_consulta[(tip, num)] = ahora
+
+        logger.info(
+            "%s-%s lleva %.0f min enviado sin CDR; consultando a SUNAT...", tip, num, minutos
+        )
+        estado, cdr, mensaje = estado_en_sunat(ruc_emisor, tip, num)
+        if estado == "registrado":
+            _guardar_cdr(ruc_emisor, tip, num, cdr, mensaje)
+        elif estado == "no_registrado":
+            # No llegó: se saca de la bandeja para que vuelva a generarse y salir.
+            logger.warning(
+                "SUNAT no tiene %s-%s: el envío no llegó. Vuelve a la cola.", tip, num
+            )
+            with _sfs_bd(escritura=True) as sfs:
+                sfs.execute(
+                    "DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=?",
+                    (ruc_emisor, tip, num),
+                )
+            _eliminar_data_files(f"{ruc_emisor}-{tip}-{num}")
+        else:
+            logger.warning(
+                "No se pudo determinar si SUNAT tiene %s-%s (%s); no se reenvía.",
+                tip, num, mensaje,
+            )
 
 
 def _docs_en_vuelo(ruc_emisor: str) -> dict:
@@ -1160,6 +1397,11 @@ def ciclo_generacion():
         ruc_emisor = EMISOR_RUC_OVERRIDE or _texto(emisor.get("ruc"), "00000000000")
 
         resetear_rechazados(conn, ruc_emisor)
+
+        # Antes de decidir qué generar: si algo se envió y su CDR nunca volvió
+        # —típicamente por un corte de conexión—, preguntarle a SUNAT si lo tiene.
+        if SOL_USUARIO and SOL_CLAVE:
+            recuperar_cdr_pendientes(ruc_emisor)
 
         comprobantes = obtener_comprobantes_pendientes(conn)
         logger.info("%d comprobante(s) pendiente(s).", len(comprobantes))
