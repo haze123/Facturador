@@ -14,7 +14,7 @@ Corre dos hilos en paralelo:
 
 Se emiten factura (`01`), boleta (`03`), nota de crédito (`07`) y nota de débito (`08`). El resumen diario (`RC`) y la comunicación de baja (`RA`) todavía no.
 
-Las notas exigen la referencia al documento que corrigen, y esos campos salen de `Comprobante`:
+Las notas exigen la referencia al documento que corrigen, y esos campos salen de `Factura`:
 
 | Campo del SFS | Columna |
 |---|---|
@@ -52,12 +52,12 @@ El daemon se guía por el `IND_SITU` que el SFS lleva en su propia base:
 
 | Estado | Significado | Qué hace el daemon |
 |---|---|---|
-| `03` / `04` | Aceptado (con o sin observaciones) | Cierra con `enviado=1` |
+| `03` / `04` | Aceptado (con o sin observaciones) | Cierra con `enviado=true` |
 | `05` | Anulado | Lo reporta como `BLOQUEADO`; **no** lo reenvía |
 | `06` | Con errores (p. ej. boleta de más de 5 días, que exige resumen diario) | Lo reporta como `BLOQUEADO`; no lo reenvía |
 | `10` | Rechazado por SUNAT | Lo regenera y lo reenvía, hasta `MAX_REINTENTOS_RECHAZO` veces |
 
-Cuando llega un CDR de rechazo, el motivo se guarda en `Comprobante.errors` (código y descripción de SUNAT, con fecha) además de quedar en el log, y el ZIP se archiva en `RPTA/errores/`. El comprobante nunca pasa a `enviado=1`.
+Cuando llega un CDR de rechazo, el motivo se guarda en `Factura.errors` (código y descripción de SUNAT, con fecha) además de quedar en el log, y el ZIP se archiva en `RPTA/errores/`. El comprobante nunca pasa a `enviado=true`.
 
 ### Tope de reenvíos
 
@@ -71,6 +71,18 @@ El conteo se guarda en `reintentos.json` (no se versiona) para que un reinicio d
 ```
 
 El contador se borra solo cuando llega el CDR de aceptación. Si corriges el dato y quieres reintentar antes de eso, elimina esa entrada del archivo.
+
+### Recuperación tras un corte de conexión
+
+Si el SFS alcanza a enviar un comprobante y la respuesta nunca vuelve —se corta internet, se cae el proceso—, nadie sabe si SUNAT lo llegó a registrar. Reenviarlo a ciegas arriesga duplicarlo, y un duplicado ante SUNAT solo se deshace con una nota de crédito.
+
+Por eso, al inicio de cada ciclo, el daemon revisa los comprobantes que el SFS marcó como enviados (tienen fecha de envío en su base) pero que llevan más de `CONSULTA_SUNAT_TRAS_MIN` minutos sin CDR. Para esos, consulta directo a SUNAT por SOAP (`billConsultService`):
+
+- Si SUNAT lo tiene registrado, descarga el CDR y lo deja en `RPTA` — el hilo CDR lo procesa igual que si hubiera llegado por el camino normal.
+- Si confirma que no lo tiene, lo saca de la bandeja del SFS para que el próximo ciclo lo regenere y reenvíe.
+- Ante cualquier otra respuesta —código desconocido, falla de red, credenciales ausentes— no toca nada. Ante la duda, nunca reenvía.
+
+Requiere `SOL_USUARIO` y `SOL_CLAVE` en el `.env`; si faltan, este paso simplemente no corre y el resto del daemon sigue igual. El servicio de consulta de SUNAT **solo existe en producción** (no tiene variante beta), pero consultar es de solo lectura: no emite nada y no depende de a qué ambiente esté apuntando el SFS para enviar.
 
 ## Requisitos
 
@@ -112,6 +124,15 @@ EMISOR_RUC=
 
 # Cuántas veces se reenvía un comprobante rechazado por SUNAT. Opcional, por defecto 3.
 MAX_REINTENTOS_RECHAZO=3
+
+# Credenciales SOL, solo para consultar a SUNAT si un comprobante enviado quedó sin
+# CDR (ver "Recuperación tras un corte de conexión"). Opcional: sin esto, el daemon
+# sigue funcionando pero no intenta recuperar CDR perdidos.
+SOL_USUARIO=
+SOL_CLAVE=
+
+# Minutos sin CDR antes de consultar a SUNAT. Opcional, por defecto 10.
+CONSULTA_SUNAT_TRAS_MIN=10
 ```
 
 ## Uso
@@ -133,7 +154,7 @@ Los logs se escriben en `facturador.log` y, si se usa PM2, también en `logs/out
 ## Flujo del comprobante
 
 ```
-Comprobante (enviado=false)
+Factura (enviado=false)
         ↓
 ciclo_generacion() cada 60s
         ↓
@@ -176,8 +197,8 @@ Escenarios que vale la pena cubrir antes de dar por bueno un cambio, porque cada
 
 ### Antes de pasar a producción
 
-1. Vaciar los comprobantes de prueba de `Comprobantes` e `Items`
-2. Volver a poner `Correlativos.numeracion` en `000000`, o la primera factura real no arrancará en 1
+1. Vaciar los comprobantes de prueba de `Factura` e `FacturaItem`
+2. Volver a poner `Correlativo.numeracion` en `0`, o la primera factura real no arrancará en 1
 3. Vaciar la tabla `DOCUMENTO` de la base del SFS y las carpetas `DATA` y `RPTA`
 4. En la configuración del SFS: certificado digital real, usuario y clave SOL reales, y los datos del emisor completos — un nombre comercial vacío se emite como `-` y SUNAT lo observa con el código `4092`
 5. Recién entonces, cambiar `RUTA_SERV_CDP` a producción y emitir **un solo** comprobante para confirmar antes de soltar el resto
