@@ -118,13 +118,11 @@ _MAX_BLOQUEADOS_LOG = 10
 # no se emiten desde acá.
 _TIPOS_SFS = {"01", "03", "07", "08"}
 
-# Notas: el SFS las parsea distinto que una factura (PipeNotaCreditoParser /
-# PipeNotaDebitoParser vs PipeFacturaParser). La cabecera es de 21 columnas —sin
-# fecVencimiento y con codMotivo|desMotivo|tipDocAfectado|numDocAfectado después de
-# moneda—, y son esos 4 campos los que la plantilla del SFS convierte en el
-# <cac:DiscrepancyResponse> y el <cac:BillingReference> del XML. Mandarles la
-# cabecera de factura hace que el SFS rechace el archivo por conteo de columnas y
-# el documento se quede en IND_SITU='01' sin llegar nunca a SUNAT.
+# Notas: el SFS las parsea con PipeNotaCreditoParser / PipeNotaDebitoParser, que
+# esperan una cabecera de 21 columnas —sin fecVencimiento y con
+# codMotivo|desMotivo|tipDocAfectado|numDocAfectado después de moneda—. Esos 4
+# campos son los que la plantilla del SFS convierte en el <cac:DiscrepancyResponse>
+# y el <cac:BillingReference> del XML, que SUNAT exige en toda nota.
 _TIPOS_NOTA = {"07", "08"}
 
 # El archivo .PAG genera un cac:PaymentTerms con PaymentMeansID='Contado', y solo la
@@ -150,7 +148,9 @@ _COLS_DET = 36
 _EXT_CABECERA = {"07": "NOT", "08": "NOT"}
 _EXT_CABECERA_POR_DEFECTO = "cab"
 
-# Archivos que el daemon escribe en DATA por cada comprobante.
+# Todas las extensiones que el daemon puede escribir en DATA. Ningún comprobante
+# las lleva todas: la cabecera es .cab o .NOT según el tipo, y el .PAG solo va en
+# facturas. Se listan juntas para armar rutas y para barrer al limpiar.
 _EXT_DATA = ("cab", "NOT", "det", "tri", "ley", "PAG")
 # Las que además puede dejar el SFS (resumen y reversión); se barren al limpiar.
 _EXT_DATA_SFS = ("RDI", "TRD", "DET")
@@ -290,6 +290,20 @@ def escribir_archivo(ruta: str, contenido: str):
     with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(contenido)
     os.replace(tmp, ruta)
+
+
+def _borrar_si_existe(ruta: str):
+    """
+    Borra un archivo que puede no estar. Se usa al regenerar un comprobante: el SFS
+    levanta todo lo que encuentre en DATA, así que un archivo sobrante de una
+    emisión anterior se colaría en la nueva.
+    """
+    try:
+        os.remove(ruta)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.exception("No se pudo borrar %s", ruta)
 
 
 def _mover(ruta: str, carpeta: str):
@@ -485,8 +499,8 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     if not lineas_det:
         logger.warning("Comprobante %s sin ítems.", num_comp)
 
-    # Totales, comunes a los dos layouts de cabecera.
-    _totales = (
+    # Cola de la cabecera: totales y versiones, iguales en los dos layouts.
+    totales = (
         f"{tot_igv:.2f}|{tot_grav:.2f}|{tot_venta:.2f}|"
         f"0.00|0.00|0.00|{tot_venta:.2f}|2.1|2.0|\n"
     )
@@ -497,32 +511,30 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
         escribir_archivo(rutas["cabecera"],
             f"0101|{fecha_str}|{hora_str}|0000|{tipo_doc_rec}|{num_doc_rec}|"
             f"{razon_social}|{moneda}|{cod_motivo}|{des_motivo}|{tip_afectado}|{num_afectado}|"
-            + _totales
+            + totales
         )
-        # Un .cab de una emisión previa haría que el SFS lea la cabecera de nota como
-        # si fuera de factura, y reviente por conteo de columnas.
-        if os.path.exists(rutas["cab"]):
-            os.remove(rutas["cab"])
+        # El SFS reconoce el tipo por la extensión de la cabecera: un .cab sobrante
+        # haría que tome la nota por una factura.
+        _borrar_si_existe(rutas["cab"])
     else:
         # Cabecera de factura/boleta (18 columnas, archivo .cab).
         escribir_archivo(rutas["cabecera"],
             f"0101|{fecha_str}|{hora_str}|-|0000|{tipo_doc_rec}|{num_doc_rec}|"
-            f"{razon_social}|{moneda}|" + _totales
+            f"{razon_social}|{moneda}|" + totales
         )
+
     if tipo_comp in _TIPOS_SIN_FORMA_PAGO:
-        # Se borra por si quedó de una emisión anterior: el SFS levanta lo que
-        # encuentre en DATA, y un .PAG viejo volvería a meter el nodo rechazado.
-        if os.path.exists(rutas["PAG"]):
-            os.remove(rutas["PAG"])
+        _borrar_si_existe(rutas["PAG"])
     else:
         escribir_archivo(rutas["PAG"], f"Contado|{tot_venta:.2f}|{moneda}|\n")
+
     escribir_archivo(rutas["tri"], f"1000|IGV|VAT|{tot_grav:.2f}|{tot_igv:.2f}|\n")
     escribir_archivo(rutas["ley"], f"1000|{monto_letras}|\n")
 
     if lineas_det:
         escribir_archivo(rutas["det"], "".join(lineas_det))
-    elif os.path.exists(rutas["det"]):
-        os.remove(rutas["det"])
+    else:
+        _borrar_si_existe(rutas["det"])
 
     # OJO: no se toca Comprobantes.enviado acá. Generar los archivos no es haber
     # enviado nada; el estado lo mueve ciclo_generacion() recién cuando el SFS
@@ -683,12 +695,7 @@ def _tiene_cdr(ruc: str, tip: str, num: str) -> bool:
 
 def _eliminar_data_files(nom_arch: str):
     for ext in _EXT_DATA + _EXT_DATA_SFS:
-        ruta = os.path.join(SFS_DATA_DIR, f"{nom_arch}.{ext}")
-        if os.path.exists(ruta):
-            try:
-                os.remove(ruta)
-            except OSError:
-                pass
+        _borrar_si_existe(os.path.join(SFS_DATA_DIR, f"{nom_arch}.{ext}"))
 
 
 def _limpiar_data_cerrados(ruc_emisor: str, en_vuelo: dict) -> int:
