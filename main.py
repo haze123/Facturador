@@ -590,13 +590,20 @@ def obtener_comprobantes_pendientes(conn):
     SUNAT, y deja en NULL el desglose de importes: ambas cosas se resuelven acá para
     que procesar_comprobante() reciba siempre lo mismo, venga de donde venga.
     """
+    # Los datos del comprobante viven en Factura: la tabla Comprobante se fusionó
+    # dentro de ella, así que "id" y "factura_id" son la misma fila (se repite el
+    # nombre solo porque obtener_receptor() y obtener_items() esperan esa clave).
+    # Se excluyen las facturas sin numeración: todavía no tienen número asignado y
+    # no hay nada que emitir.
     filas = _consultar(
         conn,
-        'SELECT id, "facturaId", "tipoComprobante", "numeracionComprobante", "fechaEmision",'
-        '       "tipoMoneda", "tipoNota", "tipoDocumentoAfectado", "numeracionDocumentoAfectado",'
+        'SELECT id, "tipoComprobante", tipo::text AS tipo_enum,'
+        '       "numeracionComprobante", "fechaEmision", "tipoMoneda", "tipoNota",'
+        '       "tipoDocumentoAfectado", "numeracionDocumentoAfectado",'
         '       "motivoDocumentoAfectado", gravadas, igv, total, "montoLetras"'
-        '  FROM public."Comprobante"'
+        '  FROM public."Factura"'
         ' WHERE enviado IS NOT TRUE'
+        '   AND "numeracionComprobante" IS NOT NULL'
         ' ORDER BY "fechaEmision" ASC NULLS LAST',
     )
     pendientes = []
@@ -606,8 +613,8 @@ def obtener_comprobantes_pendientes(conn):
             gravadas, igv = _base_e_igv(f["total"])
         pendientes.append({
             "id":                             f["id"],
-            "factura_id":                     f["facturaId"],
-            "tipo_comprobante":               _tipo_sunat(f["tipoComprobante"]),
+            "factura_id":                     f["id"],
+            "tipo_comprobante":               _tipo_sunat(f["tipoComprobante"] or f["tipo_enum"]),
             "numeracion_comprobante":         f["numeracionComprobante"],
             "fecha_emision":                  f["fechaEmision"],
             "tipo_moneda":                    f["tipoMoneda"],
@@ -1299,7 +1306,7 @@ def resetear_rechazados(conn, ruc_emisor: str):
                 continue
             intentos = _contar_reintento(num_docu, tip_docu, _texto(des_obse))
             cur.execute(
-                'UPDATE public."Comprobante" SET enviado=%s WHERE "numeracionComprobante"=%s',
+                'UPDATE public."Factura" SET enviado=%s WHERE "numeracionComprobante"=%s',
                 (ENVIADO_PENDIENTE, num_docu),
             )
             sfs.execute(
@@ -1410,7 +1417,7 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
     # antes, el motivo viejo ya no aplica.
     filas = _actualizar(
         conn,
-        'UPDATE public."Comprobante" SET enviado=%s, errors=NULL WHERE "numeracionComprobante"=%s',
+        'UPDATE public."Factura" SET enviado=%s, errors=NULL WHERE "numeracionComprobante"=%s',
         (ENVIADO_ACEPTADO, numeracion),
     )
     if filas > 0:
@@ -1442,7 +1449,7 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
         detalle += f": {parsed['descripcion']}"
     filas = _actualizar(
         conn,
-        'UPDATE public."Comprobante" SET errors=%s WHERE "numeracionComprobante"=%s',
+        'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante"=%s',
         (detalle[:_MAX_ERRORS_SQL], numeracion),
     )
     return filas > 0
