@@ -2,7 +2,7 @@
 
 Daemon de Facturación Electrónica SUNAT (SFS v2.1).
 
-Corre en segundo plano y emite comprobantes electrónicos a SUNAT sin intervención: lee los pendientes de una base de datos SQL Server, genera los archivos que necesita el SFS (Sistema de Facturación SUNAT), los entrega al facturador local —que firma el XML y lo envía— y procesa las respuestas (CDR) de SUNAT para cerrar cada comprobante.
+Corre en segundo plano y emite comprobantes electrónicos a SUNAT sin intervención: lee los pendientes de la base de datos de la aplicación, genera los archivos que necesita el SFS (Sistema de Facturación SUNAT), los entrega al facturador local —que firma el XML y lo envía— y procesa las respuestas (CDR) de SUNAT para cerrar cada comprobante.
 
 Emite facturas, boletas, notas de crédito y notas de débito.
 
@@ -14,16 +14,16 @@ Corre dos hilos en paralelo:
 
 Se emiten factura (`01`), boleta (`03`), nota de crédito (`07`) y nota de débito (`08`). El resumen diario (`RC`) y la comunicación de baja (`RA`) todavía no.
 
-Las notas exigen la referencia al documento que corrigen, y esos campos salen de `Comprobantes`:
+Las notas exigen la referencia al documento que corrigen, y esos campos salen de `Comprobante`:
 
 | Campo del SFS | Columna |
 |---|---|
-| `codMotivo` | `tipo_nota` (catálogo 09 para NC, 10 para ND) |
-| `desMotivo` | `motivo_documento_afectado` (si está vacío se usa la descripción del catálogo) |
-| `tipDocAfectado` | `tipo_documento_afectado` |
-| `numDocAfectado` | `numeracion_documento_afectado` |
+| `codMotivo` | `tipoNota` (catálogo 09 para NC, 10 para ND) |
+| `desMotivo` | `motivoDocumentoAfectado` (si está vacío se usa la descripción del catálogo) |
+| `tipDocAfectado` | `tipoDocumentoAfectado` |
+| `numDocAfectado` | `numeracionDocumentoAfectado` |
 
-Si a una nota le falta `tipo_nota`, `tipo_documento_afectado` o `numeracion_documento_afectado`, **no se emite**: se registra un WARNING y se reintenta cuando alguien complete el dato. El código de motivo no se deduce ni se rellena por defecto, porque una nota con el motivo equivocado es una declaración incorrecta ante SUNAT.
+Si a una nota le falta `tipoNota`, `tipoDocumentoAfectado` o `numeracionDocumentoAfectado`, **no se emite**: se registra un WARNING y se reintenta cuando alguien complete el dato. El código de motivo no se deduce ni se rellena por defecto, porque una nota con el motivo equivocado es una declaración incorrecta ante SUNAT.
 
 ## Archivos que genera en DATA
 
@@ -57,7 +57,7 @@ El daemon se guía por el `IND_SITU` que el SFS lleva en su propia base:
 | `06` | Con errores (p. ej. boleta de más de 5 días, que exige resumen diario) | Lo reporta como `BLOQUEADO`; no lo reenvía |
 | `10` | Rechazado por SUNAT | Lo regenera y lo reenvía, hasta `MAX_REINTENTOS_RECHAZO` veces |
 
-Cuando llega un CDR de rechazo, el motivo se guarda en `Comprobantes.errors` (código y descripción de SUNAT, con fecha) además de quedar en el log, y el ZIP se archiva en `RPTA/errores/`. El comprobante nunca pasa a `enviado=1`.
+Cuando llega un CDR de rechazo, el motivo se guarda en `Comprobante.errors` (código y descripción de SUNAT, con fecha) además de quedar en el log, y el ZIP se archiva en `RPTA/errores/`. El comprobante nunca pasa a `enviado=1`.
 
 ### Tope de reenvíos
 
@@ -75,7 +75,7 @@ El contador se borra solo cuando llega el CDR de aceptación. Si corriges el dat
 ## Requisitos
 
 - Python 3.10+
-- SQL Server accesible (driver ODBC instalado)
+- PostgreSQL accesible (la base de la aplicación)
 - SFS v2.1 instalado y corriendo localmente
 - [PM2](https://pm2.keymetrics.io/) (opcional, para gestionar el proceso)
 
@@ -90,11 +90,9 @@ pip install -r requirements.txt
 Crea un archivo `.env` en la raíz del proyecto (no se versiona) con estas variables:
 
 ```env
-# SQL Server
-DB_DRIVER={SQL Server}
-DB_SERVER=.\SQLEXPRESS
-DB_DATABASE=AUXILIAR
-DB_TRUSTED=yes
+# Base de datos de la aplicación. Es la misma DATABASE_URL que usa el sistema:
+# los parámetros de Prisma (?schema=...) se traducen solos.
+DATABASE_URL=postgresql://usuario:clave@host:5432/postgres?schema=public
 
 # Facturador SFS
 SFS_BASE_URL=http://localhost:9000
@@ -135,7 +133,7 @@ Los logs se escriben en `facturador.log` y, si se usa PM2, también en `logs/out
 ## Flujo del comprobante
 
 ```
-SQL Server (enviado=0)
+Comprobante (enviado=false)
         ↓
 ciclo_generacion() cada 60s
         ↓
@@ -147,7 +145,7 @@ SUNAT responde con CDR (ZIP) en RPTA
         ↓
 Hilo CDR detecta el ZIP y lo procesa
         ↓
-Si ACEPTADO → enviado=1 en SQL Server, ZIP movido a RPTA/procesados/
+Si ACEPTADO → enviado=true en la BD, ZIP movido a RPTA/procesados/
                 y se borran los archivos de DATA
 ```
 
@@ -155,7 +153,7 @@ El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la
 
 ## Limitaciones conocidas
 
-**Un ítem sin IGV no se puede emitir.** El detalle se arma siempre como gravado al 18% (`tipAfeIGV=10`), sin mirar los datos. Si un ítem llega con IGV en 0 —una cortesía, un servicio exonerado— el XML declara "gravado al 18%" con importe 0 y SUNAT lo rechaza con el error `3111`. Resolverlo bien exige una columna de tipo de afectación en `Items`, que hoy no existe; el daemon no puede deducirlo del monto sin arriesgar una declaración incorrecta.
+**Un ítem sin IGV no se puede emitir.** El detalle se arma siempre como gravado al 18% (`tipAfeIGV=10`), sin mirar los datos. Si un ítem llega con IGV en 0 —una cortesía, un servicio exonerado— el XML declara "gravado al 18%" con importe 0 y SUNAT lo rechaza con el error `3111`. Resolverlo bien exige una columna de tipo de afectación en `FacturaItem`, que hoy no existe; el daemon no puede deducirlo del monto sin arriesgar una declaración incorrecta.
 
 **El valor unitario pierde precisión.** Se redondea a 2 decimales y luego se escribe con 6, así que `cantidad x valor_unitario` puede diferir en céntimos del valor de venta declarado. SUNAT lo tolera en comprobantes chicos, pero el error se acumula con la cantidad de líneas.
 

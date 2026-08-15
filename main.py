@@ -3,7 +3,7 @@ main.py — Daemon de Facturación Electrónica SUNAT (SFS v2.1)
 Gestionar con PM2: pm2 start sfs.config.js --only facturador
 
 Hilos:
-  - Hilo Generador : cada INTERVALO_GENERACION_SEG segundos lee SQL Server,
+  - Hilo Generador : cada INTERVALO_GENERACION_SEG segundos lee la BD de la aplicacion,
                      genera archivos SFS y los envía al facturador local.
   - Hilo CDR       : revisa sobre carpeta RPTA, procesa CDRs al instante.
 """
@@ -15,11 +15,11 @@ import logging
 import os
 import re
 import sqlite3
-import struct
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -27,7 +27,8 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-import pyodbc
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -45,14 +46,10 @@ INTERVALO_GENERACION_SEG = int(os.getenv("INTERVALO_GENERACION_SEG", "60"))
 # watchdog (ver hilo_cdr).
 INTERVALO_BARRIDO_RPTA_SEG = int(os.getenv("INTERVALO_BARRIDO_RPTA_SEG", "30"))
 
-# SQL Server
-DB_CONFIG = {
-    "driver":             os.getenv("DB_DRIVER",   "{SQL Server}"),
-    "server":             os.getenv("DB_SERVER",   r".\SQLEXPRESS"),
-    "database":           os.getenv("DB_DATABASE", "AUXILIAR"),
-    "trusted_connection": os.getenv("DB_TRUSTED",  "yes"),
-    "timeout":            30,
-}
+# Base de datos de la aplicación (PostgreSQL). Se lee la misma DATABASE_URL que usa
+# el sistema de SPAXION, para no mantener la conexión declarada en dos lugares.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DB_TIMEOUT_SEG = int(os.getenv("DB_TIMEOUT_SEG", "30"))
 
 # Rutas SFS
 SFS_DATA_DIR = p if os.path.exists(p := os.getenv("SFS_DATA_DIR", r"C:\SFS_v2.1\sunat_archivos\sfs\DATA")) else os.path.join(_BASE, "sunat_archivos", "DATA")
@@ -147,6 +144,19 @@ _MAX_BLOQUEADOS_LOG = 10
 # no se emiten desde acá.
 _TIPOS_SFS = {"01", "03", "07", "08"}
 
+# La aplicación guarda el tipo por nombre, no con el código de SUNAT. NOTA_VENTA no
+# es un comprobante electrónico —es un documento interno— y por eso no se mapea:
+# queda fuera de _TIPOS_SFS y el daemon lo ignora.
+_TIPOS_POR_NOMBRE = {
+    "FACTURA":        "01",
+    "BOLETA":         "03",
+    "NOTA_CREDITO":   "07",
+    "NOTA_DEBITO":    "08",
+}
+
+# Todo se factura gravado al 18%: es lo que corresponde a los servicios de estética.
+_FACTOR_IGV = Decimal("1.18")
+
 # Notas: el SFS las parsea con PipeNotaCreditoParser / PipeNotaDebitoParser, que
 # esperan una cabecera de 21 columnas —sin fecVencimiento y con
 # codMotivo|desMotivo|tipDocAfectado|numDocAfectado después de moneda—. Esos 4
@@ -186,7 +196,7 @@ _EXT_DATA_SFS = ("RDI", "TRD", "DET")
 
 # Catálogos SUNAT 09 (nota de crédito) y 10 (nota de débito). Solo se usan para
 # completar desMotivo cuando la BD no trae descripción; el código siempre sale de
-# Comprobantes.tipo_nota, nunca se infiere.
+# Comprobante.tipoNota, nunca se infiere.
 _MOTIVOS_NOTA = {
     "07": {
         "01": "ANULACION DE LA OPERACION",
@@ -227,25 +237,22 @@ _ESPERA_XML_SEG        = 2   # tras pedir la generación del XML
 _ESPERA_REINTENTO_SEG  = 3   # antes de reintentar un envío que falló
 _ESPERA_ENTRE_DOCS_SEG = 1   # para no saturar al SFS documento tras documento
 
-# Estados de la columna Comprobantes.enviado.
-# Es un BIT: solo admite 0/1 (SQL Server convierte cualquier no-cero a 1), así que
-# NO sirve para un estado intermedio. El "entregado al SFS, esperando CDR" se
-# deduce de la BD del SFS — ver _docs_en_vuelo().
-ENVIADO_PENDIENTE = 0   # por generar / reintentar
-ENVIADO_ACEPTADO  = 1   # SUNAT devolvió un CDR de aceptación
+# Estados de la columna Comprobante.enviado, que es boolean: no admite un estado
+# intermedio. El "entregado al SFS, esperando CDR" se deduce de la BD del SFS,
+# ver _docs_en_vuelo().
+ENVIADO_PENDIENTE = False   # por generar / reintentar
+ENVIADO_ACEPTADO  = True    # SUNAT devolvió un CDR de aceptación
 
 # Estados de CDR que dan por buena la emisión (SUNAT acepta con y sin observaciones)
 _CDR_ACEPTADOS = {"ACEPTADO", "OBSERVADO"}
 
-# Comprobantes.errors es nvarchar(4000); el motivo se recorta antes de guardarlo.
+# Recorte defensivo del motivo antes de guardarlo en Comprobante.errors. La columna
+# es text y no tiene límite, pero un mensaje enorme de SUNAT no aporta nada.
 _MAX_ERRORS_SQL = 4000
 
 # Serializa el barrido de RPTA: watchdog lanza una llamada por cada CDR que aparece
 # y todas recorren el directorio completo (ver procesar_respuestas).
 _lock_cdr = threading.Lock()
-
-# Código ODBC de DATETIMEOFFSET: pyodbc no lo mapea solo (ver _handle_datetimeoffset)
-_SQL_DATETIMEOFFSET = -155
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -294,6 +301,39 @@ def _marcas(cantidad: int) -> str:
     return ",".join("?" * cantidad)
 
 
+def _tipo_sunat(valor) -> str:
+    """
+    Código de comprobante de SUNAT a partir de lo que guarda la aplicación, que usa
+    nombres ('BOLETA') en vez de códigos. Si ya viene un código, se deja pasar.
+    """
+    texto = _texto(valor).upper()
+    if not texto:
+        return ""
+    return _TIPOS_POR_NOMBRE.get(texto, _codigo(texto))
+
+
+def _base_e_igv(total):
+    """
+    Separa un importe con IGV incluido en base imponible e impuesto.
+
+    La aplicación solo guarda el total cobrado. Se asume todo gravado al 18%, que es
+    lo que corresponde a los servicios de estética; un ítem exonerado o gratuito
+    necesitaría el tipo de afectación, que la base no tiene (ver README).
+    """
+    bruto = formatear_decimal(total)
+    base = (bruto / _FACTOR_IGV).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(base), float(bruto - base)
+
+
+def _desglosar_igv(precio_unitario, cantidad, total_linea):
+    """(valor unitario sin IGV, valor de venta de la línea, IGV de la línea)."""
+    total = total_linea if total_linea is not None else (precio_unitario or 0) * (cantidad or 1)
+    valor_venta, igv = _base_e_igv(total)
+    cant = formatear_decimal(cantidad) or Decimal("1")
+    unitario = (Decimal(str(valor_venta)) / cant) if cant else Decimal("0")
+    return float(unitario), valor_venta, igv
+
+
 def formatear_decimal(valor) -> Decimal:
     if valor is None:
         return Decimal("0.00")
@@ -301,6 +341,62 @@ def formatear_decimal(valor) -> Decimal:
         return Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except (InvalidOperation, ValueError, TypeError):
         return Decimal("0.00")
+
+
+_UNIDADES = ("", "UNO", "DOS", "TRES", "CUATRO", "CINCO", "SEIS", "SIETE", "OCHO", "NUEVE",
+             "DIEZ", "ONCE", "DOCE", "TRECE", "CATORCE", "QUINCE", "DIECISEIS", "DIECISIETE",
+             "DIECIOCHO", "DIECINUEVE", "VEINTE")
+_DECENAS  = ("", "", "VEINTI", "TREINTA", "CUARENTA", "CINCUENTA", "SESENTA", "SETENTA",
+             "OCHENTA", "NOVENTA")
+_CENTENAS = ("", "CIENTO", "DOSCIENTOS", "TRESCIENTOS", "CUATROCIENTOS", "QUINIENTOS",
+             "SEISCIENTOS", "SETECIENTOS", "OCHOCIENTOS", "NOVECIENTOS")
+_NOMBRE_MONEDA = {"PEN": "SOLES", "USD": "DOLARES AMERICANOS", "EUR": "EUROS"}
+
+
+def _centenas_a_letras(n: int) -> str:
+    if n == 100:
+        return "CIEN"
+    partes = []
+    if n >= 100:
+        partes.append(_CENTENAS[n // 100])
+        n %= 100
+    if n <= 20:
+        if n:
+            partes.append(_UNIDADES[n])
+    elif n < 30:
+        # 21..29 se escriben juntos: VEINTIUNO, VEINTIDOS, ...
+        partes.append(_DECENAS[2] + _UNIDADES[n % 10])
+    else:
+        partes.append(_DECENAS[n // 10] + (f" Y {_UNIDADES[n % 10]}" if n % 10 else ""))
+    return " ".join(p for p in partes if p)
+
+
+def numero_a_letras(monto, moneda: str = "PEN") -> str:
+    """
+    Importe en palabras, como lo exige SUNAT en la leyenda 1000 del comprobante.
+
+    La aplicación no guarda este texto, así que se arma acá. El formato es el usual
+    en Perú: "CIENTO DIECIOCHO CON 00/100 SOLES".
+    """
+    valor = formatear_decimal(monto)
+    entero = int(valor)
+    centavos = int((valor - entero) * 100)
+
+    if entero == 0:
+        letras = "CERO"
+    else:
+        bloques = []
+        millones, resto = divmod(entero, 1_000_000)
+        miles, unidades = divmod(resto, 1000)
+        if millones:
+            bloques.append("UN MILLON" if millones == 1 else f"{_centenas_a_letras(millones)} MILLONES")
+        if miles:
+            bloques.append("MIL" if miles == 1 else f"{_centenas_a_letras(miles)} MIL")
+        if unidades:
+            bloques.append(_centenas_a_letras(unidades))
+        letras = " ".join(bloques)
+
+    return f"{letras} CON {centavos:02d}/100 {_NOMBRE_MONEDA.get(_texto(moneda, 'PEN').upper(), 'SOLES')}"
 
 
 def formatear_fecha_hora(fecha_raw) -> datetime:
@@ -343,29 +439,34 @@ def _mover(ruta: str, carpeta: str):
         logger.exception("No se pudo mover %s a %s", ruta, carpeta)
 
 # ---------------------------------------------------------------------------
-# Base de datos — SQL Server
+# Base de datos — PostgreSQL de la aplicación
 # ---------------------------------------------------------------------------
 
-def _handle_datetimeoffset(valor: bytes) -> datetime:
+def _url_sin_clave(url: str) -> str:
+    """La URL de conexión sin la contraseña, para poder mostrarla en el log."""
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", url) or "(sin configurar)"
+
+
+def _dsn_desde_url(url: str):
     """
-    pyodbc no sabe convertir DATETIMEOFFSET y lo entrega crudo; sin este converter
-    cualquier SELECT que toque una columna de ese tipo revienta con HY106.
+    Separa la URL de Prisma en algo que psycopg2 entienda.
+
+    Se usa la misma DATABASE_URL que la aplicación para no declarar la conexión dos
+    veces, pero trae parámetros propios de Prisma —?schema, connection_limit— que
+    psycopg2 rechaza. El schema se traduce a search_path y el resto se descarta.
     """
-    anio, mes, dia, hora, minu, seg, nanos, off_h, off_m = struct.unpack("<6hI2h", valor)
-    return datetime(
-        anio, mes, dia, hora, minu, seg, nanos // 1000,
-        timezone(timedelta(hours=off_h, minutes=off_m)),
-    )
+    partes = urllib.parse.urlsplit(url)
+    consulta = urllib.parse.parse_qs(partes.query)
+    esquema = (consulta.get("schema") or ["public"])[0]
+    limpia = urllib.parse.urlunsplit((partes.scheme, partes.netloc, partes.path, "", ""))
+    return limpia, f"-c search_path={esquema}"
 
 
 def conectar_bd():
-    conn_str = (
-        f"DRIVER={DB_CONFIG['driver']};SERVER={DB_CONFIG['server']};"
-        f"DATABASE={DB_CONFIG['database']};Trusted_Connection={DB_CONFIG['trusted_connection']};"
-    )
-    conn = pyodbc.connect(conn_str, timeout=DB_CONFIG["timeout"])
-    conn.add_output_converter(_SQL_DATETIMEOFFSET, _handle_datetimeoffset)
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("Falta DATABASE_URL en el .env")
+    dsn, opciones = _dsn_desde_url(DATABASE_URL)
+    return psycopg2.connect(dsn, connect_timeout=DB_TIMEOUT_SEG, options=opciones)
 
 
 def _consultar(conn, sql: str, params: tuple = ()) -> list:
@@ -405,26 +506,121 @@ def _sfs_bd(escritura: bool = False):
 
 
 def obtener_emisor(conn):
-    filas = _consultar(conn, "SELECT TOP 1 ruc, razon_social FROM Emisores")
-    return filas[0] if filas else None
+    """
+    Datos del emisor. La aplicación no tiene tabla de emisores —solo guarda el nombre
+    en Configuracion—, así que el RUC sale de EMISOR_RUC en el .env.
+    """
+    filas = _consultar(conn, 'SELECT "nombreEmpresa" FROM public."Configuracion" LIMIT 1')
+    razon = _texto(filas[0]["nombreEmpresa"]) if filas else ""
+    if not EMISOR_RUC_OVERRIDE:
+        return None
+    return {"ruc": EMISOR_RUC_OVERRIDE, "razon_social": razon}
 
 
-def obtener_receptor(conn, receptor_id):
-    if receptor_id is None:
+def obtener_receptor(conn, factura_id):
+    """
+    Receptor del comprobante, que cuelga de la factura (Comprobante -> Factura -> Cliente).
+
+    Cliente no guarda tipo ni número de documento por separado, así que se deducen:
+    con RUC es una empresa (catálogo 06 tipo '6') y con DNI una persona (tipo '1').
+    Sin ninguno de los dos, queda como consumidor final, que es lo correcto para una
+    boleta de mostrador.
+    """
+    if not factura_id:
         return {}
-    filas = _consultar(conn, "SELECT TOP 1 * FROM Receptores WHERE id = ?", (int(receptor_id),))
-    return filas[0] if filas else {}
+    filas = _consultar(
+        conn,
+        'SELECT c.dni, c.ruc, c."razonSocial", c.nombre '
+        '  FROM public."Factura" f JOIN public."Cliente" c ON c.id = f."clienteId" '
+        ' WHERE f.id = %s',
+        (factura_id,),
+    )
+    if not filas:
+        return {}
+    cli = filas[0]
+    ruc, dni = _texto(cli["ruc"]), _texto(cli["dni"])
+    if ruc:
+        return {"tipo_documento": "6", "numero_documento": ruc,
+                "razon_social": _texto(cli["razonSocial"]) or _texto(cli["nombre"])}
+    if dni:
+        return {"tipo_documento": "1", "numero_documento": dni,
+                "razon_social": _texto(cli["nombre"])}
+    return {}
 
 
-def obtener_items(conn, comprobante_id):
-    return _consultar(conn, "SELECT * FROM Items WHERE ComprobanteId = ?", (int(comprobante_id),))
+def obtener_items(conn, factura_id):
+    """
+    Ítems del comprobante, con el desglose de IGV que la aplicación no guarda.
+
+    FacturaItem tiene columnas para el desglose (valor, valorVenta, igvVenta, precio)
+    pero la aplicación solo llena nombre, cantidad, precioUnit y total. Cuando faltan
+    se calculan desde el precio con IGV incluido; si algún día empieza a llenarlas,
+    se respetan las suyas.
+    """
+    filas = _consultar(
+        conn,
+        'SELECT nombre, cantidad, "precioUnit", total, "codigoProducto", "decCantidad",'
+        '       valor, "igvVenta", precio'
+        '  FROM public."FacturaItem" WHERE "facturaId" = %s ORDER BY id',
+        (factura_id,),
+    )
+    items = []
+    for f in filas:
+        cantidad = f["decCantidad"] or f["cantidad"] or 1
+        precio_unit = f["precio"] if f["precio"] is not None else f["precioUnit"]
+        valor_unit, valor_venta, igv_venta = _desglosar_igv(precio_unit, cantidad, f["total"])
+        items.append({
+            "descripcion":     f["nombre"],
+            "codigo_producto": f["codigoProducto"],
+            "medida":          "ZZ",   # servicios: unidad de medida de SUNAT
+            "dec_cantidad":    cantidad,
+            "valor":           f["valor"]    if f["valor"]    is not None else valor_unit,
+            "valor_venta":     valor_venta,
+            "igv_venta":       f["igvVenta"] if f["igvVenta"] is not None else igv_venta,
+            "precio":          precio_unit,
+        })
+    return items
 
 
 def obtener_comprobantes_pendientes(conn):
-    return _consultar(
+    """
+    Comprobantes por emitir, con los nombres de campo que espera el resto del daemon.
+
+    La aplicación guarda el tipo como texto ('BOLETA', 'FACTURA') y no el código de
+    SUNAT, y deja en NULL el desglose de importes: ambas cosas se resuelven acá para
+    que procesar_comprobante() reciba siempre lo mismo, venga de donde venga.
+    """
+    filas = _consultar(
         conn,
-        "SELECT * FROM Comprobantes WHERE enviado IS NULL OR enviado = 0 ORDER BY fecha_emision ASC",
+        'SELECT id, "facturaId", "tipoComprobante", "numeracionComprobante", "fechaEmision",'
+        '       "tipoMoneda", "tipoNota", "tipoDocumentoAfectado", "numeracionDocumentoAfectado",'
+        '       "motivoDocumentoAfectado", gravadas, igv, total, "montoLetras"'
+        '  FROM public."Comprobante"'
+        ' WHERE enviado IS NOT TRUE'
+        ' ORDER BY "fechaEmision" ASC NULLS LAST',
     )
+    pendientes = []
+    for f in filas:
+        gravadas, igv = f["gravadas"], f["igv"]
+        if gravadas is None or igv is None:
+            gravadas, igv = _base_e_igv(f["total"])
+        pendientes.append({
+            "id":                             f["id"],
+            "factura_id":                     f["facturaId"],
+            "tipo_comprobante":               _tipo_sunat(f["tipoComprobante"]),
+            "numeracion_comprobante":         f["numeracionComprobante"],
+            "fecha_emision":                  f["fechaEmision"],
+            "tipo_moneda":                    f["tipoMoneda"],
+            "tipo_nota":                      f["tipoNota"],
+            "tipo_documento_afectado":        _tipo_sunat(f["tipoDocumentoAfectado"]),
+            "numeracion_documento_afectado":  f["numeracionDocumentoAfectado"],
+            "motivo_documento_afectado":      f["motivoDocumentoAfectado"],
+            "gravadas":                       gravadas,
+            "igv":                            igv,
+            "total":                          f["total"],
+            "monto_letras": _texto(f["montoLetras"]) or numero_a_letras(f["total"], f["tipoMoneda"]),
+        })
+    return pendientes
 
 # ---------------------------------------------------------------------------
 # Generador de archivos SFS
@@ -509,7 +705,7 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     rutas = {e: os.path.join(SFS_DATA_DIR, f"{base}.{e}") for e in _EXT_DATA}
     rutas["cabecera"] = rutas[ext_cab]
 
-    receptor     = obtener_receptor(conn, comp.get("ReceptorId"))
+    receptor     = obtener_receptor(conn, comp.get("factura_id"))
     tipo_doc_rec = _campo_pipe(receptor.get("tipo_documento"),   "0")
     num_doc_rec  = _campo_pipe(receptor.get("numero_documento"), "00000000")
     razon_social = _campo_pipe(receptor.get("razon_social"),     "CLIENTE VARIOS")
@@ -524,7 +720,7 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     tot_igv   = formatear_decimal(comp.get("igv")       or comp.get("total_igv"))
     tot_venta = formatear_decimal(comp.get("total")     or comp.get("total_venta"))
 
-    lineas_det = [_linea_detalle(item) for item in obtener_items(conn, comp["id"])]
+    lineas_det = [_linea_detalle(item) for item in obtener_items(conn, comp.get("factura_id"))]
     if not lineas_det:
         logger.warning("Comprobante %s sin ítems.", num_comp)
 
@@ -565,7 +761,7 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     else:
         _borrar_si_existe(rutas["det"])
 
-    # OJO: no se toca Comprobantes.enviado acá. Generar los archivos no es haber
+    # OJO: no se toca Comprobante.enviado acá. Generar los archivos no es haber
     # enviado nada; el estado lo mueve ciclo_generacion() recién cuando el SFS
     # confirma la recepción, y lo cierra el CDR de SUNAT.
     logger.info("Archivos SFS generados: %s", num_comp)
@@ -1103,8 +1299,8 @@ def resetear_rechazados(conn, ruc_emisor: str):
                 continue
             intentos = _contar_reintento(num_docu, tip_docu, _texto(des_obse))
             cur.execute(
-                "UPDATE Comprobantes SET enviado=? WHERE numeracion_comprobante=? AND tipo_comprobante=?",
-                (ENVIADO_PENDIENTE, num_docu, tip_docu),
+                'UPDATE public."Comprobante" SET enviado=%s WHERE "numeracionComprobante"=%s',
+                (ENVIADO_PENDIENTE, num_docu),
             )
             sfs.execute(
                 f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
@@ -1214,18 +1410,18 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
     # antes, el motivo viejo ya no aplica.
     filas = _actualizar(
         conn,
-        "UPDATE Comprobantes SET enviado = ?, errors = NULL WHERE numeracion_comprobante = ?",
+        'UPDATE public."Comprobante" SET enviado=%s, errors=NULL WHERE "numeracionComprobante"=%s',
         (ENVIADO_ACEPTADO, numeracion),
     )
     if filas > 0:
         _limpiar_reintento(numeracion)
         return True
     if filas == 0:
-        # SUNAT aceptó algo que no está en Comprobantes: numeración con otro formato,
+        # SUNAT aceptó algo que no está en Comprobante: numeración con otro formato,
         # comprobante borrado, o CDR de otro emisor. Silenciarlo dejaba el documento
         # en enviado=0 y el ZIP archivado como procesado, o sea perdido.
         logger.error(
-            "CDR aceptado de %s pero ningún comprobante coincide en SQL Server; "
+            "CDR aceptado de %s pero ningún comprobante coincide en la BD; "
             "queda en enviado=0.", numeracion,
         )
     return False
@@ -1233,7 +1429,7 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
 
 def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
     """
-    Deja el motivo del rechazo en Comprobantes.errors. Sin esto el código de SUNAT
+    Deja el motivo del rechazo en Comprobante.errors. Sin esto el código de SUNAT
     solo vive en facturador.log, y quien mira la BD no tiene forma de saber por qué
     un comprobante sigue en enviado=0.
     """
@@ -1246,7 +1442,7 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
         detalle += f": {parsed['descripcion']}"
     filas = _actualizar(
         conn,
-        "UPDATE Comprobantes SET errors = ? WHERE numeracion_comprobante = ?",
+        'UPDATE public."Comprobante" SET errors=%s WHERE "numeracionComprobante"=%s',
         (detalle[:_MAX_ERRORS_SQL], numeracion),
     )
     return filas > 0
@@ -1324,7 +1520,7 @@ def _barrer_rpta():
                         ok += 1
                         _mover(ruta, DIR_PROCESADOS)
                     else:
-                        # Aceptado por SUNAT pero no se pudo cerrar en SQL Server
+                        # Aceptado por SUNAT pero no se pudo cerrar en la BD
                         # (sin numeración o sin fila que coincida). Archivarlo como
                         # procesado lo hacía desaparecer con el comprobante en
                         # enviado=0: va a errores/ para que quede a la vista.
@@ -1518,7 +1714,7 @@ if __name__ == "__main__":
     logger.info("  FACTURADOR SUNAT - SFS v2.1")
     logger.info("  SFS DATA : %s", SFS_DATA_DIR)
     logger.info("  SFS RPTA : %s", SFS_RPTA_DIR)
-    logger.info("  SQL SERVER: %s / %s", DB_CONFIG["server"], DB_CONFIG["database"])
+    logger.info("  BASE DE DATOS: %s", _url_sin_clave(DATABASE_URL))
     logger.info("=" * 60)
 
     procesar_respuestas()
