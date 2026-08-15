@@ -4,4 +4,3 @@ __pycache__/
 logs/
 facturador.log
 reintentos.json
-migracion_ruc/
