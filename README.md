@@ -142,8 +142,7 @@ Todo esto salió de decompilar el SFS y de rechazos reales en homologación, no 
 
 Para instalar en la PC de un cliente está el **instalador**, que se ocupa de todo —prerrequisitos, SFS, datos del contribuyente, certificado y procesos— y deja la máquina emitiendo:
 
-- Procedimiento paso a paso: [`instalacion/manual.html`](instalacion/manual.html)
-- Cómo está armado y por qué: [`instalacion/README.md`](instalacion/README.md)
+Cómo está armado y por qué: [`instalacion/README.md`](instalacion/README.md). El procedimiento paso a paso está en el manual en PDF, aparte del repositorio.
 
 Para trabajar sobre el código en una máquina que ya tiene el entorno:
 
