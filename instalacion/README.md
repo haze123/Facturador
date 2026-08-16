@@ -19,7 +19,9 @@ Hay que tener a mano, del cliente:
 - El **certificado digital** `.p12` o `.pfx` y su contraseña
 - La `DATABASE_URL` de la aplicación
 
-Y en la PC: Python 3.10+, Java 8+ y Node.js. `instalar.ps1` avisa si falta alguno, con el enlace de descarga; no los instala solo a propósito — bajar runtimes sin que el operador lo sepa es meterse donde el instalador no debería decidir.
+Los prerrequisitos de la PC —Python 3.10+, Java 8 y Node.js— **los instala el script solo**, con `winget` (viene con Windows 10 1809+ y Windows 11). Si `winget` no está disponible, avisa cuáles faltan con su enlace y se detiene.
+
+Lo único que hay que tener antes es **Git**, para traer el código — o descargar el ZIP del repositorio desde GitHub y descomprimirlo.
 
 ## El procedimiento
 

@@ -56,6 +56,27 @@ function Hay($comando) {
     return [bool](Get-Command $comando -ErrorAction SilentlyContinue)
 }
 
+function Refrescar-Path {
+    <#
+    Vuelve a leer el PATH del registro. Un instalador lo modifica para las
+    consolas NUEVAS, pero la que esta corriendo conserva el de su arranque: sin
+    esto habria que cerrar y reabrir despues de cada instalacion.
+    #>
+    $maquina = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $usuario = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = ($maquina, $usuario | Where-Object { $_ }) -join ";"
+}
+
+function Instalar-Con-Winget($id, $nombre) {
+    <# Devuelve $true si quedo instalado y utilizable. #>
+    Paso "instalando $nombre..."
+    # --silent evita los asistentes; --accept-*-agreements, los prompts legales.
+    winget install --id $id --exact --silent --disable-interactivity `
+                   --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+    Refrescar-Path
+    return $?
+}
+
 # ===========================================================================
 Write-Host ""
 Write-Host "  INSTALACION DEL FACTURADOR SUNAT" -ForegroundColor White
@@ -64,40 +85,65 @@ Write-Host "  Prepara el entorno; los datos del cliente van en configurar.ps1" -
 # --- 1. Prerrequisitos del sistema -----------------------------------------
 Titulo "1. Prerrequisitos"
 
-# Estos tres se instalan a mano a proposito: bajar e instalar runtimes sin que
-# el operador lo sepa es meterse donde el instalador no deberia decidir solo.
+# Lo que hace falta, y con que paquete de winget se resuelve cada uno.
+$requeridos = @(
+    @{ Comando = "python"; Nombre = "Python 3.12"; Id = "Python.Python.3.12"
+       Manual  = "https://www.python.org/downloads/"
+       # Un Python viejo tampoco sirve: main.py usa sintaxis de 3.10 en adelante.
+       Version = { ((python --version 2>&1 | Out-String) -match "Python (\d+)\.(\d+)") -and
+                   ([int]$Matches[1] -gt 3 -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -ge 10)) } }
+    @{ Comando = "java";   Nombre = "Java 8 (Temurin)"; Id = "EclipseAdoptium.Temurin.8.JRE"
+       Manual  = "https://adoptium.net/" }
+    @{ Comando = "node";   Nombre = "Node.js LTS"; Id = "OpenJS.NodeJS.LTS"
+       Manual  = "https://nodejs.org/" }
+)
+
+$hayWinget = Hay "winget"
+if (-not $hayWinget) {
+    Aviso "winget no esta disponible: lo que falte habra que instalarlo a mano"
+    Nota "winget viene con Windows 10 1809+ y Windows 11, como 'Instalador de aplicacion'"
+}
+
 $faltan = @()
-
-if (Hay "python") {
-    $v = (python --version 2>&1 | Out-String).Trim()
-    if ($v -match "Python (\d+)\.(\d+)" -and
-        ([int]$Matches[1] -gt 3 -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -ge 10))) {
-        Ok $v
-    } else {
-        $faltan += "Python 3.10 o superior (hay: $v) -> https://www.python.org/downloads/"
+foreach ($req in $requeridos) {
+    $instalado = Hay $req.Comando
+    # Estar en el PATH no alcanza si la version es demasiado vieja.
+    if ($instalado -and $req.Version -and -not (& $req.Version)) {
+        Aviso "$($req.Nombre): la version instalada es anterior a la minima"
+        $instalado = $false
     }
-} else {
-    $faltan += "Python 3.10 o superior -> https://www.python.org/downloads/"
-}
 
-if (Hay "java") {
-    Ok "Java: $(((java -version 2>&1 | Out-String).Trim() -split "`r?`n")[0] -replace '^java\.exe\s*:\s*', '')"
-} else {
-    $faltan += "Java 8 o superior (lo necesita el SFS) -> https://adoptium.net/"
-}
+    if ($instalado) {
+        $detalle = switch ($req.Comando) {
+            "python" { (python --version 2>&1 | Out-String).Trim() }
+            "java"   { ((java -version 2>&1 | Out-String).Trim() -split "`r?`n")[0] -replace '^java(\.exe)?\s*:\s*', '' }
+            "node"   { "Node $(node --version)" }
+        }
+        Ok $detalle
+        continue
+    }
 
-if (Hay "node") {
-    Ok "Node: $(node --version)"
-} else {
-    $faltan += "Node.js (lo necesita PM2) -> https://nodejs.org/"
+    if (-not $hayWinget) {
+        $faltan += "$($req.Nombre) -> $($req.Manual)"
+        continue
+    }
+
+    Instalar-Con-Winget $req.Id $req.Nombre | Out-Null
+    if (Hay $req.Comando) {
+        Ok "$($req.Nombre) instalado"
+    } else {
+        # Algunos instaladores dejan el PATH listo recien para la proxima consola.
+        Aviso "$($req.Nombre) se instalo pero aun no esta en el PATH de esta consola"
+        $faltan += "$($req.Nombre) (reabrir la consola)"
+    }
 }
 
 if ($faltan.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Falta instalar:" -ForegroundColor Red
+    Write-Host "  Falta resolver:" -ForegroundColor Red
     foreach ($f in $faltan) { Write-Host "    - $f" -ForegroundColor Red }
     Abortar "no se puede continuar sin los prerrequisitos" `
-            "Instalarlos, abrir una consola nueva (para que tomen el PATH) y volver a correr este script."
+            "Si se acaban de instalar: cerrar esta consola, abrir una nueva y volver a correr el script."
 }
 
 # --- 2. Dependencias de Python ---------------------------------------------

@@ -95,7 +95,7 @@ if ($py -match "Python (\d+)\.(\d+)") {
 # mezclarlo con stdout; se recorta para que la linea quede legible.
 $java = Version-De "java" "-version"
 if ($java) {
-    Ok "Java: $($java -replace '^java\.exe\s*:\s*', '')"
+    Ok "Java: $($java -replace '^java(\.exe)?\s*:\s*', '')"
 } else {
     Falla "Java no esta instalado (lo necesita el SFS)"
 }
