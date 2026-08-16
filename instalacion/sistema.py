@@ -29,8 +29,15 @@ PRERREQUISITOS = (
         "version": ("--version", (3, 10)),
     },
     {
+        # No alcanza con que haya Java: las versiones anteriores a la 8u242
+        # rechazan certificados PKCS#12 con codificaciones que las nuevas aceptan
+        # sin problema. Verificado en una instalacion real: con 1.8.0_202 el SFS
+        # respondia "el certificado no fue creado" con un .p12 perfectamente
+        # valido, byte a byte identico a uno que funciona con 1.8.0_492.
         "comando": "java", "nombre": "Java 8 (Temurin)",
         "winget": "EclipseAdoptium.Temurin.8.JRE", "manual": "https://adoptium.net/",
+        # 1.8.0_242: en Java el numero de actualizacion es el CUARTO componente.
+        "version": ("-version", (1, 8, 0, 242)),
     },
     {
         "comando": "node", "nombre": "Node.js LTS",
@@ -78,11 +85,26 @@ def _version_de(comando, argumento):
     return salida.strip().splitlines()[0] if salida.strip() else ""
 
 
-def _cumple_version(comando, argumento, minima):
+def _numeros_de_version(texto):
+    """
+    Los numeros de una version, como tupla comparable.
+
+    Contempla el formato de Java, donde la actualizacion va despues de un guion
+    bajo ("1.8.0_202" -> (1,8,0,202)) y no de un punto como en todo lo demas.
+    """
     import re
-    texto = _version_de(comando, argumento)
-    m = re.search(r"(\d+)\.(\d+)", texto)
-    return bool(m) and tuple(int(x) for x in m.groups()) >= minima
+    m = re.search(r"(\d+(?:\.\d+)*(?:_\d+)?)", texto)
+    if not m:
+        return ()
+    return tuple(int(p) for p in m.group(1).replace("_", ".").split("."))
+
+
+def _cumple_version(comando, argumento, minima):
+    numeros = _numeros_de_version(_version_de(comando, argumento))
+    if not numeros:
+        return False
+    # Se comparan solo tantas partes como pide el minimo: "3.14" cumple (3,10).
+    return numeros[:len(minima)] >= tuple(minima)
 
 
 def refrescar_path():
