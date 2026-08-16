@@ -58,15 +58,11 @@ Se fija la 2.1 porque es la única contra la que se verificó el formato de los 
 
 La opción **3** revisa prerrequisitos, `.env`, la base de la aplicación, la configuración del SFS, **si apunta a producción o beta**, el certificado, los procesos de PM2 y el trabajo pendiente. No modifica nada, y no escribe en `facturador.log` — que es donde se investiga qué pasó con un comprobante real.
 
-## Base de prueba
+## Dos instalaciones sobre la misma base
 
-Para probar una instalación sin apuntarla a producción:
+Dos daemons apuntando a la misma `DATABASE_URL` **compiten por los mismos comprobantes**: el que llegue primero toma cada pendiente, lo envía y lo marca `enviado=true`; el otro ya no lo ve.
 
-```
-python crear_bd_prueba.py "<DATABASE_URL de produccion>" facturador_prueba
-```
-
-Copia solo la estructura de las cuatro tablas que consulta el daemon, sin ningún dato. Es imprescindible: si dos daemons leen la misma base, el de prueba toma los comprobantes reales pendientes, los manda a beta y los marca como enviados. El real nunca los emitiría.
+Mientras se prueba eso es solo ruido, pero con una base en uso real significa que un comprobante puede salir por la instalación equivocada —a beta, sin validez fiscal— y quedar marcado como enviado. Antes de que un cliente empiece a facturar de verdad, una sola instalación por base.
 
 ## Compilar el ejecutable
 
@@ -87,6 +83,5 @@ Deja `FacturadorSetup.exe` en esta carpeta. No se versiona: se genera al publica
 | `sistema.py` | Prerrequisitos, winget, PM2, descarga del SFS |
 | `contribuyente.py` | Validaciones, carga en el SFS, `.env`, ambiente |
 | `chequeos.py` | El diagnóstico |
-| `crear_bd_prueba.py` | Base de prueba sin datos |
 | `_limpiar_contribuyente.py` | Borra los datos del contribuyente anterior |
 | `construir.py` | Compila el `.exe` |
