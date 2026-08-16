@@ -43,17 +43,21 @@ function Dato($texto)   { Write-Host "         $texto" -ForegroundColor DarkGray
 # --- utilidades ------------------------------------------------------------
 
 function Leer-Env {
-    <# El .env como tabla. Se ignoran comentarios y lineas sueltas. #>
+    <#
+    El .env como tabla. Se ignoran comentarios y lineas sueltas.
+    Devuelve $null si el archivo no existe, para distinguirlo de uno vacio.
+    #>
     $ruta = Join-Path $PSScriptRoot "..\.env"
-    $env = @{}
     if (-not (Test-Path $ruta)) { return $null }
+    $tabla = @{}
     foreach ($linea in Get-Content $ruta -Encoding UTF8) {
         $l = $linea.Trim()
         if ($l -eq "" -or $l.StartsWith("#") -or -not $l.Contains("=")) { continue }
         $i = $l.IndexOf("=")
-        $env[$l.Substring(0, $i).Trim()] = $l.Substring($i + 1).Trim()
+        $tabla[$l.Substring(0, $i).Trim()] = $l.Substring($i + 1).Trim()
     }
-    return $env
+    # El coma evita que PowerShell desarme la tabla al devolverla.
+    return ,$tabla
 }
 
 function Version-De($comando, $argumento) {
@@ -87,8 +91,14 @@ if ($py -match "Python (\d+)\.(\d+)") {
 }
 
 # El SFS es una aplicacion Java: sin JRE no arranca.
+# java escribe su version en stderr, y PowerShell le antepone "java.exe : " al
+# mezclarlo con stdout; se recorta para que la linea quede legible.
 $java = Version-De "java" "-version"
-if ($java) { Ok "Java: $java" } else { Falla "Java no esta instalado (lo necesita el SFS)" }
+if ($java) {
+    Ok "Java: $($java -replace '^java\.exe\s*:\s*', '')"
+} else {
+    Falla "Java no esta instalado (lo necesita el SFS)"
+}
 
 $node = Version-De "node" "--version"
 if ($node) { Ok "Node: $node" } else { Falla "Node no esta instalado (lo necesita PM2)" }
@@ -108,17 +118,17 @@ foreach ($paquete in @("psycopg2", "dotenv", "watchdog")) {
 # --- 2. Configuracion del daemon -------------------------------------------
 Titulo "2. Configuracion del daemon (.env)"
 
-$env = Leer-Env
-if ($null -eq $env) {
+$conf = Leer-Env
+if ($null -eq $conf) {
     Falla "no existe el archivo .env"
 } else {
     # Sin estas dos el daemon no arranca; el resto tiene valores por defecto.
     foreach ($clave in @("DATABASE_URL", "EMISOR_RUC")) {
-        if ($env.ContainsKey($clave) -and $env[$clave]) {
+        if ($conf.ContainsKey($clave) -and $conf[$clave]) {
             if ($clave -eq "DATABASE_URL") {
                 Ok "$clave definida"   # nunca se imprime: lleva la contrasena
             } else {
-                Ok "$clave = $($env[$clave])"
+                Ok "$clave = $($conf[$clave])"
             }
         } else {
             Falla "falta $clave en el .env"
@@ -126,22 +136,31 @@ if ($null -eq $env) {
     }
     # Sin credenciales SOL no se cierra ningun resumen diario: su CDR llega
     # detras de un ticket y no hay otra forma de traerlo.
-    if ($env["SOL_USUARIO"] -and $env["SOL_CLAVE"]) {
-        Ok "credenciales SOL configuradas (usuario $($env['SOL_USUARIO']))"
+    if ($conf["SOL_USUARIO"] -and $conf["SOL_CLAVE"]) {
+        Ok "credenciales SOL configuradas (usuario $($conf['SOL_USUARIO']))"
     } else {
         Falla "faltan SOL_USUARIO / SOL_CLAVE: sin eso NO se cierra ningun resumen de boletas"
     }
 }
 
+# --- Rutas de la instalacion ------------------------------------------------
+# Se resuelven una sola vez: el .env manda, y si no esta se usa la ubicacion
+# habitual del SFS.
+$bdSfs   = if ($conf -and $conf["SFS_BD_PATH"])   { $conf["SFS_BD_PATH"] }   else { "C:\SFS_v-2.1\bd\BDFacturador.db" }
+$urlSfs  = if ($conf -and $conf["SFS_BASE_URL"])  { $conf["SFS_BASE_URL"] }  else { "http://localhost:9000" }
+$dataDir = if ($conf -and $conf["SFS_DATA_DIR"])  { $conf["SFS_DATA_DIR"] }  else { "C:\SFS_v-2.1\sunat_archivos\sfs\DATA" }
+
 # --- Chequeos del lado Python ----------------------------------------------
-# Una sola pasada por _chequeos.py, que habla con las dos bases. Vive aparte
-# porque incrustar Python en un here-string de PowerShell rompe las comillas.
-$bdSfsRuta = if ($env -and $env["SFS_BD_PATH"]) { $env["SFS_BD_PATH"] } else { "C:\SFS_v-2.1\bd\BDFacturador.db" }
+# Una sola pasada por _chequeos.py, que habla con las dos bases y con PM2. Vive
+# aparte porque incrustar Python en un here-string de PowerShell rompe las
+# comillas, y porque ConvertFrom-Json no puede con la salida de 'pm2 jlist'.
 $chk = @{}
 $scriptPy = Join-Path $PSScriptRoot "_chequeos.py"
-if (Test-Path $scriptPy) {
+if (-not (Test-Path $scriptPy)) {
+    Falla "falta $scriptPy - no se pueden hacer los chequeos de base de datos ni de PM2"
+} else {
     Push-Location (Join-Path $PSScriptRoot "..")
-    $lineas = python $scriptPy $bdSfsRuta 2>&1
+    $lineas = python $scriptPy $bdSfs 2>&1
     Pop-Location
     foreach ($l in $lineas) {
         $t = "$l".Trim()
@@ -153,7 +172,7 @@ if (Test-Path $scriptPy) {
 # --- 3. Base de datos de la aplicacion -------------------------------------
 Titulo "3. Base de datos de la aplicacion"
 
-if (-not ($env -and $env["DATABASE_URL"])) {
+if (-not ($conf -and $conf["DATABASE_URL"])) {
     Aviso "sin DATABASE_URL no se puede probar la conexion"
 } elseif ($chk["bd_ok"] -eq "1") {
     Ok "conexion establecida"
@@ -169,9 +188,6 @@ if (-not ($env -and $env["DATABASE_URL"])) {
 
 # --- 4. SFS ----------------------------------------------------------------
 Titulo "4. Facturador SUNAT (SFS)"
-
-$bdSfs = if ($env -and $env["SFS_BD_PATH"]) { $env["SFS_BD_PATH"] } else { "C:\SFS_v-2.1\bd\BDFacturador.db" }
-$urlSfs = if ($env -and $env["SFS_BASE_URL"]) { $env["SFS_BASE_URL"] } else { "http://localhost:9000" }
 
 try {
     $r = Invoke-WebRequest -Uri "$urlSfs/" -TimeoutSec 8 -UseBasicParsing
@@ -200,15 +216,14 @@ if (-not (Test-Path $bdSfs)) {
 
     # El RUC del .env y el del SFS tienen que ser el mismo contribuyente.
     $rucSfs = $chk["sfs_NUMRUC"]
-    if ($env -and $env["EMISOR_RUC"] -and $rucSfs -and $env["EMISOR_RUC"] -ne $rucSfs) {
-        Falla "el RUC del .env ($($env['EMISOR_RUC'])) NO coincide con el del SFS ($rucSfs)"
+    if ($conf -and $conf["EMISOR_RUC"] -and $rucSfs -and $conf["EMISOR_RUC"] -ne $rucSfs) {
+        Falla "el RUC del .env ($($conf['EMISOR_RUC'])) NO coincide con el del SFS ($rucSfs)"
     }
 }
 
 # --- 5. Ambiente: produccion o beta ----------------------------------------
 Titulo "5. Ambiente de SUNAT"
 
-$dataDir = if ($env -and $env["SFS_DATA_DIR"]) { $env["SFS_DATA_DIR"] } else { "C:\SFS_v-2.1\sunat_archivos\sfs\DATA" }
 $constantes = Join-Path (Split-Path $dataDir -Parent) "VALI\constantes.properties"
 
 if (Test-Path $constantes) {
@@ -255,13 +270,17 @@ if ($certs.Count -eq 0) {
             }
             # El RUC va dentro del subject; si es de otro contribuyente, SUNAT
             # rechaza con un error que no dice que el problema es el certificado.
-            if ($p -and $p["NUMRUC"]) {
-                if ($x.Subject -match $p["NUMRUC"]) {
-                    Ok "el certificado corresponde al RUC $($p['NUMRUC'])"
+            $rucEmisor = $chk["sfs_NUMRUC"]
+            if (-not $rucEmisor -and $conf) { $rucEmisor = $conf["EMISOR_RUC"] }
+            if ($rucEmisor) {
+                if ($x.Subject -match $rucEmisor) {
+                    Ok "el certificado corresponde al RUC $rucEmisor"
                 } else {
-                    Falla "el certificado NO corresponde al RUC $($p['NUMRUC'])"
+                    Falla "el certificado NO corresponde al RUC $rucEmisor"
                     Dato "titular: $($x.Subject)"
                 }
+            } else {
+                Aviso "no se pudo comparar el RUC: falta el del emisor"
             }
         } catch {
             Falla "no se pudo abrir el certificado (contrasena incorrecta?)"
@@ -291,8 +310,8 @@ if ($chk["pm2_error"]) {
             continue
         }
         # pm_uptime es el instante de arranque en milisegundos desde 1970 (UTC).
-        $arranque = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$campos[2]).LocalDateTime
-        $horas = [math]::Round(((Get-Date) - $arranque).TotalHours, 1)
+        $desde = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$campos[2]).LocalDateTime
+        $horas = [math]::Round(((Get-Date) - $desde).TotalHours, 1)
         $reinicios = [int]$campos[1]
         Ok "'$nombre' online (${horas}h, $reinicios reinicios)"
         # Reinicios repetidos suelen ser un crash en bucle, no una parada normal.
@@ -303,8 +322,8 @@ if ($chk["pm2_error"]) {
 }
 
 # Sin esto, al reiniciar la PC no arranca nada solo.
-$arranque = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
-if ($arranque -and ($arranque.PSObject.Properties.Name -match "pm2")) {
+$registro = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
+if ($registro -and ($registro.PSObject.Properties.Name -match "pm2")) {
     Ok "PM2 arranca automaticamente con Windows"
 } else {
     Aviso "PM2 no esta registrado para arrancar con Windows (pm2-startup install)"
@@ -313,7 +332,12 @@ if ($arranque -and ($arranque.PSObject.Properties.Name -match "pm2")) {
 # --- 8. Trabajo pendiente --------------------------------------------------
 Titulo "8. Estado del trabajo"
 
-if ($chk["sfs_estados"]) {
+if (-not $chk.ContainsKey("sfs_estados")) {
+    Aviso "no se pudo leer la bandeja del SFS"
+} elseif (-not $chk["sfs_estados"]) {
+    # Instalacion nueva: todavia no se emitio nada. No es un problema.
+    Ok "la bandeja del SFS esta vacia (aun no se emitio ningun comprobante)"
+} else {
     $estado = $chk["sfs_estados"]
     $nombres = @{
         "01"="por generar XML"; "02"="XML generado"; "03"="aceptado";
