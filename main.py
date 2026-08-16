@@ -1400,7 +1400,10 @@ def _url_bill_service() -> str:
     beta —o al revés— devolvería "el ticket no existe".
     """
     try:
-        with open(SFS_CONSTANTES_PATH, encoding="utf-8", errors="replace") as fh:
+        # utf-8-sig y no utf-8: si alguien edita el archivo con el Bloc de notas le
+        # queda un BOM al inicio, y con utf-8 ese caracter invisible se pega al
+        # nombre de la primera propiedad.
+        with open(SFS_CONSTANTES_PATH, encoding="utf-8-sig", errors="replace") as fh:
             for linea in fh:
                 linea = linea.strip()
                 # Las variantes que no se usan quedan comentadas con '#', y hay una
