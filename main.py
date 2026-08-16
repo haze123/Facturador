@@ -1853,7 +1853,19 @@ def _boletas_en_resumenes_activos(ruc_emisor: str) -> set:
             activas.update(boletas)
             continue
         if situ:
-            continue  # cerrado: ya se resolvió, no hace falta el resguardo de tiempo
+            continue  # cerrado: ya se resolvió, no hace falta ningún resguardo
+
+        # Sin rastro en la bandeja, pero sus archivos siguen en DATA: el resumen
+        # se generó y todavía no se proceso. Es una señal mas confiable que el
+        # tiempo — si el SFS estuvo caido un rato largo, la gracia se vencia y se
+        # generaba un segundo resumen con las mismas boletas (paso: dos RC del
+        # mismo dia mientras el SFS reiniciaba en bucle). Los .RDI solo se borran
+        # cuando el documento se cierra, asi que su presencia dice "sigue vivo".
+        base = _nombre_archivo_rc(ruc_emisor, numeracion_rc)
+        if os.path.exists(os.path.join(SFS_DATA_DIR, f"{base}.RDI")):
+            activas.update(boletas)
+            continue
+
         try:
             generado = datetime.strptime(entrada.get("generado", ""), "%Y-%m-%d %H:%M:%S")
         except ValueError:
