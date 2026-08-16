@@ -7,12 +7,13 @@ romperia con cualquier actualizacion suya.
 """
 import json
 import os
-import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+
+import sistema
 
 BETA = "https://e-beta.sunat.gob.pe/ol-ti-itcpfegem-beta/billService"
 PRODUCCION = "https://e-factura.sunat.gob.pe/ol-ti-itcpfegem/billService"
@@ -261,6 +262,65 @@ def fijar_ambiente(ruta_sfs, produccion):
     return True, destino
 
 
+def escribir_config_pm2(raiz, ruta_sfs):
+    """
+    Genera sfs.config.js con las rutas reales de esta instalacion.
+
+    El archivo versionado trae rutas absolutas fijas, que solo sirven en la PC
+    donde se escribio: si el proyecto o el SFS quedan en otra carpeta, PM2
+    intenta arrancar los procesos en directorios que no existen. Y como lee todo
+    el archivo aunque se le pida un solo proceso, alcanza con que una ruta este
+    mal para que falle.
+    """
+    contenido = """// Generado por el instalador: las rutas son las de ESTA instalacion.
+module.exports = {
+  apps: [
+    {
+      name: "sfs",
+      script: "java",
+      args: "-jar facturadorApp-%(version)s.jar server prod.yaml",
+      cwd: %(sfs)s,
+      watch: false,
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 10,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/sfs-error.log",
+      out_file: "logs/sfs-out.log",
+      merge_logs: true,
+    },
+    {
+      name: "facturador",
+      script: "main.py",
+      interpreter: "python",
+      cwd: %(raiz)s,
+      watch: false,
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 10,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        PYTHONIOENCODING: "utf-8",
+      },
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/error.log",
+      out_file: "logs/out.log",
+      merge_logs: true,
+    },
+  ],
+};
+""" % {
+        # json.dumps escapa las barras invertidas de las rutas de Windows.
+        "sfs": json.dumps(ruta_sfs),
+        "raiz": json.dumps(raiz),
+        "version": sistema.VERSION_SFS,
+    }
+    destino = os.path.join(raiz, "sfs.config.js")
+    with open(destino, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(contenido)
+    return destino
+
+
 def escribir_env(raiz, datos, ruta_sfs):
     """Genera el .env del daemon. Devuelve la ruta del respaldo, si hubo."""
     contenido = f"""# Generado por el instalador el {datetime.now():%Y-%m-%d %H:%M}
@@ -299,7 +359,6 @@ DESFASE_BD_HORAS=auto
 
 def _restringir_permisos(archivo):
     """El .env lleva la clave SOL y la de la base en texto plano."""
-    import sistema
     usuario = os.environ.get("USERNAME", "")
     if usuario:
         sistema.correr(f'icacls "{archivo}" /inheritance:r /grant:r "{usuario}:(F)"', timeout=30)
