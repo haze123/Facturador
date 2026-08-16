@@ -240,14 +240,35 @@ def cargar_en_sfs(base_url, datos, avisar=print):
         return False, f"el SFS rechazo la direccion: {_motivo(r)}"
     avisar("    direccion fiscal cargada")
 
+    # El SFS NO usa la ruta que se le pasa: arma la suya pegando su carpeta CERT
+    # con lo que reciba en 'nombreCertificado' (verificado en el bytecode de
+    # importarCertificado). Mandarle una ruta completa produce algo como
+    # "...\CERT\C:\otra\ruta\cert.p12", que no existe, y el SFS solo responde
+    # "el certificado no fue creado" sin decir que el problema es la ruta.
+    # Asi que el archivo se copia a CERT y se le manda unicamente el nombre.
+    nombre = _copiar_a_cert(datos["ruta_sfs"], datos["ruta_certificado"])
     r = _post_sfs(base_url, "ImportarCertificado.htm", {
-        "nombreCertificado": datos["ruta_certificado"],
+        "nombreCertificado": nombre,
         "passPrivateKey": datos["clave_certificado"],
     })
     if r.get("validacion") != "EXITO":
         return False, f"el SFS rechazo el certificado: {_motivo(r)}"
-    avisar("    certificado importado")
+    avisar(f"    certificado importado ({nombre})")
     return True, ""
+
+
+def _copiar_a_cert(ruta_sfs, origen):
+    """Deja el certificado en la carpeta CERT del SFS y devuelve su nombre."""
+    import shutil
+    destino_dir = os.path.join(ruta_sfs, "sunat_archivos", "sfs", "CERT")
+    os.makedirs(destino_dir, exist_ok=True)
+    nombre = os.path.basename(origen)
+    destino = os.path.join(destino_dir, nombre)
+    # Si ya es el mismo archivo no hay nada que copiar: copiarlo sobre si mismo
+    # falla y ademas lo dejaria en cero.
+    if os.path.abspath(origen) != os.path.abspath(destino):
+        shutil.copy2(origen, destino)
+    return nombre
 
 
 def fijar_ambiente(ruta_sfs, produccion):
