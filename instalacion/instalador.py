@@ -240,12 +240,26 @@ def configurar_cliente():
     }
 
     titulo("5. Configurando el SFS")
+    # Antes de arrancar nada: el sfs.config.js versionado trae rutas fijas de otra
+    # PC, y PM2 lee el archivo entero aunque se le pida un solo proceso.
+    config = contribuyente.escribir_config_pm2(RAIZ, ruta_sfs)
+    ok(f"{os.path.basename(config)} generado con las rutas de esta PC")
+
     base_url = "http://localhost:9000"
     if not contribuyente.esperar_sfs(base_url, segundos=5):
-        paso("levantando el SFS...")
-        sistema.correr(["pm2", "start", os.path.join(RAIZ, "sfs.config.js"), "--only", "sfs"])
+        paso("levantando el SFS (puede tardar hasta un minuto)...")
+        codigo, salida = sistema.correr(["pm2", "start", config, "--only", "sfs"], timeout=120)
         if not contribuyente.esperar_sfs(base_url, segundos=90):
             error("el SFS no respondio despues de 90 segundos")
+            # Sin esto habria que ir a buscar el motivo a los logs de PM2.
+            nota("  Respuesta de PM2:")
+            for linea in salida.strip().splitlines()[-6:]:
+                nota(f"    {linea}")
+            codigo, log = sistema.correr("pm2 logs sfs --lines 12 --nostream", timeout=60)
+            if log.strip():
+                nota("  Ultimas lineas del SFS:")
+                for linea in log.strip().splitlines()[-8:]:
+                    nota(f"    {linea}")
             return False
     ok("el SFS responde")
 
@@ -268,10 +282,14 @@ def configurar_cliente():
         nota(f"  se respaldo el .env anterior en {os.path.basename(respaldo)}")
     ok(".env escrito y restringido al usuario actual")
 
-    sistema.correr(["pm2", "start", os.path.join(RAIZ, "sfs.config.js")])
+    sistema.correr(["pm2", "start", config])
     sistema.correr(["pm2", "save"])
-    sistema.correr(["pm2-startup", "install"])
-    ok("SFS y daemon en PM2, con arranque automatico")
+    codigo, _ = sistema.correr(["pm2-startup", "install"], timeout=120)
+    ok("SFS y daemon registrados en PM2")
+    if sistema.hay("pm2-startup"):
+        ok("arranque automatico con Windows")
+    else:
+        aviso("sin arranque automatico: al prender la PC hay que correr 'pm2 resurrect'")
 
     print(f"\n{C.VERDE}  LISTO - la instalacion quedo en BETA{C.FIN}")
     nota("\n  Antes de pasar a produccion:")
