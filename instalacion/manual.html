@@ -225,7 +225,19 @@
        de una fila de tabla. */
     .aviso, pre, figure, .previo { break-inside: avoid; }
     .paso { break-inside: auto; }
-    h2 { break-after: avoid; }
+
+    /* Un parrafo o un item son cortos: se mantienen enteros. Sin esto, permitir
+       que el paso se reparta hace que el corte caiga a mitad de una oracion. */
+    p, li, h2 { break-inside: avoid; }
+    /* Nunca una linea sola al pie ni al comienzo de una hoja. */
+    body { orphans: 3; widows: 3; }
+
+    /* La linea que presenta un comando o un aviso va pegada a el: separarlos deja
+       un "Habilitar la ejecucion de scripts:" al pie de una hoja y el comando en
+       la siguiente. */
+    h2, p:has(+ pre), p:has(+ .aviso), p:has(+ figure), p:has(+ .tabla-scroll) {
+      break-after: avoid;
+    }
 
     /* La tabla se divide entre filas, nunca dentro de una, y el encabezado se
        repite en cada hoja para no perder de vista que columna es cual. */
