@@ -18,7 +18,7 @@ Por eso el daemon llama a `sincronizar_bandeja_sfs()` al inicio de cada ciclo y 
 
 ## Tipos de comprobante
 
-Se emiten factura (`01`), nota de crédito (`07`) y nota de débito (`08`) de forma individual, y boleta (`03`) agrupada en el resumen diario (`RC`, ver más abajo). Para anular un comprobante ya aceptado se usa la nota de crédito, no la comunicación de baja (ver "Limitaciones conocidas").
+Se emiten factura (`01`), nota de crédito (`07`) y nota de débito (`08`) de forma individual, y boleta (`03`) agrupada en el resumen diario (`RC`, ver más abajo). Para anular un comprobante ya aceptado se emite una nota de crédito.
 
 Las notas exigen la referencia al documento que corrigen, y esos campos salen de `Factura`:
 
@@ -255,8 +255,6 @@ El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la
 ## Limitaciones conocidas
 
 **El valor unitario pierde precisión.** Se redondea a 2 decimales y luego se escribe con 6, así que `cantidad x valor_unitario` puede diferir en céntimos del valor de venta declarado. SUNAT lo tolera en comprobantes chicos, pero el error se acumula con la cantidad de líneas.
-
-**No se emite comunicación de baja (`RA`), y es una decisión, no una falta.** Para anular un comprobante ya aceptado se usa una nota de crédito, que el daemon sí emite y que además no tiene el plazo de 7 días de la baja. La baja solo sería preferible ante un documento duplicado, donde revertirlo con una nota deja tres documentos en vez de uno; si ese caso aparece, se evalúa entonces.
 
 **El resumen diario no maneja rechazo parcial de una línea.** Si SUNAT acepta el resumen pero observa una boleta puntual dentro de él, ese caso no se detecta automáticamente y necesita revisión manual (ver "Resumen diario de boletas").
 
