@@ -275,10 +275,14 @@ def configurar_cliente():
     nota(f"  {destino}")
 
     titulo("7. Daemon")
-    respaldo = contribuyente.escribir_env(RAIZ, datos, ruta_sfs)
+    respaldo, restringido = contribuyente.escribir_env(RAIZ, datos, ruta_sfs)
     if respaldo:
         nota(f"  se respaldo el .env anterior en {os.path.basename(respaldo)}")
-    ok(".env escrito y restringido al usuario actual")
+    if restringido:
+        ok(".env escrito y restringido al usuario actual")
+    else:
+        ok(".env escrito")
+        aviso("no se pudo restringir su acceso; lleva claves en texto plano")
 
     sistema.correr(["pm2", "start", config])
     sistema.correr(["pm2", "save"])
