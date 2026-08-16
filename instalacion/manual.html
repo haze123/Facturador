@@ -224,7 +224,20 @@
        una— y el navegador termina cortandolo por cualquier lado, incluso a mitad
        de una fila de tabla. */
     .aviso, pre, figure, .previo { break-inside: avoid; }
-    .paso { break-inside: auto; }
+
+    /* En pantalla el paso es una grilla de dos columnas, pero Chrome fragmenta mal
+       los contenedores grid al imprimir: en vez de cortar entre lineas, rebana el
+       contenido y parte los renglones por la mitad. En papel se pasa a bloque,
+       con el numero flotando al margen. */
+    .paso { display: block; break-inside: auto; }
+    .paso > .n {
+      float: left;
+      width: 26px; height: 22px;
+      margin: 2px 12px 0 0;
+      font-size: 10pt;
+    }
+    .paso > .cuerpo { overflow: visible; }
+    .paso h2 { margin-left: 38px; }
 
     /* Un parrafo o un item son cortos: se mantienen enteros. Sin esto, permitir
        que el paso se reparta hace que el corte caiga a mitad de una oracion. */

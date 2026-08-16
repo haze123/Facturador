@@ -1024,6 +1024,10 @@ def _linea_rdi(fecha_emision: str, fecha_resumen: str, boleta: dict, receptor: d
         "", "", "", "",
         "1",
     ]
+    # Una columna de más o de menos hace que el SFS rechace el archivo entero con
+    # un mensaje que no dice cuál falta; mejor que salte acá.
+    if len(campos) != _COLS_RDI:
+        raise ValueError(f".RDI: {len(campos)} columnas, se esperan {_COLS_RDI}")
     return "|".join(campos) + "|\n"
 
 
@@ -1036,7 +1040,10 @@ def _linea_trd(id_linea: int, boleta: dict) -> str:
     """
     grav = formatear_decimal(boleta["gravadas"])
     igv  = formatear_decimal(boleta["igv"])
-    return f"{id_linea}|1000|IGV|VAT|{grav:.2f}|{igv:.2f}|\n"
+    campos = [str(id_linea), "1000", "IGV", "VAT", f"{grav:.2f}", f"{igv:.2f}"]
+    if len(campos) != _COLS_TRD:
+        raise ValueError(f".TRD: {len(campos)} columnas, se esperan {_COLS_TRD}")
+    return "|".join(campos) + "|\n"
 
 
 def generar_resumen_diario(conn, ruc_emisor: str):

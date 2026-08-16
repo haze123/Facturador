@@ -1,6 +1,6 @@
-# Instalación en un cliente nuevo
+# Instalador
 
-Todo se hace desde **`FacturadorSetup.exe`**: un solo ejecutable con menú, que lleva adentro su propio Python. Por eso corre en una PC recién formateada, donde todavía no hay nada instalado.
+Un solo ejecutable con menú, `FacturadorSetup.exe`, que lleva adentro su propio Python. Por eso corre en una PC recién formateada, donde todavía no hay nada instalado.
 
 ```
    1  Instalar el entorno (prerrequisitos, PM2, SFS)
@@ -9,35 +9,9 @@ Todo se hace desde **`FacturadorSetup.exe`**: un solo ejecutable con menú, que 
    4  Pasar a produccion
 ```
 
-Están separados a propósito: cuando a un cliente le vence el certificado —que pasa— no hay que reinstalar nada, se corre solo la opción 2.
+**El procedimiento paso a paso está en [`manual.html`](manual.html)** — abrirlo en el navegador. Este documento cubre lo demás: por qué está armado así y qué hacer cuando algo se sale del camino.
 
-## Antes de empezar
-
-Hay que tener a mano, del cliente:
-
-- RUC, razón social y dirección fiscal **con ubigeo** (6 dígitos)
-- Usuario y clave **SOL secundarios** (no los principales)
-- El **certificado digital** `.p12` o `.pfx` y su contraseña
-- La `DATABASE_URL` de la aplicación
-
-Python, Java y Node los instala el propio programa con `winget`.
-
-## El procedimiento
-
-1. Copiar la carpeta del proyecto a la PC (clonar el repositorio o descomprimir el ZIP)
-2. Doble click en **`FacturadorSetup.exe`**
-3. Opción **1** — instala prerrequisitos, PM2 y descarga el SFS (~90 MB)
-4. Opción **2** — pide los datos del cliente y deja todo andando
-
-Al terminar el paso 4 **la instalación queda apuntando a beta**. Eso es deliberado:
-
-1. Emitir un comprobante de prueba y confirmar que SUNAT lo acepte
-2. Borrar los comprobantes de prueba de la base de la aplicación
-3. Recién entonces, opción **4** — pasar a producción
-
-**Por qué no instalar directo en producción.** Si algo está mal configurado y un comprobante real sale contra beta, el daemon lo marca como `enviado=true` en la base pero ante SUNAT no existe — y después nada delata la diferencia. Es el peor error posible de este sistema, y arrancar en beta lo vuelve imposible.
-
-> **La primera vez que se abre en una PC nueva, Windows muestra "Windows protegió su PC".** Es SmartScreen, porque el ejecutable no está firmado: *Más información → Ejecutar de todas formas*. Evitarlo requiere un certificado de firma de código (200–400 USD al año).
+Las cuatro opciones están separadas a propósito: cuando a un cliente le vence el certificado —que pasa— no hay que reinstalar nada, se corre solo la opción 2.
 
 ## Lo que el instalador no hace, y por qué
 
@@ -47,6 +21,8 @@ Al terminar el paso 4 **la instalación queda apuntando a beta**. Eso es deliber
 
 **No prende el temporizador del SFS.** Sus jobs internos de generar y enviar harían por su cuenta lo mismo que el daemon hace por REST, compitiendo por los mismos documentos.
 
+**No firma el ejecutable.** Por eso Windows muestra *"Windows protegió su PC"* la primera vez en cada máquina: *Más información → Ejecutar de todas formas*. Evitarlo requiere un certificado de firma de código, entre 200 y 400 USD al año.
+
 ## Versión del SFS
 
 Se instala la **2.1**. SUNAT publica hasta la 2.4 en
@@ -54,15 +30,15 @@ Se instala la **2.1**. SUNAT publica hasta la 2.4 en
 
 Se fija la 2.1 porque es la única contra la que se verificó el formato de los archivos planos que genera el daemon, incluido el del resumen diario de boletas. Actualizar es una decisión aparte: hay que volver a probar la emisión de cada tipo de comprobante.
 
-## Diagnóstico
-
-La opción **3** revisa prerrequisitos, `.env`, la base de la aplicación, la configuración del SFS, **si apunta a producción o beta**, el certificado, los procesos de PM2 y el trabajo pendiente. No modifica nada, y no escribe en `facturador.log` — que es donde se investiga qué pasó con un comprobante real.
-
 ## Dos instalaciones sobre la misma base
 
 Dos daemons apuntando a la misma `DATABASE_URL` **compiten por los mismos comprobantes**: el que llegue primero toma cada pendiente, lo envía y lo marca `enviado=true`; el otro ya no lo ve.
 
 Mientras se prueba eso es solo ruido, pero con una base en uso real significa que un comprobante puede salir por la instalación equivocada —a beta, sin validez fiscal— y quedar marcado como enviado. Antes de que un cliente empiece a facturar de verdad, una sola instalación por base.
+
+## Reutilizar una PC que ya tenía otro cliente
+
+La opción 2 lo detecta y pregunta antes de borrar nada. Si se responde que sí, vacía los datos del contribuyente anterior (RUC, credenciales, certificado y el historial de comprobantes) dejando un respaldo de la base. Si se responde que no, avisa y sigue — pero conviene estar seguro: emitir con el certificado de otro contribuyente es facturar a su nombre.
 
 ## Compilar el ejecutable
 
@@ -73,15 +49,17 @@ python -m pip install pyinstaller
 python construir.py
 ```
 
-Deja `FacturadorSetup.exe` en esta carpeta. No se versiona: se genera al publicar.
+Deja `FacturadorSetup.exe` en esta carpeta. No se versiona: se publica como release en GitHub.
 
 ## Los archivos
 
 | Archivo | Qué es |
 |---|---|
+| `manual.html` | El procedimiento de instalación, paso a paso |
 | `instalador.py` | El menú y el flujo de cada operación |
 | `sistema.py` | Prerrequisitos, winget, PM2, descarga del SFS |
-| `contribuyente.py` | Validaciones, carga en el SFS, `.env`, ambiente |
-| `chequeos.py` | El diagnóstico |
-| `_limpiar_contribuyente.py` | Borra los datos del contribuyente anterior |
+| `contribuyente.py` | Validaciones, carga en el SFS, `.env`, limpieza |
+| `chequeos.py` | El diagnóstico de la opción 3 |
 | `construir.py` | Compila el `.exe` |
+
+`sfs.config.js`, en la raíz del proyecto, **lo genera la opción 2** con las rutas de cada PC. No se versiona: tenerlo en el repositorio hacía que una instalación nueva heredara las rutas de otra máquina y PM2 no arrancara.
