@@ -43,7 +43,20 @@ def correr(comando, timeout=900):
     """
     Ejecuta un programa y devuelve (codigo, salida). Junta stdout y stderr porque
     varios (java, npm, pip) escriben informacion util en el segundo.
+
+    OJO con el primer elemento: en Windows, pm2, npm, gh y winget no son .exe sino
+    archivos .CMD, y Windows no sabe ejecutarlos sin pasar por el shell. Invocarlos
+    con una lista (que Python corre sin shell) falla con "no se puede encontrar el
+    archivo" aunque esten instalados y en el PATH. Por eso se resuelve la ruta real
+    con which() y, si termina en .cmd o .bat, se ejecuta a traves de cmd.exe.
     """
+    if isinstance(comando, (list, tuple)):
+        comando = list(comando)
+        ruta = shutil.which(comando[0])
+        if ruta:
+            comando[0] = ruta
+            if ruta.lower().endswith((".cmd", ".bat")):
+                comando = ["cmd", "/c"] + comando
     try:
         r = subprocess.run(
             comando, shell=isinstance(comando, str), capture_output=True,
@@ -53,7 +66,7 @@ def correr(comando, timeout=900):
     except subprocess.TimeoutExpired:
         return -1, f"el comando tardo mas de {timeout} segundos"
     except Exception as e:
-        return -1, str(e)
+        return -1, f"{type(e).__name__}: {e}"
 
 
 def hay(comando):
