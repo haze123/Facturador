@@ -1538,8 +1538,12 @@ def recuperar_cdr_resumenes(ruc_emisor: str):
         if cdr and codigo in _TICKET_CON_CDR:
             # Vale tanto para el aceptado como para el rechazado: el parser del CDR
             # decide cuál es, igual que con cualquier otro comprobante.
+            # El resumen NO se cierra acá: recién cuando el hilo CDR termine de
+            # procesarlo. Cerrarlo al bajarlo dejaba un hueco de segundos en el que
+            # el resumen ya figuraba cerrado —y por lo tanto sus boletas libres—
+            # pero todavía no estaban en enviado=true, así que el ciclo siguiente
+            # las tomaba y armaba otro resumen con las mismas.
             _guardar_cdr(ruc_emisor, _TIPO_RC, numeracion, cdr, f"ticket {ticket}: {mensaje}")
-            _cerrar_resumen_en_sfs(ruc_emisor, numeracion)
         else:
             logger.warning(
                 "Ticket %s de %s devolvió el código %s sin CDR (%s); se reintenta.",
@@ -2106,6 +2110,10 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
         )
         if filas > 0:
             _limpiar_reintento(numeracion)
+            # Recién ahora el resumen esta terminado de verdad: sus boletas ya
+            # quedaron cerradas. Marcarlo antes liberaba las boletas mientras
+            # todavia figuraban pendientes, y se generaba otro resumen con ellas.
+            _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
             logger.info("Resumen %s aceptado: %d boleta(s) marcadas enviado=1.", numeracion, filas)
             return True
         logger.error(
@@ -2158,6 +2166,10 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
             'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante" = ANY(%s)',
             (detalle[:_MAX_ERRORS_SQL], boletas),
         )
+        # Aunque haya sido rechazado, el ticket ya se consumio: dejarlo abierto
+        # haria que se lo siguiera consultando en vano en cada ciclo. El motivo
+        # del rechazo queda en Factura.errors, que es donde se consulta.
+        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
         return filas > 0
 
     filas = _actualizar(
