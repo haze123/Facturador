@@ -9,7 +9,7 @@ Un solo ejecutable con menú, `FacturadorSetup.exe`, que lleva adentro su propio
    4  Pasar a produccion
 ```
 
-**El procedimiento paso a paso está en [`manual.html`](manual.html)** — abrirlo en el navegador. Este documento cubre lo demás: por qué está armado así y qué hacer cuando algo se sale del camino.
+**El procedimiento paso a paso está en el manual en PDF**, que se distribuye aparte del repositorio. Este documento cubre lo demás: por qué el instalador está armado así y qué hacer cuando algo se sale del camino.
 
 Las cuatro opciones están separadas a propósito: cuando a un cliente le vence el certificado —que pasa— no hay que reinstalar nada, se corre solo la opción 2.
 
@@ -55,7 +55,6 @@ Deja `FacturadorSetup.exe` en esta carpeta. No se versiona: se publica como rele
 
 | Archivo | Qué es |
 |---|---|
-| `manual.html` | El procedimiento de instalación, paso a paso |
 | `instalador.py` | El menú y el flujo de cada operación |
 | `sistema.py` | Prerrequisitos, winget, PM2, descarga del SFS |
 | `contribuyente.py` | Validaciones, carga en el SFS, `.env`, limpieza |
