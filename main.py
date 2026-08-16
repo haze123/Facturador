@@ -1828,23 +1828,19 @@ def _boletas_de_resumen(numeracion_rc: str) -> list:
 
 def _boletas_en_resumenes_activos(ruc_emisor: str) -> set:
     """
-    Boletas que ya están dentro de un resumen que el SFS sigue teniendo registrado y
-    sin cerrar (pendiente o bloqueado): no se las incluye de nuevo en un resumen
-    nuevo mientras el primero todavía espera respuesta de SUNAT, ni mientras siga
-    bloqueado esperando revisión manual. Un resumen ya cerrado no necesita este
-    filtro —sus boletas ya quedaron en enviado=true.
+    Boletas que ya entraron en algún resumen y por lo tanto NO pueden entrar en
+    otro. Solo se liberan cuando ese resumen se cerró, porque ahí ya quedaron en
+    enviado=true y las filtra obtener_boletas_para_resumen() por su cuenta.
 
-    Un resumen recién generado tampoco aparece todavía en _docs_en_vuelo(): el SFS
-    lo escanea con un job propio, no en la misma llamada REST que lo entrega, y eso
-    tardó hasta un minuto y medio en la práctica. Por eso, mientras no haya pasado
-    _GRACIA_REGISTRO_RC_SEG desde que se generó, se lo trata como activo aunque el
-    SFS todavía no sepa nada de él — sin este resguardo, el siguiente ciclo (60s) lo
-    daba por libre y generaba un segundo resumen con las mismas boletas. Pasada la
-    gracia sin rastro en el SFS, recién ahí se asume que se perdió de verdad (p. ej.
-    la llamada REST falló) y se liberan sus boletas.
+    En cualquier otro caso se retienen, incluso si el SFS no sabe nada del resumen:
+    esa ausencia no distingue entre "nunca se entregó" y "se entregó y ya se
+    limpió". Liberarlas ante la duda es lo que genera el peor error posible acá —
+    las mismas boletas declaradas dos veces a SUNAT, que acepta ambos resúmenes sin
+    notar que llevan los mismos comprobantes, y que solo se deshace con una
+    comunicación de baja. Retenerlas de más, en cambio, se ve en el log y se
+    resuelve sacando el resumen de resumenes.json.
     """
     en_vuelo = _docs_en_vuelo(ruc_emisor)
-    ahora = datetime.now()
     activas = set()
     for numeracion_rc, entrada in _leer_resumenes().get("resumenes", {}).items():
         boletas = entrada.get("boletas", [])
@@ -1855,24 +1851,45 @@ def _boletas_en_resumenes_activos(ruc_emisor: str) -> set:
         if situ:
             continue  # cerrado: ya se resolvió, no hace falta ningún resguardo
 
-        # Sin rastro en la bandeja, pero sus archivos siguen en DATA: el resumen
-        # se generó y todavía no se proceso. Es una señal mas confiable que el
-        # tiempo — si el SFS estuvo caido un rato largo, la gracia se vencia y se
-        # generaba un segundo resumen con las mismas boletas (paso: dos RC del
-        # mismo dia mientras el SFS reiniciaba en bucle). Los .RDI solo se borran
-        # cuando el documento se cierra, asi que su presencia dice "sigue vivo".
-        base = _nombre_archivo_rc(ruc_emisor, numeracion_rc)
-        if os.path.exists(os.path.join(SFS_DATA_DIR, f"{base}.RDI")):
-            activas.update(boletas)
-            continue
-
-        try:
-            generado = datetime.strptime(entrada.get("generado", ""), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-        if (ahora - generado).total_seconds() < _GRACIA_REGISTRO_RC_SEG:
-            activas.update(boletas)
+        # Sin rastro en la bandeja del SFS no se puede saber qué pasó: puede que
+        # nunca se haya entregado, o que se haya entregado y ya se limpiara. Ante
+        # esa duda las boletas NO se liberan.
+        #
+        # Antes se liberaban pasado un lapso, y eso genero dos resumenes con las
+        # mismas boletas mientras el SFS reiniciaba en bucle: SUNAT acepto los
+        # dos, porque no detecta que lleven los mismos comprobantes. Declarar dos
+        # veces solo se deshace con una comunicacion de baja. Una boleta trabada,
+        # en cambio, se ve en el log y se destraba sacando su resumen de
+        # resumenes.json: molesto, pero reversible.
+        activas.update(boletas)
+        if not _rdi_presente(ruc_emisor, numeracion_rc):
+            _avisar_resumen_sin_rastro(numeracion_rc, entrada, boletas)
     return activas
+
+
+def _rdi_presente(ruc_emisor: str, numeracion_rc: str) -> bool:
+    """
+    True si el .RDI del resumen sigue en DATA, o sea que aun no se proceso: esos
+    archivos solo se borran cuando el documento se cierra.
+    """
+    base = _nombre_archivo_rc(ruc_emisor, numeracion_rc)
+    return os.path.exists(os.path.join(SFS_DATA_DIR, f"{base}.RDI"))
+
+
+def _avisar_resumen_sin_rastro(numeracion_rc: str, entrada: dict, boletas: list):
+    """Un resumen del que no queda ninguna señal necesita que alguien lo mire."""
+    try:
+        generado = datetime.strptime(entrada.get("generado", ""), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return
+    if (datetime.now() - generado).total_seconds() < _GRACIA_REGISTRO_RC_SEG:
+        return   # recien generado: es normal que todavia no haya rastro
+    logger.warning(
+        "El resumen %s no figura en el SFS ni tiene archivos en DATA. Sus %d "
+        "boleta(s) quedan retenidas para no declararlas dos veces. Si se confirma "
+        "que nunca llego a SUNAT, borrar su entrada de %s para que vuelvan a la cola.",
+        numeracion_rc, len(boletas), os.path.basename(_RESUMENES_PATH),
+    )
 
 
 def _leer_reintentos() -> dict:
