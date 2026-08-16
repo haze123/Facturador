@@ -1,6 +1,5 @@
-<title>Manual de Campo del Facturador</title>
+<title>Instalación del Facturador</title>
 <style>
-  /* ---- Tokens: paleta clara completa en :root ---- */
   :root {
     --papel:      #f6f7f9;
     --superficie: #ffffff;
@@ -15,57 +14,31 @@
     --peligro-bg: #fcecec;
     --alerta:     #8a5a00;
     --alerta-bg:  #fdf3e0;
-    --ok:         #1f6b45;
-    --ok-bg:      #e8f4ed;
     --codigo-bg:  #10151c;
     --codigo-tx:  #d7dde6;
     --sombra:     0 1px 2px rgba(18,22,29,.06), 0 4px 12px rgba(18,22,29,.05);
-
-    --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
     --sans:  system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     --mono:  ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --papel:      #0e1116;
-      --superficie: #161b23;
-      --borde:      #2a323e;
-      --borde-sutil:#212832;
-      --tinta:      #e6eaf0;
-      --tinta-2:    #a8b2c0;
-      --tinta-3:    #7b8492;
-      --azul:       #7aa7e0;
-      --azul-claro: #16233a;
-      --peligro:    #f08a8a;
-      --peligro-bg: #2a1618;
-      --alerta:     #e0b263;
-      --alerta-bg:  #2a2113;
-      --ok:         #6fc79a;
-      --ok-bg:      #12251c;
-      --codigo-bg:  #0a0d12;
-      --codigo-tx:  #ccd4de;
-      --sombra:     0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
+      --papel: #0e1116; --superficie: #161b23; --borde: #2a323e; --borde-sutil: #212832;
+      --tinta: #e6eaf0; --tinta-2: #a8b2c0; --tinta-3: #7b8492;
+      --azul: #7aa7e0; --azul-claro: #16233a;
+      --peligro: #f08a8a; --peligro-bg: #2a1618;
+      --alerta: #e0b263; --alerta-bg: #2a2113;
+      --codigo-bg: #0a0d12; --codigo-tx: #ccd4de;
+      --sombra: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
     }
   }
   :root[data-theme="dark"] {
-    --papel:      #0e1116;
-    --superficie: #161b23;
-    --borde:      #2a323e;
-    --borde-sutil:#212832;
-    --tinta:      #e6eaf0;
-    --tinta-2:    #a8b2c0;
-    --tinta-3:    #7b8492;
-    --azul:       #7aa7e0;
-    --azul-claro: #16233a;
-    --peligro:    #f08a8a;
-    --peligro-bg: #2a1618;
-    --alerta:     #e0b263;
-    --alerta-bg:  #2a2113;
-    --ok:         #6fc79a;
-    --ok-bg:      #12251c;
-    --codigo-bg:  #0a0d12;
-    --codigo-tx:  #ccd4de;
-    --sombra:     0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
+    --papel: #0e1116; --superficie: #161b23; --borde: #2a323e; --borde-sutil: #212832;
+    --tinta: #e6eaf0; --tinta-2: #a8b2c0; --tinta-3: #7b8492;
+    --azul: #7aa7e0; --azul-claro: #16233a;
+    --peligro: #f08a8a; --peligro-bg: #2a1618;
+    --alerta: #e0b263; --alerta-bg: #2a2113;
+    --codigo-bg: #0a0d12; --codigo-tx: #ccd4de;
+    --sombra: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
   }
 
   * { box-sizing: border-box; }
@@ -73,18 +46,17 @@
     margin: 0;
     background: var(--papel);
     color: var(--tinta);
-    font-family: var(--serif);
-    font-size: 17px;
-    line-height: 1.65;
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
     -webkit-font-smoothing: antialiased;
   }
-  .envoltura { max-width: 780px; margin: 0 auto; padding: 0 24px 96px; }
+  .envoltura { max-width: 720px; margin: 0 auto; padding: 0 24px 80px; }
 
-  /* ---- Cabecera ---- */
-  header.tapa {
+  header {
     border-bottom: 2px solid var(--tinta);
-    padding: 56px 0 20px;
-    margin-bottom: 40px;
+    padding: 52px 0 18px;
+    margin-bottom: 36px;
   }
   .rotulo {
     font-family: var(--mono);
@@ -92,128 +64,83 @@
     letter-spacing: .14em;
     text-transform: uppercase;
     color: var(--tinta-3);
-    margin: 0 0 14px;
-  }
-  h1 {
-    font-family: var(--sans);
-    font-size: clamp(30px, 5.2vw, 42px);
-    font-weight: 750;
-    letter-spacing: -.022em;
-    line-height: 1.08;
-    text-wrap: balance;
-    margin: 0 0 14px;
-  }
-  .bajada { color: var(--tinta-2); margin: 0; max-width: 60ch; }
-
-  /* ---- Indice ---- */
-  nav.indice {
-    background: var(--superficie);
-    border: 1px solid var(--borde);
-    border-radius: 4px;
-    padding: 20px 24px;
-    margin-bottom: 52px;
-    box-shadow: var(--sombra);
-  }
-  nav.indice p {
-    font-family: var(--mono);
-    font-size: 11px;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-    color: var(--tinta-3);
     margin: 0 0 12px;
   }
-  nav.indice ol { margin: 0; padding-left: 20px; columns: 2; column-gap: 32px; }
-  nav.indice li { font-family: var(--sans); font-size: 14.5px; margin-bottom: 7px; break-inside: avoid; }
-  nav.indice a { color: var(--tinta); text-decoration: none; border-bottom: 1px solid var(--borde); }
-  nav.indice a:hover { color: var(--azul); border-color: var(--azul); }
-
-  /* ---- Secciones ---- */
-  section { margin-bottom: 60px; scroll-margin-top: 24px; }
-  h2 {
-    font-family: var(--sans);
-    font-size: 25px;
-    font-weight: 700;
-    letter-spacing: -.015em;
-    margin: 0 0 6px;
+  h1 {
+    font-size: clamp(28px, 5vw, 38px);
+    font-weight: 750;
+    letter-spacing: -.022em;
+    line-height: 1.1;
+    margin: 0;
     text-wrap: balance;
   }
-  .numero {
+
+  /* Los pasos son una secuencia real: el numero indica orden, no decora. */
+  .paso {
+    display: grid;
+    grid-template-columns: 34px 1fr;
+    gap: 0 16px;
+    margin-bottom: 40px;
+    scroll-margin-top: 20px;
+  }
+  .paso > .n {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
+    font-weight: 600;
     color: var(--azul);
-    letter-spacing: .1em;
-    display: block;
-    margin-bottom: 4px;
+    background: var(--azul-claro);
+    border-radius: 4px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    margin-top: 2px;
   }
-  h2 + .intro { color: var(--tinta-2); margin: 0 0 26px; }
-  h3 {
-    font-family: var(--sans);
-    font-size: 17px;
-    font-weight: 650;
-    margin: 34px 0 10px;
-    letter-spacing: -.005em;
+  .paso > .cuerpo { min-width: 0; }
+  h2 {
+    font-size: 21px;
+    font-weight: 700;
+    letter-spacing: -.015em;
+    margin: 0 0 12px;
+    text-wrap: balance;
   }
-  p { margin: 0 0 16px; }
-  ul, ol { padding-left: 22px; margin: 0 0 16px; }
-  li { margin-bottom: 7px; }
-  strong { font-weight: 700; }
+  p { margin: 0 0 14px; }
+  ul, ol { padding-left: 20px; margin: 0 0 14px; }
+  li { margin-bottom: 6px; }
   code {
     font-family: var(--mono);
     font-size: .87em;
     background: var(--azul-claro);
-    color: var(--tinta);
     padding: 1px 5px;
     border-radius: 3px;
   }
-
-  /* ---- Bloques de comando ---- */
   pre {
     background: var(--codigo-bg);
     color: var(--codigo-tx);
     font-family: var(--mono);
-    font-size: 13.5px;
+    font-size: 13px;
     line-height: 1.7;
-    padding: 16px 18px;
+    padding: 14px 16px;
     border-radius: 4px;
     overflow-x: auto;
-    margin: 0 0 18px;
+    margin: 0 0 16px;
   }
   pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
   .comentario { color: #7e8899; }
 
-  /* ---- Avisos ---- */
   .aviso {
     border-left: 3px solid var(--alerta);
     background: var(--alerta-bg);
-    padding: 14px 18px;
+    padding: 12px 16px;
     border-radius: 0 4px 4px 0;
-    margin: 0 0 20px;
+    margin: 0 0 16px;
+    font-size: 15px;
   }
   .aviso.critico { border-left-color: var(--peligro); background: var(--peligro-bg); }
-  .aviso.nota    { border-left-color: var(--azul);    background: var(--azul-claro); }
   .aviso p:last-child { margin-bottom: 0; }
-  .aviso .titulo {
-    font-family: var(--sans);
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: .07em;
-    text-transform: uppercase;
-    color: var(--alerta);
-    display: block;
-    margin-bottom: 5px;
-  }
-  .aviso.critico .titulo { color: var(--peligro); }
-  .aviso.nota .titulo    { color: var(--azul); }
+  .aviso b { display: block; margin-bottom: 3px; }
 
-  /* ---- Tablas ---- */
-  .tabla-scroll { overflow-x: auto; margin: 0 0 20px; }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-    font-family: var(--sans);
-    font-size: 14.5px;
-    min-width: 460px;
-  }
+  .tabla-scroll { overflow-x: auto; margin: 0 0 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; min-width: 420px; }
   th {
     text-align: left;
     font-weight: 650;
@@ -224,356 +151,214 @@
     border-bottom: 1px solid var(--borde);
     padding: 0 14px 8px 0;
   }
-  td {
-    padding: 11px 14px 11px 0;
-    border-bottom: 1px solid var(--borde-sutil);
-    vertical-align: top;
-  }
+  td { padding: 10px 14px 10px 0; border-bottom: 1px solid var(--borde-sutil); vertical-align: top; }
   td:last-child, th:last-child { padding-right: 0; }
+  td code { font-size: .84em; }
 
-  /* ---- Fallas ---- */
-  .falla {
-    background: var(--superficie);
-    border: 1px solid var(--borde);
-    border-radius: 4px;
-    padding: 18px 20px;
-    margin-bottom: 14px;
-    box-shadow: var(--sombra);
-  }
-  .falla .sintoma {
-    font-family: var(--mono);
-    font-size: 13.5px;
-    color: var(--peligro);
-    margin: 0 0 10px;
-    line-height: 1.5;
-  }
-  .falla dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; }
-  .falla dt {
-    font-family: var(--sans);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .07em;
-    text-transform: uppercase;
-    color: var(--tinta-3);
-    padding-top: 3px;
-  }
-  .falla dd { margin: 0; font-size: 15.5px; }
-  .falla dd code { font-size: .85em; }
-
-  /* ---- Lista de verificacion ---- */
-  .chequeo { list-style: none; padding: 0; }
-  .chequeo li {
-    padding-left: 30px;
-    position: relative;
-    margin-bottom: 11px;
-  }
+  .chequeo { list-style: none; padding: 0; margin: 0 0 16px; }
+  .chequeo li { padding-left: 28px; position: relative; margin-bottom: 9px; }
   .chequeo li::before {
     content: "";
-    position: absolute;
-    left: 0; top: 6px;
-    width: 15px; height: 15px;
+    position: absolute; left: 0; top: 5px;
+    width: 14px; height: 14px;
     border: 1.5px solid var(--tinta-3);
     border-radius: 2px;
   }
 
+  .previo {
+    background: var(--superficie);
+    border: 1px solid var(--borde);
+    border-radius: 4px;
+    padding: 22px 24px;
+    margin-bottom: 44px;
+    box-shadow: var(--sombra);
+  }
+  .previo h2 { font-size: 17px; margin-bottom: 14px; }
+
+  figure {
+    margin: 0 0 16px;
+    border: 1px solid var(--borde);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  figure img { display: block; width: 100%; height: auto; }
+  figcaption {
+    font-size: 13px;
+    color: var(--tinta-2);
+    padding: 9px 13px;
+    border-top: 1px solid var(--borde-sutil);
+    background: var(--papel);
+  }
+
   footer {
     border-top: 1px solid var(--borde);
-    padding-top: 22px;
+    padding-top: 20px;
     color: var(--tinta-3);
-    font-family: var(--sans);
     font-size: 13.5px;
   }
   a { color: var(--azul); }
   :focus-visible { outline: 2px solid var(--azul); outline-offset: 2px; border-radius: 2px; }
-  @media (max-width: 620px) {
-    nav.indice ol { columns: 1; }
-    .falla dl { grid-template-columns: 1fr; gap: 2px; }
-    .falla dt { padding-top: 8px; }
+  @media (max-width: 560px) {
+    .paso { grid-template-columns: 1fr; gap: 8px; }
+    .paso > .n { width: 28px; }
+  }
+
+  @media print {
+    :root, :root[data-theme="dark"], :root:not([data-theme="light"]) {
+      --papel: #fff; --superficie: #fff;
+      --borde: #c9cfd8; --borde-sutil: #e3e7ec;
+      --tinta: #000; --tinta-2: #333a44; --tinta-3: #5c6570;
+      --azul: #14396b; --azul-claro: #eef2f8;
+      --peligro: #8c1a1a; --peligro-bg: #fbeded;
+      --alerta: #6f4700; --alerta-bg: #fdf5e6;
+      --codigo-bg: #f2f4f7; --codigo-tx: #14181f;
+      --sombra: none;
+    }
+    @page { margin: 18mm 16mm; }
+    body { font-size: 10.5pt; line-height: 1.5; background: #fff; }
+    .envoltura { max-width: none; padding: 0; }
+    header { padding-top: 0; }
+    .paso, .aviso, pre, table, .tabla-scroll, figure, .previo { break-inside: avoid; }
+    h2 { break-after: avoid; }
+    pre { border: 1px solid var(--borde); font-size: 9pt; }
+    .comentario { color: #5c6570; }
+    a[href^="http"]::after {
+      content: " (" attr(href) ")";
+      font-family: var(--mono); font-size: 8.5pt; color: var(--tinta-3); word-break: break-all;
+    }
   }
 </style>
 
 <div class="envoltura">
 
-<header class="tapa">
-  <p class="rotulo">Facturador SUNAT · SFS 2.1 · Manual técnico</p>
-  <h1>Manual de Campo del Facturador</h1>
-  <p class="bajada">Instalar, configurar y diagnosticar el daemon de facturación electrónica en la PC de un cliente. Escrito a partir de instalaciones reales: cada falla documentada acá ocurrió de verdad.</p>
+<header>
+  <p class="rotulo">Facturador SUNAT · SFS 2.1</p>
+  <h1>Instalación del Facturador</h1>
 </header>
 
-<nav class="indice">
-  <p>Contenido</p>
-  <ol>
-    <li><a href="#llevar">Qué llevar al cliente</a></li>
-    <li><a href="#instalar">Instalación</a></li>
-    <li><a href="#datos">Los datos, con sus trampas</a></li>
-    <li><a href="#produccion">De beta a producción</a></li>
-    <li><a href="#fallas">Cuando algo falla</a></li>
-    <li><a href="#operacion">Operación diaria</a></li>
-    <li><a href="#nunca">Lo que nunca hay que hacer</a></li>
-    <li><a href="#mantenimiento">Mantenimiento</a></li>
-  </ol>
-</nav>
-
-<section id="llevar">
-  <span class="numero">01</span>
-  <h2>Qué llevar al cliente</h2>
-  <p class="intro">Sin alguno de estos datos la instalación se corta a la mitad y hay que volver.</p>
-
+<div class="previo">
+  <h2>Antes de empezar, tener a mano</h2>
   <ul class="chequeo">
-    <li><strong>Certificado digital</strong> <code>.p12</code> o <code>.pfx</code> <em>y su contraseña</em>. Es lo que firma ante SUNAT; sin él no se emite nada.</li>
-    <li><strong>Usuario y clave SOL secundarios</strong> — no los principales. Se usan para enviar y para consultar los tickets de los resúmenes.</li>
-    <li><strong>RUC y razón social</strong> exactos, como figuran en SUNAT.</li>
-    <li><strong>Dirección fiscal con ubigeo</strong> (6 dígitos). El ubigeo se saca de la ficha RUC del contribuyente.</li>
-    <li><strong><code>DATABASE_URL</code></strong> de la base de la aplicación, la misma que usa el sistema del cliente.</li>
+    <li>Certificado digital <code>.p12</code> o <code>.pfx</code> <b style="display:inline">y su contraseña</b></li>
+    <li>Usuario y clave <b style="display:inline">SOL secundarios</b> (no los principales)</li>
+    <li>RUC y razón social</li>
+    <li>Dirección fiscal con ubigeo de 6 dígitos</li>
+    <li><code>DATABASE_URL</code> de la base de la aplicación</li>
   </ul>
+  <p style="margin:0;color:var(--tinta-2);font-size:14.5px">La PC no necesita nada preinstalado salvo Git. Python, Java, Node y PM2 los instala el propio programa.</p>
+</div>
 
-  <div class="aviso nota">
-    <span class="titulo">Sobre el certificado</span>
-    <p>Es la clave privada del contribuyente. Pasalo por USB o en un ZIP; nunca por chat, que puede recodificar el archivo. Y jamás lo reutilices entre clientes: emitir con el certificado de otro es facturar a su nombre.</p>
+<div class="paso" id="p1">
+  <div class="n">1</div>
+  <div class="cuerpo">
+    <h2>Instalar Git</h2>
+    <p>Descargarlo de <a href="https://git-scm.com/download/win">git-scm.com</a> e instalarlo con las opciones por defecto.</p>
+    <p style="color:var(--tinta-2);font-size:15px">Alternativa sin Git: entrar al repositorio en GitHub, botón <b style="display:inline">Code → Download ZIP</b>, y descomprimir en <code>C:\FacturadorDaemon</code>. Después seguir desde el paso 3.</p>
   </div>
+</div>
 
-  <p>La PC no necesita nada preinstalado. El instalador se ocupa de Python, Java, Node y PM2 mediante <code>winget</code>. Lo único que hace falta de antemano es <strong>Git</strong>, o bajar el ZIP del repositorio desde GitHub.</p>
-</section>
-
-<section id="instalar">
-  <span class="numero">02</span>
-  <h2>Instalación</h2>
-  <p class="intro">Cuatro pasos. El largo es la descarga del SFS, unos 90 MB desde SUNAT.</p>
-
-  <h3>Traer el código</h3>
+<div class="paso" id="p2">
+  <div class="n">2</div>
+  <div class="cuerpo">
+    <h2>Traer el código</h2>
+    <p>Abrir <b style="display:inline">PowerShell</b> y ejecutar:</p>
 <pre><code>cd C:\
 git clone https://github.com/haze123/Facturador.git FacturadorDaemon
 cd C:\FacturadorDaemon\instalacion</code></pre>
+    <p>Pide usuario y contraseña de GitHub: el repositorio es privado.</p>
+  </div>
+</div>
 
-  <h3>Bajar el instalador</h3>
-  <p>El ejecutable no viaja en el repositorio: se descarga de la release. Abrilo en el navegador, iniciá sesión en GitHub —el repositorio es privado— y guardá el archivo en la carpeta <code>instalacion</code>.</p>
+<div class="paso" id="p3">
+  <div class="n">3</div>
+  <div class="cuerpo">
+    <h2>Descargar el instalador</h2>
+    <p>El ejecutable no viene en el repositorio. Abrir la página de descargas, iniciar sesión en GitHub y guardar <code>FacturadorSetup.exe</code> dentro de <code>C:\FacturadorDaemon\instalacion</code>:</p>
 <pre><code>Start-Process "https://github.com/haze123/Facturador/releases/tag/v1.0-instalador"</code></pre>
-
-  <div class="aviso">
-    <span class="titulo">Windows protegió su PC</span>
-    <p>Aparece la primera vez en cada máquina, porque el ejecutable no está firmado. <strong>Más información → Ejecutar de todas formas.</strong> Evitarlo requiere un certificado de firma de código, que cuesta entre 200 y 400 dólares al año.</p>
+    <p>Habilitar la ejecución de scripts (una sola vez por PC):</p>
+<pre><code>Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned</code></pre>
+    <div class="aviso">
+      <b>Windows protegió su PC</b>
+      <p>Aparece la primera vez porque el ejecutable no está firmado: <b style="display:inline">Más información → Ejecutar de todas formas.</b></p>
+    </div>
   </div>
+</div>
 
-  <h3>Instalar el entorno</h3>
-  <p>Doble click en <code>FacturadorSetup.exe</code> y elegí la <strong>opción 1</strong>. Instala prerrequisitos, PM2 y el arranque automático con Windows, y descarga el SFS.</p>
-
-  <div class="aviso">
-    <span class="titulo">Si dice que algo no aparece en el PATH</span>
-    <p>Es normal: algunos instaladores solo actualizan el PATH para consolas nuevas. Cerrá la consola, abrí otra y volvé a correr la opción 1. Lo que ya está hecho lo saltea.</p>
+<div class="paso" id="p4">
+  <div class="n">4</div>
+  <div class="cuerpo">
+    <h2>Instalar el entorno</h2>
+    <p>Doble click en <code>FacturadorSetup.exe</code> y elegir la <b style="display:inline">opción 1</b>.</p>
+    <p>Instala Python, Java, Node y PM2, configura el arranque automático con Windows y descarga el SFS de SUNAT. Cuando pregunte dónde instalarlo, aceptar <code>C:\SFS_v-2.1</code> con Enter.</p>
+    <p><b style="display:inline">Tarda varios minutos</b>, sobre todo la descarga de 90 MB.</p>
+    <div class="aviso">
+      <b>Si dice que algo no aparece en el PATH</b>
+      <p>Cerrar la consola, abrir otra y volver a correr la opción 1. Lo ya instalado se saltea.</p>
+    </div>
   </div>
+</div>
 
-  <h3>Configurar el cliente</h3>
-  <p><strong>Opción 2.</strong> Pide los datos, valida cada uno antes de tocar nada, y deja los dos procesos corriendo. Al terminar corre el diagnóstico solo.</p>
-  <p>La instalación queda apuntando a <strong>beta</strong>. Eso es deliberado y se explica en la sección 4.</p>
-</section>
-
-<section id="datos">
-  <span class="numero">03</span>
-  <h2>Los datos, con sus trampas</h2>
-  <p class="intro">Tres campos se malinterpretan siempre. Los tres costaron una vuelta completa la primera vez.</p>
-
-  <h3>La dirección va por partes</h3>
-  <p>El SFS guarda cada parte por separado y las combina al armar el XML. Si pegás la dirección completa en el primer campo, queda duplicada en el comprobante impreso.</p>
-  <div class="tabla-scroll">
-    <table>
-      <thead><tr><th>Campo</th><th>Ejemplo correcto</th></tr></thead>
-      <tbody>
-        <tr><td>Dirección</td><td><code>AV. CARLOS ALBERTO IZAGUIRRE NRO. 785 DPTO. 302</code></td></tr>
-        <tr><td>Urbanización</td><td><code>URB. MERCURIO ETAPA 1</code></td></tr>
-        <tr><td>Departamento</td><td><code>LIMA</code></td></tr>
-        <tr><td>Provincia</td><td><code>LIMA</code></td></tr>
-        <tr><td>Distrito</td><td><code>LOS OLIVOS</code></td></tr>
-      </tbody>
-    </table>
+<div class="paso" id="p5">
+  <div class="n">5</div>
+  <div class="cuerpo">
+    <h2>Configurar el cliente</h2>
+    <p><b style="display:inline">Opción 2</b> del mismo menú. Pide los datos en este orden:</p>
+    <div class="tabla-scroll">
+      <table>
+        <thead><tr><th>Dato</th><th>Cómo se ingresa</th></tr></thead>
+        <tbody>
+          <tr><td>RUC</td><td>11 dígitos. Se valida el dígito verificador.</td></tr>
+          <tr><td>Razón social</td><td>Como figura en SUNAT.</td></tr>
+          <tr><td>Nombre comercial</td><td>Enter usa la razón social.</td></tr>
+          <tr><td>Usuario y clave SOL</td><td>Los secundarios. <b style="display:inline">La clave no se ve al escribir.</b></td></tr>
+          <tr><td>Ubigeo</td><td>6 dígitos, de la ficha RUC.</td></tr>
+          <tr><td>Dirección</td><td>Solo calle y número: <code>AV. IZAGUIRRE NRO. 785 DPTO. 302</code></td></tr>
+          <tr><td>Urbanización</td><td>Aparte de la dirección: <code>URB. MERCURIO ETAPA 1</code></td></tr>
+          <tr><td>Depto. / Provincia / Distrito</td><td>Cada uno por separado.</td></tr>
+          <tr><td>Certificado</td><td>Ruta del <b style="display:inline">archivo</b> <code>.p12</code>, no de la carpeta.</td></tr>
+          <tr><td><code>DATABASE_URL</code></td><td>Se prueba la conexión antes de seguir.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Al terminar deja los dos procesos corriendo y ejecuta la verificación.</p>
   </div>
+</div>
 
-  <h3>El certificado es la ruta del archivo</h3>
-  <p>No de la carpeta que lo contiene. Tiene que terminar en <code>.p12</code> o <code>.pfx</code>:</p>
-<pre><code><span class="comentario"># Correcto</span>
-C:\SFS_v-2.1\sunat_archivos\sfs\CERT\certificado.p12
-
-<span class="comentario"># Incorrecto: es una carpeta</span>
-C:\SFS_v-2.1\sunat_archivos\sfs\CERT</code></pre>
-
-  <h3>Las contraseñas no se ven al escribir</h3>
-  <p>Ni asteriscos ni puntos: la consola no muestra nada. Escribila y dale Enter aunque parezca que el teclado no responde.</p>
-</section>
-
-<section id="produccion">
-  <span class="numero">04</span>
-  <h2>De beta a producción</h2>
-  <p class="intro">El paso más importante del procedimiento, y el que no conviene apurar.</p>
-
-  <div class="aviso critico">
-    <span class="titulo">Por qué se instala en beta</span>
-    <p>Si algo está mal configurado y un comprobante real sale contra beta, el daemon lo marca como <code>enviado=true</code> en la base del cliente, pero <strong>ante SUNAT no existe</strong>. Nada delata después la diferencia: la aplicación lo da por facturado y no lo está. Es el peor error posible de este sistema, y arrancar en beta lo vuelve imposible.</p>
+<div class="paso" id="p6">
+  <div class="n">6</div>
+  <div class="cuerpo">
+    <h2>Verificar</h2>
+    <p><b style="display:inline">Opción 3.</b> Revisa prerrequisitos, configuración, base de datos, SFS, certificado y procesos.</p>
+    <p>Tiene que terminar en <code>TODO CORRECTO</code> o <code>FUNCIONA, con avisos</code>. El aviso de que está en <b style="display:inline">BETA</b> es esperado.</p>
   </div>
+</div>
 
-  <p>El orden es:</p>
-  <ol>
-    <li>Emitir un comprobante de prueba y confirmar que SUNAT lo acepte.</li>
-    <li>Borrar los comprobantes de prueba de la base de la aplicación.</li>
-    <li>Recién entonces, <strong>opción 4</strong> del instalador. Pide escribir <code>PRODUCCION</code> como confirmación y reinicia el SFS para que tome el cambio.</li>
-  </ol>
-
-  <p>Para verificar en cualquier momento a dónde apunta, la opción 3 lo muestra en su sección 5. También se lee directo del archivo:</p>
-<pre><code>Select-String C:\SFS_v-2.1\sunat_archivos\sfs\VALI\constantes.properties `
-  -Pattern "^RUTA_SERV_CDP"</code></pre>
-  <p>Si la URL contiene <code>e-beta</code> no tiene validez fiscal; si contiene <code>e-factura</code>, sí.</p>
-</section>
-
-<section id="fallas">
-  <span class="numero">05</span>
-  <h2>Cuando algo falla</h2>
-  <p class="intro">Empezá siempre por la opción 3 del instalador: revisa las ocho partes del sistema y dice cuál está mal. Abajo, las fallas que ya ocurrieron y qué las causa.</p>
-
-  <div class="falla">
-    <p class="sintoma">El SFS no responde después de 90 segundos</p>
-    <dl>
-      <dt>Causa</dt><dd>Casi siempre hay un SFS huérfano ocupando el puerto 9000, de un intento anterior. En su log aparece <code>Address already in use</code>.</dd>
-      <dt>Solución</dt><dd><code>pm2 stop all</code>, luego <code>taskkill /IM java.exe /F</code>, luego <code>pm2 restart all</code>. En esa PC el único Java que corre es el SFS.</dd>
-    </dl>
+<div class="paso" id="p7">
+  <div class="n">7</div>
+  <div class="cuerpo">
+    <h2>Probar en beta</h2>
+    <p>La instalación quedó apuntando al ambiente de pruebas de SUNAT. Emitir un comprobante y confirmar que lo acepten, en la bandeja del SFS:</p>
+<pre><code>Start-Process "http://localhost:9000"</code></pre>
+    <p>En la columna <b style="display:inline">Situación</b> tiene que decir <code>Enviado y Aceptado SUNAT</code>.</p>
+    <p>Después, borrar los comprobantes de prueba de la base de la aplicación.</p>
   </div>
+</div>
 
-  <div class="falla">
-    <p class="sintoma">el SFS rechazo el certificado: Hubo un error, el certificado no fue creado</p>
-    <dl>
-      <dt>Causa</dt><dd>Se le pasó una ruta completa donde espera solo el nombre del archivo. El SFS arma su propia ruta pegando su carpeta <code>CERT</code> con lo que recibe.</dd>
-      <dt>Solución</dt><dd>Ya está resuelto en el instalador, que copia el archivo y le manda solo el nombre. Si aparece, la versión del ejecutable es vieja: bajá la última de la release.</dd>
-    </dl>
+<div class="paso" id="p8">
+  <div class="n">8</div>
+  <div class="cuerpo">
+    <h2>Pasar a producción</h2>
+    <div class="aviso critico">
+      <b>Solo después de la prueba del paso 7</b>
+      <p>Un comprobante real emitido contra beta queda marcado como enviado en la base del cliente, pero ante SUNAT no existe — y nada delata después la diferencia.</p>
+    </div>
+    <p><b style="display:inline">Opción 4</b> del menú. Pide escribir <code>PRODUCCION</code> para confirmar y reinicia el SFS.</p>
+    <p>Desde ese momento los comprobantes tienen validez fiscal. Correr la opción 3 una última vez: la sección 5 debe decir <b style="display:inline">PRODUCCION</b>.</p>
   </div>
-
-  <div class="falla">
-    <p class="sintoma">PermissionError: Permission denied: '...\.env'</p>
-    <dl>
-      <dt>Causa</dt><dd>El <code>.env</code> quedó sin permisos de lectura al restringirlo. Lleva claves en texto plano, por eso se restringe.</dd>
-      <dt>Solución</dt><dd><code>icacls C:\FacturadorDaemon\.env /reset</code> y <code>pm2 restart facturador</code>.</dd>
-    </dl>
-  </div>
-
-  <div class="falla">
-    <p class="sintoma">Se generaron dos resúmenes con las mismas boletas</p>
-    <dl>
-      <dt>Causa</dt><dd>Versión vieja del daemon. Las corregidas retienen las boletas ante cualquier duda.</dd>
-      <dt>Gravedad</dt><dd><strong>Alta en producción:</strong> SUNAT acepta ambos resúmenes sin notar que llevan los mismos comprobantes, y quedan declarados dos veces. Deshacerlo exige una comunicación de baja.</dd>
-      <dt>Solución</dt><dd><code>git pull</code> en la carpeta del proyecto y <code>pm2 restart facturador</code>. Verificá la versión con <code>git log --oneline -1</code>.</dd>
-    </dl>
-  </div>
-
-  <div class="falla">
-    <p class="sintoma">Un resumen figura aceptado pero sin fecha de generación ni de envío</p>
-    <dl>
-      <dt>Causa</dt><dd>Quedó en <code>RPTA</code> el CDR de un resumen anterior con el mismo número. El daemon lo dio por contestado sin enviarlo.</dd>
-      <dt>Solución</dt><dd>Solo pasa si se reinició el correlativo a mano. Borrar los CDR viejos antes de reiniciarlo:<br><code>Get-ChildItem ...\RPTA -Recurse -File -Filter "*RC*" | Remove-Item</code></dd>
-    </dl>
-  </div>
-
-  <div class="falla">
-    <p class="sintoma">Comprobantes de un RUC que no es el del cliente</p>
-    <dl>
-      <dt>Causa</dt><dd>El ZIP de SUNAT trae archivos de prueba en <code>DATA</code>. El SFS los levanta como propios.</dd>
-      <dt>Solución</dt><dd>Las versiones nuevas del instalador vacían <code>DATA</code> al instalar. Si aparecen, borrarlos de la carpeta y de la bandeja del SFS.</dd>
-    </dl>
-  </div>
-
-  <div class="falla">
-    <p class="sintoma">Error caught while calling pidusage: spawn powershell.exe ENOENT</p>
-    <dl>
-      <dt>Causa</dt><dd>PM2 no encuentra PowerShell para medir CPU y memoria.</dd>
-      <dt>Gravedad</dt><dd><strong>Ninguna.</strong> Los procesos funcionan; solo se pierden esas dos estadísticas de la tabla.</dd>
-    </dl>
-  </div>
-
-  <div class="aviso nota">
-    <span class="titulo">Antes de investigar nada</span>
-    <p>Verificá la versión del código: <code>git log --oneline -1</code>. Un buen porcentaje de las fallas raras son código desactualizado, y comprobarlo lleva cinco segundos.</p>
-  </div>
-</section>
-
-<section id="operacion">
-  <span class="numero">06</span>
-  <h2>Operación diaria</h2>
-  <p class="intro">El sistema no necesita intervención. Esto es para cuando alguien pregunta si está funcionando.</p>
-
-  <h3>Ver el estado</h3>
-<pre><code>pm2 list                                  <span class="comentario"># los dos procesos deben decir online</span>
-pm2 logs facturador --lines 20 --nostream <span class="comentario"># qué hizo el daemon</span></code></pre>
-  <p>El daemon revisa la base cada 60 segundos. En el log eso se ve como <code>Consultando BD...</code> seguido de cuántos comprobantes hay pendientes.</p>
-
-  <h3>La bandeja del SFS</h3>
-  <p><code>http://localhost:9000</code> — es un <strong>historial</strong>, no una cola: guarda todo lo procesado. Lo que importa es la columna Situación.</p>
-  <div class="tabla-scroll">
-    <table>
-      <thead><tr><th>Situación</th><th>Significa</th></tr></thead>
-      <tbody>
-        <tr><td>Enviado y Aceptado SUNAT</td><td>Terminado, con CDR.</td></tr>
-        <tr><td>Enviado a SUNAT Por Procesar</td><td>En curso. Los resúmenes pasan por acá mientras esperan su ticket.</td></tr>
-        <tr><td>Por Generar XML</td><td>Recién registrado. Se resuelve en el próximo ciclo.</td></tr>
-        <tr><td>Con Errores</td><td>Necesita revisión: no se resuelve solo.</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Cuánto tarda</h3>
-  <p>Una factura o nota necesita <strong>dos ciclos</strong>: el SFS registra el archivo en el primero y genera el XML en el segundo. Un resumen diario tarda algo más, porque SUNAT responde con un ticket que hay que consultar aparte.</p>
-
-  <h3>Las boletas no se envían solas</h3>
-  <p>Todas se acumulan y salen agrupadas en un resumen diario, con las del día anterior. Es lo que evita que una boleta enviada tarde quede bloqueada para siempre. Si alguien pregunta por qué una boleta de hoy no aparece en SUNAT, la respuesta es esa.</p>
-</section>
-
-<section id="nunca">
-  <span class="numero">07</span>
-  <h2>Lo que nunca hay que hacer</h2>
-  <p class="intro">Tres errores con consecuencias que no se revierten fácil.</p>
-
-  <div class="aviso critico">
-    <span class="titulo">Dos daemons sobre la misma base</span>
-    <p>Compiten por los mismos comprobantes: el que llegue primero toma cada pendiente y lo marca como enviado. Si uno está en beta, esos comprobantes quedan marcados sin haberse emitido de verdad. Una sola instalación por base de datos.</p>
-  </div>
-
-  <div class="aviso critico">
-    <span class="titulo">Reutilizar el certificado de otro cliente</span>
-    <p>Es la clave privada con la que se firma ante SUNAT. Emitir con el de otro contribuyente es facturar a su nombre.</p>
-  </div>
-
-  <div class="aviso critico">
-    <span class="titulo">Reutilizar una PC sin limpiarla</span>
-    <p>El SFS conserva el RUC, las credenciales y el certificado del cliente anterior. El instalador lo detecta y pregunta antes de borrar: si es para otro cliente, hay que responder que sí.</p>
-  </div>
-</section>
-
-<section id="mantenimiento">
-  <span class="numero">08</span>
-  <h2>Mantenimiento</h2>
-
-  <h3>El certificado vence</h3>
-  <p>Duran entre uno y tres años. No hace falta reinstalar: se corre la <strong>opción 2</strong> con el certificado nuevo. Los demás datos aparecen entre corchetes y se aceptan con Enter.</p>
-
-  <h3>Actualizar el código</h3>
-<pre><code>pm2 stop facturador
-cd C:\FacturadorDaemon
-git pull
-pm2 start facturador</code></pre>
-  <p>Y si cambió el instalador, bajar de nuevo el ejecutable de la release.</p>
-
-  <h3>Mover a otra PC</h3>
-  <p>Instalación limpia en la nueva y <strong>apagar el daemon de la vieja antes de arrancar el de la nueva</strong>. Si las dos corren a la vez contra la misma base, se pelean los comprobantes.</p>
-
-  <h3>Los archivos que no se versionan</h3>
-  <div class="tabla-scroll">
-    <table>
-      <thead><tr><th>Archivo</th><th>Qué guarda</th></tr></thead>
-      <tbody>
-        <tr><td><code>.env</code></td><td>Conexión a la base y credenciales SOL. Se regenera con la opción 2.</td></tr>
-        <tr><td><code>resumenes.json</code></td><td>Correlativo de los resúmenes y qué boletas lleva cada uno. <strong>Borrarlo reinicia la numeración</strong>, así que solo se toca con la bandeja y los CDR ya limpios.</td></tr>
-        <tr><td><code>reintentos.json</code></td><td>Cuántos reenvíos lleva cada comprobante rechazado.</td></tr>
-      </tbody>
-    </table>
-  </div>
-</section>
+</div>
 
 <footer>
-  <p>Facturador SUNAT · SFS 2.1 · Emite facturas, notas de crédito y débito individuales, y agrupa las boletas en resumen diario. Documentación técnica del proyecto en <code>README.md</code>.</p>
+  <p>Una sola instalación por base de datos: dos daemons sobre la misma base compiten por los mismos comprobantes.</p>
 </footer>
 
 </div>
