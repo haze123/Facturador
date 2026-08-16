@@ -58,6 +58,15 @@ SFS_RPTA_DIR = p if os.path.exists(p := os.getenv("SFS_RPTA_DIR", r"C:\SFS_v2.1\
 SFS_BD_PATH  = os.getenv("SFS_BD_PATH",  r"C:\SFS_v2.1\bd\BDFacturador.db")
 SFS_BASE_URL = os.getenv("SFS_BASE_URL", "http://localhost:9000")
 
+# Configuración del SFS: de acá sale a qué ambiente de SUNAT está enviando
+# (RUTA_SERV_CDP), que es donde hay que consultar el ticket de un resumen. Se
+# deriva de SFS_DATA_DIR —son carpetas hermanas— para no declarar otra ruta que
+# después quede desincronizada.
+SFS_CONSTANTES_PATH = os.getenv(
+    "SFS_CONSTANTES_PATH",
+    os.path.join(os.path.dirname(SFS_DATA_DIR), "VALI", "constantes.properties"),
+)
+
 DIR_PROCESADOS = os.path.join(SFS_RPTA_DIR, "procesados")
 DIR_ERRORES    = os.path.join(SFS_RPTA_DIR, "errores")
 
@@ -136,13 +145,28 @@ MAX_REINTENTOS_RECHAZO = int(os.getenv("MAX_REINTENTOS_RECHAZO", "3"))
 # arrancar la cuenta de cero y el bucle volvería a ser infinito.
 _REINTENTOS_PATH = os.path.join(_BASE, "reintentos.json")
 _lock_reintentos = threading.Lock()
+
+# Igual que reintentos.json: el correlativo del resumen y qué boletas lleva cada uno
+# viven en disco, porque un reinicio de PM2 no puede repetir un RC-YYYYMMDD-NNN ya
+# usado ni perder de vista qué boletas quedaron esperando su CDR.
+_RESUMENES_PATH = os.path.join(_BASE, "resumenes.json")
+_lock_resumenes = threading.Lock()
 # Cuántos bloqueados se detallan en el log antes de resumir; son estables entre
 # ciclos y volcarlos todos cada 60s ahoga el resto del log.
 _MAX_BLOQUEADOS_LOG = 10
-# Tipos que el daemon envía hoy: factura, boleta, nota de crédito y nota de débito.
-# RC (resumen diario) y RA (comunicación de baja) quedan fuera a propósito: por ahora
-# no se emiten desde acá.
-_TIPOS_SFS = {"01", "03", "07", "08"}
+# Tipos que el daemon envía hoy: factura, boleta, nota de crédito, nota de débito y
+# resumen diario de boletas. RA (comunicación de baja) queda fuera a propósito: por
+# ahora no se emite desde acá.
+_TIPOS_SFS = {"01", "03", "07", "08", "RC"}
+
+# Constantes.CONSTANTE_TIPO_DOCUMENTO_RBOLETAS: el SFS trata el resumen diario como
+# un tipo de documento más, con los mismos dos endpoints REST que todo lo demás
+# (GenerarComprobante.htm / enviarXML.htm) y el mismo patrón de dos pasadas. Puertas
+# adentro, SUNAT usa un flujo con ticket (sendSummary + getStatus sobre el mismo
+# billService) — confirmado contra el WSDL real de producción — pero eso lo resuelve
+# el SFS solo: el daemon no necesita hablar SOAP para esto, a diferencia de la
+# recuperación de CDR (que sí lo hace directo).
+_TIPO_RC = "RC"
 
 # La aplicación guarda el tipo por nombre, no con el código de SUNAT. NOTA_VENTA no
 # es un comprobante electrónico —es un documento interno— y por eso no se mapea:
@@ -156,6 +180,31 @@ _TIPOS_POR_NOMBRE = {
 
 # Todo se factura gravado al 18%: es lo que corresponde a los servicios de estética.
 _FACTOR_IGV = Decimal("1.18")
+
+# La aplicación guarda sus fechas con el reloj de su servidor de BD, que hoy corre
+# en UTC; SUNAT en cambio espera la fecha de emisión en hora local del emisor. Sin
+# corregir eso, toda venta hecha entre las 19:00 y la medianoche cae en el día
+# siguiente y se le declararía a SUNAT una fecha futura, que rechaza.
+#
+# El desfase se MIDE contra la propia BD en vez de fijarlo, porque no es una
+# decisión de este daemon: si alguien cambia la zona horaria del servidor a hora de
+# Lima, un -5 fijo quedaría al revés del problema y correría las fechas para el otro
+# lado sin que nadie se entere. Medirlo se autocorrige solo.
+# Se puede forzar un valor con DESFASE_BD_HORAS (en horas) si hiciera falta.
+DESFASE_BD_HORAS = os.getenv("DESFASE_BD_HORAS", "auto").strip().lower()
+# Hasta la primera medición se asume lo que hay hoy; la medición ocurre al inicio de
+# cada ciclo, antes de que se genere ningún comprobante.
+_desfase_horas: float = -5.0
+_desfase_medido = False
+_lock_desfase = threading.Lock()
+
+if DESFASE_BD_HORAS != "auto":
+    try:
+        _desfase_horas = float(DESFASE_BD_HORAS)
+    except ValueError:
+        # Un valor mal escrito no puede pasar por bueno en silencio: sería declarar
+        # fechas corridas a SUNAT. Se avisa y se sigue midiendo.
+        DESFASE_BD_HORAS = "auto"
 
 # Notas: el SFS las parsea con PipeNotaCreditoParser / PipeNotaDebitoParser, que
 # esperan una cabecera de 21 columnas —sin fecVencimiento y con
@@ -179,6 +228,14 @@ _TIPOS_SIN_FORMA_PAGO = {"03", "07", "08"}
 # 36 igual que el resto. Guiarse por ese texto hace que el SFS rechace el archivo
 # con un mensaje que apunta justo al número equivocado.
 _COLS_DET = 36
+
+# PipeResumenBoletaParser del SFS: el .RDI no es una cabecera única sino una línea
+# por boleta con este mismo layout de 23 columnas; el .TRD es el desglose de
+# tributos de cada línea, 6 columnas, vinculado por posición (idLineaRd = número de
+# fila dentro del .RDI, 1-based). Confirmado decompilando el parser, mismo método
+# que para notas y ND.
+_COLS_RDI = 23
+_COLS_TRD = 6
 
 # El SFS identifica cada documento por su archivo de cabecera, y la extensión cambia
 # según el tipo (ver BandejaDocumentosServiceImpl): .CAB para factura y boleta, .NOT
@@ -228,6 +285,14 @@ _MOTIVOS_NOTA = {
 # El reenvío queda acotado por el estado, no por el tiempo: _activar_pendientes_sfs_bd()
 # solo mira IND_SITU '01'/'02' (aún sin enviar); ver _ESTADOS_BLOQUEADO para el resto.
 _COOLDOWN_REENVIO_SEG = 45
+
+# El SFS no registra un resumen diario en su propia bandeja apenas responde EXITO a
+# GenerarComprobante.htm: lo escanea un job interno aparte, que tardó hasta ~90s en
+# la práctica. Sin este resguardo, _boletas_en_resumenes_activos() no veía el
+# resumen recién generado durante ese lapso y el siguiente ciclo (60s) generaba un
+# segundo resumen con las mismas boletas — confirmado en beta: dos RC duplicados
+# con el mismo pool de 5 boletas antes de que el primero apareciera en la bandeja.
+_GRACIA_REGISTRO_RC_SEG = 300
 _ultimo_intento: dict = {}
 
 # Pausas al conversar con el SFS. No son arbitrarias: el facturador procesa los
@@ -400,6 +465,10 @@ def numero_a_letras(monto, moneda: str = "PEN") -> str:
 
 
 def formatear_fecha_hora(fecha_raw) -> datetime:
+    """
+    La fecha tal como está guardada, sin mover la hora. Para lo que se le declara a
+    SUNAT hay que pasarla antes por fecha_local(): lo que hay en la BD está en UTC.
+    """
     if isinstance(fecha_raw, datetime):
         return fecha_raw
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%Y %H:%M:%S"):
@@ -408,6 +477,59 @@ def formatear_fecha_hora(fecha_raw) -> datetime:
         except (ValueError, AttributeError):
             pass
     raise ValueError(f"Fecha inválida: {fecha_raw!r}")
+
+
+def detectar_desfase_bd(conn) -> float:
+    """
+    Mide cuánto adelanta el reloj de la BD respecto de la hora local y lo recuerda.
+
+    Es lo que hace que el daemon siga funcionando si alguien cambia la zona horaria
+    del servidor: con la BD en UTC da -5, y si pasa a hora de Lima da 0, sin tocar
+    nada acá. Se redondea a media hora porque ninguna zona horaria usa una
+    granularidad menor, y así un par de segundos de latencia no ensucian el valor.
+    """
+    global _desfase_horas
+    if DESFASE_BD_HORAS != "auto":
+        return _desfase_horas
+    try:
+        filas = _consultar(conn, "SELECT now() AT TIME ZONE 'utc' AS utc, now() AS con_zona")
+        # now() vuelve con zona; se compara su lectura "de pared" contra el reloj local.
+        pared = filas[0]["con_zona"].replace(tzinfo=None)
+        crudo = (pared - datetime.now()).total_seconds() / 3600
+        medido = round(crudo * 2) / 2
+    except Exception:
+        logger.exception("No se pudo medir el desfase horario de la BD; se conserva %+g h.",
+                         _desfase_horas)
+        return _desfase_horas
+
+    global _desfase_medido
+    correccion = -medido
+    with _lock_desfase:
+        if correccion != _desfase_horas or not _desfase_medido:
+            logger.info(
+                "El reloj de la BD adelanta %+g h respecto de la hora local; las fechas "
+                "de emisión se corrigen en %+g h antes de declararlas a SUNAT.",
+                medido, correccion,
+            )
+            _desfase_horas = correccion
+            _desfase_medido = True
+    return _desfase_horas
+
+
+def fecha_local(fecha_raw) -> datetime:
+    """
+    Fecha de la BD llevada a la hora local del emisor.
+
+    Es la única forma válida de leer una fecha de emisión: es la que va al
+    comprobante y la que decide a qué día pertenece una boleta para el resumen
+    diario. Ver detectar_desfase_bd().
+    """
+    fecha = formatear_fecha_hora(fecha_raw)
+    if fecha.tzinfo is not None:
+        # Si alguna vez llega con zona horaria explícita, se convierte de verdad en
+        # vez de sumarle el desplazamiento a ciegas.
+        return fecha.astimezone(timezone(timedelta(hours=_desfase_horas))).replace(tzinfo=None)
+    return fecha + timedelta(hours=_desfase_horas)
 
 
 def escribir_archivo(ruta: str, contenido: str):
@@ -589,6 +711,9 @@ def obtener_comprobantes_pendientes(conn):
     La aplicación guarda el tipo como texto ('BOLETA', 'FACTURA') y no el código de
     SUNAT, y deja en NULL el desglose de importes: ambas cosas se resuelven acá para
     que procesar_comprobante() reciba siempre lo mismo, venga de donde venga.
+
+    Las boletas (03) quedan afuera a propósito: van por el resumen diario
+    (ver obtener_boletas_para_resumen/generar_resumen_diario), nunca individualmente.
     """
     # Los datos del comprobante viven en Factura: la tabla Comprobante se fusionó
     # dentro de ella, así que "id" y "factura_id" son la misma fila (se repite el
@@ -608,13 +733,16 @@ def obtener_comprobantes_pendientes(conn):
     )
     pendientes = []
     for f in filas:
+        tipo_comp = _tipo_sunat(f["tipoComprobante"] or f["tipo_enum"])
+        if tipo_comp == "03":
+            continue
         gravadas, igv = f["gravadas"], f["igv"]
         if gravadas is None or igv is None:
             gravadas, igv = _base_e_igv(f["total"])
         pendientes.append({
             "id":                             f["id"],
             "factura_id":                     f["id"],
-            "tipo_comprobante":               _tipo_sunat(f["tipoComprobante"] or f["tipo_enum"]),
+            "tipo_comprobante":               tipo_comp,
             "numeracion_comprobante":         f["numeracionComprobante"],
             "fecha_emision":                  f["fechaEmision"],
             "tipo_moneda":                    f["tipoMoneda"],
@@ -628,6 +756,59 @@ def obtener_comprobantes_pendientes(conn):
             "monto_letras": _texto(f["montoLetras"]) or numero_a_letras(f["total"], f["tipoMoneda"]),
         })
     return pendientes
+
+
+def obtener_boletas_para_resumen(conn) -> list:
+    """
+    Boletas sin enviar, emitidas antes de hoy: el pool de candidatas para el próximo
+    resumen diario. Las de hoy se dejan para el resumen de un día siguiente — recién
+    "cerraron" su día una vez que termina, y mandar un resumen a medio día se presta
+    a que lleguen más boletas después y queden fuera.
+    """
+    filas = _consultar(
+        conn,
+        'SELECT id, "tipoComprobante", tipo::text AS tipo_enum,'
+        '       "numeracionComprobante", "fechaEmision",'
+        '       gravadas, igv, total, "montoLetras"'
+        '  FROM public."Factura"'
+        ' WHERE enviado IS NOT TRUE'
+        '   AND "numeracionComprobante" IS NOT NULL'
+        ' ORDER BY "fechaEmision" ASC NULLS LAST',
+    )
+    hoy = datetime.now().date()
+    candidatas = []
+    for f in filas:
+        if _tipo_sunat(f["tipoComprobante"] or f["tipo_enum"]) != "03":
+            continue
+        faltantes = _validar_campos_obligatorios({
+            "numeracion_comprobante": f["numeracionComprobante"],
+            "fecha_emision":          f["fechaEmision"],
+            "total":                  f["total"],
+        })
+        if faltantes:
+            logger.warning(
+                "Boleta %s sin datos obligatorios (%s); no entra al resumen hasta completarlos.",
+                f["numeracionComprobante"] or f["id"], ", ".join(faltantes),
+            )
+            continue
+        # En hora local, que es la que define a qué día pertenece la boleta: en UTC
+        # una boleta de las 20:00 figuraría como del día siguiente y nunca entraría.
+        if fecha_local(f["fechaEmision"]).date() >= hoy:
+            continue
+        gravadas, igv = f["gravadas"], f["igv"]
+        if gravadas is None or igv is None:
+            gravadas, igv = _base_e_igv(f["total"])
+        candidatas.append({
+            "id":                     f["id"],
+            "factura_id":             f["id"],
+            "numeracion_comprobante": f["numeracionComprobante"],
+            "fecha_emision":          f["fechaEmision"],
+            "gravadas":               gravadas,
+            "igv":                    igv,
+            "total":                  f["total"],
+            "monto_letras": _texto(f["montoLetras"]) or numero_a_letras(f["total"], "PEN"),
+        })
+    return candidatas
 
 # ---------------------------------------------------------------------------
 # Generador de archivos SFS
@@ -671,6 +852,30 @@ def _referencia_nota(comp: dict, tipo_comp: str, num_comp: str):
     return cod_motivo, des_motivo, tip_afectado, num_afectado
 
 
+def _validar_campos_obligatorios(comp: dict) -> list:
+    """
+    Campos sin los que no se puede armar un comprobante ni una línea del resumen
+    diario. Solo devuelve qué falta —no decide qué hacer con eso—, para que sirva
+    tanto a procesar_comprobante() como a obtener_boletas_para_resumen(): cada
+    camino de emisión define si bloquea del todo o solo excluye esa fila.
+
+    No repite lo que ya filtra la consulta SQL (numeracionComprobante IS NOT NULL);
+    igual se valida acá porque es la única garantía si algún día una fila llega por
+    otro camino, y porque una fecha ilegible pasaba hoy como una excepción genérica
+    sin motivo claro en el log.
+    """
+    faltantes = []
+    if not _texto(comp.get("numeracion_comprobante")):
+        faltantes.append("numeracion_comprobante")
+    try:
+        formatear_fecha_hora(comp.get("fecha_emision"))
+    except (ValueError, TypeError):
+        faltantes.append("fecha_emision")
+    if comp.get("total") is None:
+        faltantes.append("total")
+    return faltantes
+
+
 def _linea_detalle(item: dict) -> str:
     """Una línea del archivo .det: las 36 columnas en el orden que lee el SFS."""
     cant   = formatear_decimal(item.get("dec_cantidad") or item.get("cantidad_venta") or item.get("cantidad", 1))
@@ -698,6 +903,24 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     # zfill(2) para que el nombre de archivo coincida con el tip_docu que se manda al SFS
     tipo_comp = _codigo(comp.get("tipo_comprobante"), "01")
 
+    # Validación previa: todo esto se chequea antes de escribir nada, para no dejar
+    # archivos huérfanos en DATA por un comprobante que igual no se puede armar bien.
+    faltantes = _validar_campos_obligatorios(comp)
+    if faltantes:
+        logger.warning(
+            "Comprobante %s-%s sin datos obligatorios (%s); no se emite hasta completarlos.",
+            tipo_comp, num_comp or "?", ", ".join(faltantes),
+        )
+        return False
+
+    items = obtener_items(conn, comp.get("factura_id"))
+    if not items:
+        logger.warning(
+            "Comprobante %s-%s sin ítems; no se emite hasta completarlos.",
+            tipo_comp, num_comp,
+        )
+        return False
+
     # Las notas se validan antes de escribir nada: si les falta la referencia, el SFS
     # las rechazaría igual y quedarían archivos huérfanos en DATA.
     referencia = None
@@ -719,7 +942,8 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     moneda       = _campo_pipe(comp.get("tipo_moneda"),          "PEN")
     monto_letras = _campo_pipe(comp.get("monto_letras"),         "SIN DESCRIPCION")
 
-    fecha_dt  = formatear_fecha_hora(comp.get("fecha_emision"))
+    # En hora local: es la fecha que se le declara a SUNAT (la BD guarda UTC).
+    fecha_dt  = fecha_local(comp.get("fecha_emision"))
     fecha_str = fecha_dt.strftime("%Y-%m-%d")
     hora_str  = fecha_dt.strftime("%H:%M:%S")
 
@@ -727,9 +951,7 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     tot_igv   = formatear_decimal(comp.get("igv")       or comp.get("total_igv"))
     tot_venta = formatear_decimal(comp.get("total")     or comp.get("total_venta"))
 
-    lineas_det = [_linea_detalle(item) for item in obtener_items(conn, comp.get("factura_id"))]
-    if not lineas_det:
-        logger.warning("Comprobante %s sin ítems.", num_comp)
+    lineas_det = [_linea_detalle(item) for item in items]
 
     # Cola de la cabecera: totales y versiones, iguales en los dos layouts.
     totales = (
@@ -763,16 +985,97 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     escribir_archivo(rutas["tri"], f"1000|IGV|VAT|{tot_grav:.2f}|{tot_igv:.2f}|\n")
     escribir_archivo(rutas["ley"], f"1000|{monto_letras}|\n")
 
-    if lineas_det:
-        escribir_archivo(rutas["det"], "".join(lineas_det))
-    else:
-        _borrar_si_existe(rutas["det"])
+    escribir_archivo(rutas["det"], "".join(lineas_det))
 
     # OJO: no se toca Comprobante.enviado acá. Generar los archivos no es haber
     # enviado nada; el estado lo mueve ciclo_generacion() recién cuando el SFS
     # confirma la recepción, y lo cierra el CDR de SUNAT.
     logger.info("Archivos SFS generados: %s", num_comp)
     return True
+
+
+def _linea_rdi(fecha_emision: str, fecha_resumen: str, boleta: dict, receptor: dict) -> str:
+    """
+    Una línea del .RDI: PipeResumenBoletaParser no lee una cabecera única sino una
+    línea por boleta con este mismo layout de 23 columnas.
+
+    Dos campos que parecen intercambiables y no lo son (verificado en
+    ConvertirRBoletasXML.ftl, que es lo que arma el XML final):
+      - tipDocResumen -> <cbc:DocumentTypeCode>: el TIPO de comprobante, "03" para
+        una boleta. Poner "1" acá lo rechaza SUNAT con el error 2241.
+      - tipEstado     -> <cbc:ConditionCode>: el estado de la línea, "1" = nueva.
+
+    Los bloques de documento modificado y de percepción son opcionales, y la
+    plantilla los emite con `<#if serDocModifico != "">` / `<#if tipRegPercepcion
+    != "">`: la condición es contra CADENA VACÍA, no contra "-". Un "-" ahí los
+    daría por presentes y armaría un XML con esos nodos rellenos de basura, así que
+    esos 8 campos van vacíos. Es lo contrario de lo que hace el resto de los
+    archivos del daemon, donde "-" es el relleno habitual.
+    """
+    tipo_doc_rec = _campo_pipe(receptor.get("tipo_documento"), "0")
+    num_doc_rec  = _campo_pipe(receptor.get("numero_documento"), "00000000")
+    grav  = formatear_decimal(boleta["gravadas"])
+    total = formatear_decimal(boleta["total"])
+    campos = [
+        fecha_emision, fecha_resumen, "03", boleta["numeracion_comprobante"],
+        tipo_doc_rec, num_doc_rec, "PEN",
+        f"{grav:.2f}", "0.00", "0.00", "0.00", "0.00", "0.00", f"{total:.2f}",
+        "", "", "", "",
+        "", "", "", "",
+        "1",
+    ]
+    return "|".join(campos) + "|\n"
+
+
+def _linea_trd(id_linea: int, boleta: dict) -> str:
+    """
+    Desglose de tributos de una línea del .RDI: 6 columnas, mismo patrón que el .tri
+    de un comprobante individual. id_linea es la posición (1-based) de la boleta
+    dentro del .RDI: es lo único que vincula ambos archivos, porque el parser no
+    guarda un identificador propio por línea.
+    """
+    grav = formatear_decimal(boleta["gravadas"])
+    igv  = formatear_decimal(boleta["igv"])
+    return f"{id_linea}|1000|IGV|VAT|{grav:.2f}|{igv:.2f}|\n"
+
+
+def generar_resumen_diario(conn, ruc_emisor: str):
+    """
+    Agrupa en un solo resumen las boletas pendientes de días anteriores y escribe
+    sus .RDI/.TRD en DATA. Devuelve el doc {"num_ruc","tip_docu","num_docu"} listo
+    para activar_procesamiento_sfs(), o None si no había boletas candidatas.
+    """
+    boletas = obtener_boletas_para_resumen(conn)
+    if not boletas:
+        return None
+    excluidas = _boletas_en_resumenes_activos(ruc_emisor)
+    boletas = [b for b in boletas if b["numeracion_comprobante"] not in excluidas]
+    if not boletas:
+        return None
+
+    hoy = datetime.now()
+    fecha_resumen = hoy.strftime("%Y-%m-%d")
+    numeracion_rc = _siguiente_numeracion_rc(hoy.strftime("%Y%m%d"))
+    base = _nombre_archivo_rc(ruc_emisor, numeracion_rc)
+    os.makedirs(SFS_DATA_DIR, exist_ok=True)
+
+    lineas_rdi, lineas_trd = [], []
+    for i, boleta in enumerate(boletas, start=1):
+        receptor = obtener_receptor(conn, boleta.get("factura_id"))
+        fecha_emision = fecha_local(boleta["fecha_emision"]).strftime("%Y-%m-%d")
+        lineas_rdi.append(_linea_rdi(fecha_emision, fecha_resumen, boleta, receptor))
+        lineas_trd.append(_linea_trd(i, boleta))
+
+    escribir_archivo(os.path.join(SFS_DATA_DIR, f"{base}.RDI"), "".join(lineas_rdi))
+    escribir_archivo(os.path.join(SFS_DATA_DIR, f"{base}.TRD"), "".join(lineas_trd))
+
+    numeraciones = [b["numeracion_comprobante"] for b in boletas]
+    _registrar_resumen(numeracion_rc, numeraciones)
+    logger.info(
+        "Resumen diario %s generado con %d boleta(s): %s",
+        numeracion_rc, len(numeraciones), ", ".join(numeraciones),
+    )
+    return {"num_ruc": ruc_emisor, "tip_docu": _TIPO_RC, "num_docu": numeracion_rc}
 
 # ---------------------------------------------------------------------------
 # API REST del SFS local
@@ -826,6 +1129,29 @@ def _xml_generado(ruc: str, tip: str, num: str) -> bool:
         return True
 
 
+def sincronizar_bandeja_sfs() -> bool:
+    """
+    Fuerza al SFS a releer la carpeta DATA y registrar en su bandeja lo que haya
+    nuevo. Devuelve True si respondió.
+
+    Hace falta porque el SFS solo escanea DATA cuando se le carga la pantalla
+    (cargarArchivosContribuyente cuelga de CargarPantalla.htm) o desde un job
+    programado que exige el temporizador prendido. Ni GenerarComprobante.htm ni
+    enviarXML.htm lo hacen: operan sobre lo que ya está en la bandeja.
+
+    Sin esta llamada, el daemon dependía de que alguien tuviera abierta la bandeja
+    en el navegador —ahí la página refresca sola y de paso dispara el escaneo—, y
+    con la ventana cerrada los archivos se quedaban en DATA sin que nadie los mire.
+    """
+    r = _sfs_post("api/CargarPantalla.htm", {})
+    if r is None:
+        return False
+    if r.get("validacion") != "EXITO":
+        logger.warning("El SFS no pudo releer DATA: %s", _resumen_sfs(r))
+        return False
+    return True
+
+
 def activar_procesamiento_sfs(documentos: list) -> list:
     """Envía los documentos al SFS local. Devuelve solo los que el SFS aceptó."""
     if not documentos:
@@ -835,6 +1161,10 @@ def activar_procesamiento_sfs(documentos: list) -> list:
     except Exception:
         logger.warning("SFS no responde — envío automático desactivado.")
         return []
+
+    # Que el SFS levante de DATA lo recién escrito antes de pedirle nada sobre ello:
+    # los endpoints de generar y enviar solo ven lo que ya está en su bandeja.
+    sincronizar_bandeja_sfs()
 
     enviados = []
     ahora    = time.monotonic()
@@ -1025,6 +1355,195 @@ def _guardar_cdr(ruc: str, tipo: str, numeracion: str, cdr: bytes, mensaje: str)
     )
 
 # ---------------------------------------------------------------------------
+# Consulta del ticket de un resumen diario
+# ---------------------------------------------------------------------------
+
+# Un resumen no devuelve su CDR en el acto como una factura: SUNAT responde un
+# ticket y hay que volver a preguntar por él. El SFS sabe hacerlo, pero solo desde
+# un job programado (ActualizarBajasJob) que exige tener el temporizador prendido,
+# y prenderlo levantaría también sus jobs de generar/enviar, que harían por su
+# cuenta lo mismo que este daemon hace por REST. Por eso la consulta la hace el
+# daemon, con el mismo patrón que ya usa para recuperar CDR perdidos.
+_SOBRE_TICKET = """<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:ser="http://service.sunat.gob.pe">
+  <soapenv:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsse:UsernameToken>
+        <wsse:Username>{usuario}</wsse:Username>
+        <wsse:Password>{clave}</wsse:Password>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </soapenv:Header>
+  <soapenv:Body>
+    <ser:getStatus>
+      <ticket>{ticket}</ticket>
+    </ser:getStatus>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+# Códigos de getStatus (distintos de los de getStatusCdr): 0 y 99 traen el CDR —el
+# 99 es el de un resumen procesado CON errores, y su CDR explica cuáles—, mientras
+# que el 98 significa que SUNAT todavía lo está procesando.
+_TICKET_CON_CDR   = ("0", "98", "99")
+_TICKET_EN_PROCESO = "98"
+
+
+def _url_bill_service() -> str:
+    """
+    Endpoint de envío del SFS (RUTA_SERV_CDP de constantes.properties), que es el
+    mismo servicio donde se consulta el ticket.
+
+    Se lee de ahí en vez de tener su propia variable para que la consulta salga
+    SIEMPRE al ambiente al que el SFS está enviando: si alguien pasa el SFS de beta
+    a producción, esto lo sigue solo. Preguntarle a producción por un ticket de
+    beta —o al revés— devolvería "el ticket no existe".
+    """
+    try:
+        with open(SFS_CONSTANTES_PATH, encoding="utf-8", errors="replace") as fh:
+            for linea in fh:
+                linea = linea.strip()
+                # Las variantes que no se usan quedan comentadas con '#', y hay una
+                # por cada tipo de servicio y ambiente: solo vale la activa.
+                if linea.startswith("RUTA_SERV_CDP="):
+                    return linea.split("=", 1)[1].strip()
+    except OSError:
+        logger.exception(
+            "No se pudo leer %s para ubicar el servicio de SUNAT.", SFS_CONSTANTES_PATH
+        )
+    return ""
+
+
+def consultar_ticket_sunat(ruc: str, ticket: str):
+    """
+    Pregunta a SUNAT por el resultado de un ticket de resumen.
+
+    Devuelve (codigo, mensaje, cdr_zip). Ante cualquier fallo devuelve
+    (None, motivo, None) y quien llama debe tratarlo como "todavía no sé": el
+    resumen queda como está y se vuelve a consultar en el próximo ciclo.
+    """
+    if not (SOL_USUARIO and SOL_CLAVE):
+        return None, "faltan SOL_USUARIO y SOL_CLAVE en el .env", None
+    url = _url_bill_service()
+    if not url:
+        return None, "no se pudo determinar el servicio de SUNAT (RUTA_SERV_CDP)", None
+
+    sobre = _SOBRE_TICKET.format(usuario=f"{ruc}{SOL_USUARIO}", clave=SOL_CLAVE, ticket=ticket)
+    peticion = urllib.request.Request(
+        url,
+        data=sobre.encode("utf-8"),
+        headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "urn:getStatus"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(peticion, timeout=30) as r:
+            respuesta = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode("utf-8", "replace")
+        detalle = _texto_de_nodo(cuerpo, "faultstring") or f"HTTP {e.code}"
+        logger.warning("Consulta del ticket %s rechazada por SUNAT: %s", ticket, detalle)
+        return None, detalle, None
+    except Exception as e:
+        logger.warning("No se pudo consultar el ticket %s: %s", ticket, e)
+        return None, str(e), None
+
+    codigo  = _texto_de_nodo(respuesta, "statusCode")
+    mensaje = _texto_de_nodo(respuesta, "statusMessage")
+    b64     = _texto_de_nodo(respuesta, "content")
+    cdr = None
+    if b64:
+        try:
+            cdr = base64.b64decode(b64)
+        except (ValueError, binascii.Error):
+            logger.exception("SUNAT devolvió un CDR ilegible para el ticket %s", ticket)
+    return codigo or None, mensaje, cdr
+
+
+def _resumenes_con_ticket(ruc_emisor: str) -> list:
+    """[(num_docu, ticket)] de los resúmenes enviados que esperan respuesta."""
+    if not os.path.exists(SFS_BD_PATH):
+        return []
+    try:
+        with _sfs_bd() as sfs:
+            return [
+                (_texto(num), _texto(tk))
+                for num, tk in sfs.execute(
+                    "SELECT NUM_DOCU, NUM_TICKET FROM DOCUMENTO "
+                    "WHERE NUM_RUC=? AND TIP_DOCU=? AND IND_SITU IN ('08','09') "
+                    "AND NUM_TICKET IS NOT NULL AND NUM_TICKET <> ''",
+                    (ruc_emisor, _TIPO_RC),
+                )
+            ]
+    except sqlite3.Error:
+        logger.exception("No se pudo leer la BD del SFS para buscar tickets de resumen.")
+        return []
+
+
+def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str):
+    """
+    Da por cerrado el resumen en la bandeja del SFS una vez que su CDR está en RPTA.
+
+    Un ticket de SUNAT se consume al consultarlo: si el SFS lo vuelve a consultar
+    después de que el daemon ya lo usó, recibe "El ticket no existe" y deja el
+    resumen en IND_SITU='05'. Ese estado cuenta como bloqueado, así que el resumen
+    se reportaría como trabado en cada ciclo y sus archivos nunca saldrían de DATA
+    —pese a estar perfectamente emitido y con las boletas ya cerradas—.
+
+    Se marca '03' con el mismo criterio que usa _activar_pendientes_sfs_bd() cuando
+    encuentra un CDR ya descargado: en la bandeja del SFS ese estado significa "ya
+    no me ocupo de esto". El veredicto real de SUNAT no vive acá sino en el CDR, que
+    es quien decide si las boletas quedan en enviado=true o con su motivo de rechazo.
+    """
+    if not os.path.exists(SFS_BD_PATH):
+        return
+    try:
+        with _sfs_bd(escritura=True) as sfs:
+            sfs.execute(
+                "UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE='Aceptado (CDR procesado)' "
+                "WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? AND IND_SITU IN ('08','09')",
+                (ruc_emisor, _TIPO_RC, numeracion),
+            )
+    except sqlite3.Error:
+        logger.exception("No se pudo cerrar el resumen %s en la bandeja del SFS.", numeracion)
+
+
+def recuperar_cdr_resumenes(ruc_emisor: str):
+    """
+    Consulta el ticket de cada resumen enviado y baja su CDR cuando ya está listo.
+
+    El CDR queda en RPTA y de ahí en adelante el flujo es el de siempre: el hilo
+    CDR lo levanta y _actualizar_sql_cdr() lo reparte entre todas las boletas que
+    el resumen agrupa.
+    """
+    ahora = time.monotonic()
+    for numeracion, ticket in _resumenes_con_ticket(ruc_emisor):
+        if _tiene_cdr(ruc_emisor, _TIPO_RC, numeracion):
+            continue
+        previo = _ultima_consulta.get((_TIPO_RC, numeracion))
+        if previo is not None and ahora - previo < _COOLDOWN_CONSULTA_SEG:
+            continue
+        _ultima_consulta[(_TIPO_RC, numeracion)] = ahora
+
+        codigo, mensaje, cdr = consultar_ticket_sunat(ruc_emisor, ticket)
+        if codigo is None:
+            logger.info("Ticket %s de %s: sin respuesta útil (%s); se reintenta.",
+                        ticket, numeracion, mensaje)
+            continue
+        if codigo == _TICKET_EN_PROCESO:
+            logger.info("SUNAT todavía procesa el resumen %s (ticket %s).", numeracion, ticket)
+            continue
+        if cdr and codigo in _TICKET_CON_CDR:
+            # Vale tanto para el aceptado como para el rechazado: el parser del CDR
+            # decide cuál es, igual que con cualquier otro comprobante.
+            _guardar_cdr(ruc_emisor, _TIPO_RC, numeracion, cdr, f"ticket {ticket}: {mensaje}")
+            _cerrar_resumen_en_sfs(ruc_emisor, numeracion)
+        else:
+            logger.warning(
+                "Ticket %s de %s devolvió el código %s sin CDR (%s); se reintenta.",
+                ticket, numeracion, codigo, mensaje,
+            )
+
+# ---------------------------------------------------------------------------
 # SFS BD SQLite — gestión de estados
 # ---------------------------------------------------------------------------
 
@@ -1085,6 +1604,12 @@ def _limpiar_data_cerrados(ruc_emisor: str, en_vuelo: dict) -> int:
         if len(partes) < 4:
             continue
         tip, num = partes[1], "-".join(partes[2:])
+        if tip == _TIPO_RC:
+            # El nombre de archivo de un resumen va sin el "RC-" del id (lo exige
+            # validarNombreArchivo del SFS), pero en la bandeja el número sí lo
+            # lleva. Sin reponerlo acá, sus archivos nunca calzaban y quedaban en
+            # DATA para siempre. Ver _nombre_archivo_rc().
+            num = f"{_TIPO_RC}-{num}"
         situ, _ = en_vuelo.get((tip, num), ("", ""))
         if situ in _ESTADOS_CERRADOS:
             _eliminar_data_files(base)
@@ -1127,6 +1652,12 @@ def _docs_enviados_sin_cdr(ruc_emisor: str) -> list:
     Documentos que el SFS dice haber enviado y que siguen sin cerrarse, con cuántos
     minutos llevan así. Son los únicos candidatos a consultarle a SUNAT: si no tienen
     fecha de envío es que nunca salieron, y preguntar por ellos no tiene sentido.
+
+    Los resúmenes (RC) quedan afuera: su respuesta vive detrás de un ticket y se
+    consulta con getStatus, no con getStatusCdr (ver recuperar_cdr_resumenes). Si
+    entraran acá, se les preguntaría con una serie-número que no existe como tal, y
+    una respuesta de "no registrado" borraría el resumen de la bandeja junto con su
+    ticket — perdiendo el único modo de recuperar su CDR.
     """
     if not os.path.exists(SFS_BD_PATH):
         return []
@@ -1137,9 +1668,9 @@ def _docs_enviados_sin_cdr(ruc_emisor: str) -> list:
         with _sfs_bd() as sfs:
             filas = sfs.execute(
                 "SELECT TIP_DOCU, NUM_DOCU, FEC_ENVI FROM DOCUMENTO "
-                f"WHERE NUM_RUC=? AND IND_SITU NOT IN ({marcas}) "
+                f"WHERE NUM_RUC=? AND TIP_DOCU<>? AND IND_SITU NOT IN ({marcas}) "
                 "AND FEC_ENVI IS NOT NULL AND FEC_ENVI <> ''",
-                (ruc_emisor, *_ESTADOS_CERRADOS),
+                (ruc_emisor, _TIPO_RC, *_ESTADOS_CERRADOS),
             ).fetchall()
     except sqlite3.Error:
         logger.exception("No se pudo leer la BD del SFS para buscar documentos sin CDR.")
@@ -1219,6 +1750,114 @@ def _docs_en_vuelo(ruc_emisor: str) -> dict:
     except sqlite3.Error:
         logger.exception("No se pudo leer la BD del SFS; se omite el filtro de duplicados.")
         return {}
+
+
+def _leer_resumenes() -> dict:
+    try:
+        with open(_RESUMENES_PATH, encoding="utf-8") as fh:
+            datos = json.load(fh)
+        return datos if isinstance(datos, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        logger.exception("No se pudo leer %s; se reinicia el registro de resúmenes.", _RESUMENES_PATH)
+        return {}
+
+
+def _guardar_resumenes(datos: dict):
+    try:
+        escribir_archivo(_RESUMENES_PATH, json.dumps(datos, ensure_ascii=False, indent=2))
+    except OSError:
+        logger.exception("No se pudo guardar %s; el registro de resúmenes no persiste.", _RESUMENES_PATH)
+
+
+def _siguiente_numeracion_rc(fecha: str) -> str:
+    """
+    RC-{fecha}-{NNN} (fecha=YYYYMMDD), con NNN correlativo propio del daemon — la
+    única numeración que el daemon asigna en vez de leer: para todo lo demás la
+    aplicación ya la puso antes de que el comprobante llegue acá.
+
+    Con el prefijo "RC-" incluido, porque es la forma canónica del id: es la que
+    usa SUNAT en el XML, la que el SFS guarda en DOCUMENTO.NUM_DOCU y espera en su
+    API REST, y la que vuelve en el CDR. La ÚNICA excepción es el nombre de archivo
+    en DATA, que se arma sin el prefijo (ver _nombre_archivo_rc).
+    """
+    with _lock_resumenes:
+        datos = _leer_resumenes()
+        n = int(datos.get("ultimo_correlativo", 0)) + 1
+        datos["ultimo_correlativo"] = n
+        _guardar_resumenes(datos)
+    return f"{_TIPO_RC}-{fecha}-{n:03d}"
+
+
+def _nombre_archivo_rc(ruc_emisor: str, numeracion_rc: str) -> str:
+    """
+    Nombre base del archivo en DATA para un resumen, sin el prefijo "RC-" del id.
+
+    validarNombreArchivo() del SFS exige exactamente 4 tramos separados por guión
+    (RUC-TIPO-SERIE-NUMERO). Como _nombre_base() ya agrega el tipo, dejar el "RC-"
+    del id daría 5 tramos y el SFS descarta el archivo en silencio: no genera el
+    XML ni lo registra en su bandeja, sin ningún error que lo delate (confirmado
+    decompilando esa validación).
+    """
+    return _nombre_base(ruc_emisor, _TIPO_RC, _sin_prefijo_rc(numeracion_rc))
+
+
+def _sin_prefijo_rc(numeracion_rc: str) -> str:
+    prefijo = f"{_TIPO_RC}-"
+    return numeracion_rc[len(prefijo):] if numeracion_rc.startswith(prefijo) else numeracion_rc
+
+
+def _registrar_resumen(numeracion_rc: str, boletas: list):
+    with _lock_resumenes:
+        datos = _leer_resumenes()
+        datos.setdefault("resumenes", {})[numeracion_rc] = {
+            "boletas": boletas,
+            "generado": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _guardar_resumenes(datos)
+
+
+def _boletas_de_resumen(numeracion_rc: str) -> list:
+    entrada = _leer_resumenes().get("resumenes", {}).get(numeracion_rc) or {}
+    return entrada.get("boletas", [])
+
+
+def _boletas_en_resumenes_activos(ruc_emisor: str) -> set:
+    """
+    Boletas que ya están dentro de un resumen que el SFS sigue teniendo registrado y
+    sin cerrar (pendiente o bloqueado): no se las incluye de nuevo en un resumen
+    nuevo mientras el primero todavía espera respuesta de SUNAT, ni mientras siga
+    bloqueado esperando revisión manual. Un resumen ya cerrado no necesita este
+    filtro —sus boletas ya quedaron en enviado=true.
+
+    Un resumen recién generado tampoco aparece todavía en _docs_en_vuelo(): el SFS
+    lo escanea con un job propio, no en la misma llamada REST que lo entrega, y eso
+    tardó hasta un minuto y medio en la práctica. Por eso, mientras no haya pasado
+    _GRACIA_REGISTRO_RC_SEG desde que se generó, se lo trata como activo aunque el
+    SFS todavía no sepa nada de él — sin este resguardo, el siguiente ciclo (60s) lo
+    daba por libre y generaba un segundo resumen con las mismas boletas. Pasada la
+    gracia sin rastro en el SFS, recién ahí se asume que se perdió de verdad (p. ej.
+    la llamada REST falló) y se liberan sus boletas.
+    """
+    en_vuelo = _docs_en_vuelo(ruc_emisor)
+    ahora = datetime.now()
+    activas = set()
+    for numeracion_rc, entrada in _leer_resumenes().get("resumenes", {}).items():
+        boletas = entrada.get("boletas", [])
+        situ, _ = en_vuelo.get((_TIPO_RC, numeracion_rc), ("", ""))
+        if situ and situ not in _ESTADOS_CERRADOS:
+            activas.update(boletas)
+            continue
+        if situ:
+            continue  # cerrado: ya se resolvió, no hace falta el resguardo de tiempo
+        try:
+            generado = datetime.strptime(entrada.get("generado", ""), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if (ahora - generado).total_seconds() < _GRACIA_REGISTRO_RC_SEG:
+            activas.update(boletas)
+    return activas
 
 
 def _leer_reintentos() -> dict:
@@ -1347,7 +1986,9 @@ def _extraer_numeracion(texto) -> str | None:
     # B001, y también BC01/FC01/BC03 en notas de crédito. El patrón anterior exigía
     # 3 dígitos al final (\d{3}) y dejaba fuera esas series, con lo que el CDR de una
     # nota de crédito quedaba sin numeración y su comprobante nunca pasaba a enviado=1.
-    m = re.search(r"[A-Z][A-Z0-9]{3}-\d+", _texto(texto))
+    # El resumen diario (RC-YYYYMMDD-NNN) tiene solo 2 letras antes del guión, así que
+    # necesita su propia alternativa: nunca calzaría con las 4 exigidas por la otra.
+    m = re.search(rf"{_TIPO_RC}-\d{{8}}-\d+|[A-Z][A-Z0-9]{{3}}-\d+", _texto(texto))
     return m.group(0) if m else None
 
 
@@ -1413,6 +2054,34 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
         return False
     if parsed["status"] not in _CDR_ACEPTADOS:
         return False
+
+    if numeracion.startswith(f"{_TIPO_RC}-"):
+        # Un resumen no es una fila de Factura: agrupa muchas boletas, así que el
+        # cierre es un fan-out a todas las que se guardaron en resumenes.json cuando
+        # se generó, no un UPDATE de una sola fila.
+        boletas = _boletas_de_resumen(numeracion)
+        if not boletas:
+            logger.error(
+                "CDR aceptado del resumen %s pero no hay boletas registradas para él "
+                "en resumenes.json; quedan en enviado=0.", numeracion,
+            )
+            return False
+        filas = _actualizar(
+            conn,
+            'UPDATE public."Factura" SET enviado=%s, errors=NULL '
+            'WHERE "numeracionComprobante" = ANY(%s)',
+            (ENVIADO_ACEPTADO, boletas),
+        )
+        if filas > 0:
+            _limpiar_reintento(numeracion)
+            logger.info("Resumen %s aceptado: %d boleta(s) marcadas enviado=1.", numeracion, filas)
+            return True
+        logger.error(
+            "CDR aceptado del resumen %s pero ninguna de sus boletas coincide en la "
+            "BD; quedan en enviado=0.", numeracion,
+        )
+        return False
+
     # errors se limpia junto con la aceptación: si el comprobante había sido rechazado
     # antes, el motivo viejo ya no aplica.
     filas = _actualizar(
@@ -1447,6 +2116,18 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
         detalle += f" — código {parsed['codigo']}"
     if parsed.get("descripcion"):
         detalle += f": {parsed['descripcion']}"
+
+    if numeracion.startswith(f"{_TIPO_RC}-"):
+        boletas = _boletas_de_resumen(numeracion)
+        if not boletas:
+            return False
+        filas = _actualizar(
+            conn,
+            'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante" = ANY(%s)',
+            (detalle[:_MAX_ERRORS_SQL], boletas),
+        )
+        return filas > 0
+
     filas = _actualizar(
         conn,
         'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante"=%s',
@@ -1599,12 +2280,24 @@ def ciclo_generacion():
 
         ruc_emisor = EMISOR_RUC_OVERRIDE or _texto(emisor.get("ruc"), "00000000000")
 
+        # Antes de leer una sola fecha: medir con qué reloj las guarda la aplicación.
+        # De esto depende qué día se le declara a SUNAT (ver detectar_desfase_bd).
+        detectar_desfase_bd(conn)
+
+        # Primero que el SFS relea DATA: todo lo que sigue —qué está en vuelo, qué
+        # falta activar, qué se puede limpiar— se decide mirando su bandeja, y sin
+        # esto no refleja lo que quedó escrito en ciclos anteriores.
+        sincronizar_bandeja_sfs()
+
         resetear_rechazados(conn, ruc_emisor)
 
         # Antes de decidir qué generar: si algo se envió y su CDR nunca volvió
         # —típicamente por un corte de conexión—, preguntarle a SUNAT si lo tiene.
+        # Y los resúmenes ya enviados esperan su CDR detrás de un ticket, que hay
+        # que consultar aparte: SUNAT no lo devuelve en el momento del envío.
         if SOL_USUARIO and SOL_CLAVE:
             recuperar_cdr_pendientes(ruc_emisor)
+            recuperar_cdr_resumenes(ruc_emisor)
 
         comprobantes = obtener_comprobantes_pendientes(conn)
         logger.info("%d comprobante(s) pendiente(s).", len(comprobantes))
@@ -1639,6 +2332,16 @@ def ciclo_generacion():
                     })
             except Exception:
                 logger.exception("Error procesando %r", comp.get("numeracion_comprobante"))
+
+        # Las boletas no entran al loop de arriba (ver obtener_comprobantes_pendientes):
+        # se agrupan acá en un resumen diario, que de ahí en más sigue el mismo
+        # camino que cualquier otro documento (activar_procesamiento_sfs, etc.).
+        try:
+            resumen_doc = generar_resumen_diario(conn, ruc_emisor)
+            if resumen_doc:
+                docs_generados.append(resumen_doc)
+        except Exception:
+            logger.exception("Error generando el resumen diario de boletas")
 
         _reportar_clasificacion(fuera_alcance, omitidos, bloqueados)
 
