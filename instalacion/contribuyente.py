@@ -169,13 +169,18 @@ def _motivo(respuesta):
     """
     El texto de error de una respuesta del SFS.
 
-    No siempre viene en 'mensaje': segun el endpoint usa 'Mensaje' con mayuscula,
-    o directamente no manda ninguno. Quedarse solo con 'mensaje' mostraba un
-    'None' que no decia nada, asi que como ultimo recurso se vuelca la respuesta
-    entera — fea, pero con la informacion a la vista.
+    OJO: varios endpoints devuelven el motivo en la MISMA clave 'validacion' que
+    usan para decir 'EXITO' —confirmado en el bytecode de importarCertificado, que
+    hace put("validacion", "Debe ingresar la ruta del certificado")—. Buscarlo
+    solo en 'mensaje' mostraba un 'None' inutil teniendo el motivo a la vista.
     """
     if not isinstance(respuesta, dict):
         return str(respuesta)
+    # "FALLO" lo pone _post_sfs cuando ni siquiera se pudo llamar al SFS; en ese
+    # caso el detalle esta en 'mensaje', no aca.
+    validacion = respuesta.get("validacion")
+    if validacion and validacion not in ("EXITO", "FALLO"):
+        return str(validacion)
     for clave in ("mensaje", "Mensaje", "message", "error", "Error"):
         if respuesta.get(clave):
             return str(respuesta[clave])
