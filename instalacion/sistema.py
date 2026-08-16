@@ -29,8 +29,15 @@ PRERREQUISITOS = (
         "version": ("--version", (3, 10)),
     },
     {
+        # No alcanza con que haya Java: las versiones anteriores a la 8u242
+        # rechazan certificados PKCS#12 con codificaciones que las nuevas aceptan
+        # sin problema. Verificado en una instalacion real: con 1.8.0_202 el SFS
+        # respondia "el certificado no fue creado" con un .p12 perfectamente
+        # valido, byte a byte identico a uno que funciona con 1.8.0_492.
         "comando": "java", "nombre": "Java 8 (Temurin)",
         "winget": "EclipseAdoptium.Temurin.8.JRE", "manual": "https://adoptium.net/",
+        # 1.8.0_242: en Java el numero de actualizacion es el CUARTO componente.
+        "version": ("-version", (1, 8, 0, 242)),
     },
     {
         "comando": "node", "nombre": "Node.js LTS",
@@ -43,7 +50,20 @@ def correr(comando, timeout=900):
     """
     Ejecuta un programa y devuelve (codigo, salida). Junta stdout y stderr porque
     varios (java, npm, pip) escriben informacion util en el segundo.
+
+    OJO con el primer elemento: en Windows, pm2, npm, gh y winget no son .exe sino
+    archivos .CMD, y Windows no sabe ejecutarlos sin pasar por el shell. Invocarlos
+    con una lista (que Python corre sin shell) falla con "no se puede encontrar el
+    archivo" aunque esten instalados y en el PATH. Por eso se resuelve la ruta real
+    con which() y, si termina en .cmd o .bat, se ejecuta a traves de cmd.exe.
     """
+    if isinstance(comando, (list, tuple)):
+        comando = list(comando)
+        ruta = shutil.which(comando[0])
+        if ruta:
+            comando[0] = ruta
+            if ruta.lower().endswith((".cmd", ".bat")):
+                comando = ["cmd", "/c"] + comando
     try:
         r = subprocess.run(
             comando, shell=isinstance(comando, str), capture_output=True,
@@ -53,7 +73,7 @@ def correr(comando, timeout=900):
     except subprocess.TimeoutExpired:
         return -1, f"el comando tardo mas de {timeout} segundos"
     except Exception as e:
-        return -1, str(e)
+        return -1, f"{type(e).__name__}: {e}"
 
 
 def hay(comando):
@@ -65,11 +85,26 @@ def _version_de(comando, argumento):
     return salida.strip().splitlines()[0] if salida.strip() else ""
 
 
-def _cumple_version(comando, argumento, minima):
+def _numeros_de_version(texto):
+    """
+    Los numeros de una version, como tupla comparable.
+
+    Contempla el formato de Java, donde la actualizacion va despues de un guion
+    bajo ("1.8.0_202" -> (1,8,0,202)) y no de un punto como en todo lo demas.
+    """
     import re
-    texto = _version_de(comando, argumento)
-    m = re.search(r"(\d+)\.(\d+)", texto)
-    return bool(m) and tuple(int(x) for x in m.groups()) >= minima
+    m = re.search(r"(\d+(?:\.\d+)*(?:_\d+)?)", texto)
+    if not m:
+        return ()
+    return tuple(int(p) for p in m.group(1).replace("_", ".").split("."))
+
+
+def _cumple_version(comando, argumento, minima):
+    numeros = _numeros_de_version(_version_de(comando, argumento))
+    if not numeros:
+        return False
+    # Se comparan solo tantas partes como pide el minimo: "3.14" cumple (3,10).
+    return numeros[:len(minima)] >= tuple(minima)
 
 
 def refrescar_path():
@@ -208,4 +243,32 @@ def descargar_sfs(ruta_destino, version=VERSION_SFS, avisar=print):
     # Las carpetas de trabajo tienen que existir antes de emitir.
     for carpeta in ("DATA", "RPTA", "CERT"):
         os.makedirs(os.path.join(ruta_destino, "sunat_archivos", "sfs", carpeta), exist_ok=True)
+
+    sobrantes = _limpiar_data_de_ejemplo(ruta_destino)
+    if sobrantes:
+        avisar(f"    se quitaron {sobrantes} archivo(s) de ejemplo que traia el ZIP")
     return True, f"instalado en {ruta_destino}"
+
+
+def _limpiar_data_de_ejemplo(ruta_sfs):
+    """
+    Vacia DATA de los comprobantes que SUNAT deja en su ZIP.
+
+    La distribucion viene con archivos de prueba de OTRO contribuyente (se vieron
+    con RUC 20480072872). El SFS los levanta como documentos propios e intenta
+    emitirlos, asi que no pueden quedar en una instalacion nueva.
+    """
+    data = os.path.join(ruta_sfs, "sunat_archivos", "sfs", "DATA")
+    if not os.path.isdir(data):
+        return 0
+    borrados = 0
+    for nombre in os.listdir(data):
+        ruta = os.path.join(data, nombre)
+        # .gitkeep y cualquier subcarpeta se conservan: solo se van los comprobantes.
+        if os.path.isfile(ruta) and not nombre.startswith("."):
+            try:
+                os.remove(ruta)
+                borrados += 1
+            except OSError:
+                pass
+    return borrados

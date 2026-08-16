@@ -171,27 +171,43 @@ def configurar_cliente():
     razon = preguntar("Razon social", previo.get("RAZON", ""), obligatorio=True)
     comercial = preguntar("Nombre comercial", previo.get("NOMCOM", "") or razon)
     usuario_sol = preguntar("Usuario SOL secundario", previo.get("USUSOL", ""), obligatorio=True)
-    clave_sol = preguntar_clave("Clave SOL")
+    clave_sol = preguntar_clave("Clave SOL (no se ve al escribir)")
     if not clave_sol:
         error("la clave SOL es obligatoria")
         return False
 
     titulo("2. Direccion fiscal")
+    nota("  Cada parte va por separado: el SFS las combina al armar el XML.")
     ubigeo = preguntar("Ubigeo (6 digitos)", previo.get("UBIGEO", ""), obligatorio=True)
-    direccion = preguntar("Direccion", "", obligatorio=True)
+    nota("  Solo calle y numero. Ejemplo: AV. IZAGUIRRE NRO. 785 DPTO. 302")
+    direccion = preguntar("Direccion (sin distrito ni urbanizacion)", "", obligatorio=True)
     departamento = preguntar("Departamento", "LIMA", obligatorio=True)
     provincia = preguntar("Provincia", "LIMA", obligatorio=True)
     distrito = preguntar("Distrito", "", obligatorio=True)
-    urbanizacion = preguntar("Urbanizacion (opcional)")
+    urbanizacion = preguntar("Urbanizacion (opcional). Ej: URB. MERCURIO ETAPA 1")
 
     titulo("3. Certificado digital")
-    nota("  El .p12 o .pfx que emitio la entidad certificadora para este RUC.")
+    nota("  El archivo .p12 o .pfx que emitio la entidad certificadora para este RUC.")
+    nota(r"  Ejemplo: C:\certificado.p12")
     while True:
-        ruta_cert = preguntar("Ruta del archivo", "", obligatorio=True).strip('"')
-        if os.path.exists(ruta_cert):
-            break
-        error(f"no existe el archivo '{ruta_cert}'")
-    clave_cert = preguntar_clave("Contrasena del certificado")
+        ruta_cert = preguntar("Ruta del ARCHIVO .p12", "", obligatorio=True).strip('"')
+        if os.path.isfile(ruta_cert):
+            if ruta_cert.lower().endswith((".p12", ".pfx")):
+                break
+            error("el archivo tiene que ser .p12 o .pfx")
+        elif os.path.isdir(ruta_cert):
+            # Sin esto se aceptaba la carpeta y fallaba despues culpando a la
+            # contrasena, que es lo ultimo donde uno buscaria el problema.
+            error("eso es una carpeta; hace falta la ruta del archivo .p12 que esta adentro")
+            certs = [f for f in os.listdir(ruta_cert) if f.lower().endswith((".p12", ".pfx"))]
+            if certs:
+                nota("  En esa carpeta hay: " + ", ".join(certs))
+                nota(f"  Probar con: {os.path.join(ruta_cert, certs[0])}")
+            else:
+                nota("  Esa carpeta no tiene ningun .p12: hay que copiar ahi el del cliente.")
+        else:
+            error(f"no existe '{ruta_cert}'")
+    clave_cert = preguntar_clave("Contrasena del certificado (no se ve al escribir)")
 
     # Se valida ANTES de tocar el SFS: un certificado de otro contribuyente falla
     # en SUNAT con un error que no menciona al certificado.
@@ -202,8 +218,6 @@ def configurar_cliente():
     (ok if valido else aviso)(f"certificado: {mensaje}")
 
     titulo("4. Base de datos de la aplicacion")
-    aviso("Para una instalacion de PRUEBA, usar una base de prueba, NO la de produccion.")
-    nota("  Dos daemons sobre la misma base se pelean los mismos comprobantes.")
     while True:
         db_url = preguntar("DATABASE_URL", "", obligatorio=True)
         listo, mensaje = contribuyente.probar_base(db_url)
@@ -224,12 +238,26 @@ def configurar_cliente():
     }
 
     titulo("5. Configurando el SFS")
+    # Antes de arrancar nada: el sfs.config.js versionado trae rutas fijas de otra
+    # PC, y PM2 lee el archivo entero aunque se le pida un solo proceso.
+    config = contribuyente.escribir_config_pm2(RAIZ, ruta_sfs)
+    ok(f"{os.path.basename(config)} generado con las rutas de esta PC")
+
     base_url = "http://localhost:9000"
     if not contribuyente.esperar_sfs(base_url, segundos=5):
-        paso("levantando el SFS...")
-        sistema.correr(["pm2", "start", os.path.join(RAIZ, "sfs.config.js"), "--only", "sfs"])
+        paso("levantando el SFS (puede tardar hasta un minuto)...")
+        codigo, salida = sistema.correr(["pm2", "start", config, "--only", "sfs"], timeout=120)
         if not contribuyente.esperar_sfs(base_url, segundos=90):
             error("el SFS no respondio despues de 90 segundos")
+            # Sin esto habria que ir a buscar el motivo a los logs de PM2.
+            nota("  Respuesta de PM2:")
+            for linea in salida.strip().splitlines()[-6:]:
+                nota(f"    {linea}")
+            codigo, log = sistema.correr("pm2 logs sfs --lines 12 --nostream", timeout=60)
+            if log.strip():
+                nota("  Ultimas lineas del SFS:")
+                for linea in log.strip().splitlines()[-8:]:
+                    nota(f"    {linea}")
             return False
     ok("el SFS responde")
 
@@ -247,15 +275,23 @@ def configurar_cliente():
     nota(f"  {destino}")
 
     titulo("7. Daemon")
-    respaldo = contribuyente.escribir_env(RAIZ, datos, ruta_sfs)
+    respaldo, restringido = contribuyente.escribir_env(RAIZ, datos, ruta_sfs)
     if respaldo:
         nota(f"  se respaldo el .env anterior en {os.path.basename(respaldo)}")
-    ok(".env escrito y restringido al usuario actual")
+    if restringido:
+        ok(".env escrito y restringido al usuario actual")
+    else:
+        ok(".env escrito")
+        aviso("no se pudo restringir su acceso; lleva claves en texto plano")
 
-    sistema.correr(["pm2", "start", os.path.join(RAIZ, "sfs.config.js")])
+    sistema.correr(["pm2", "start", config])
     sistema.correr(["pm2", "save"])
-    sistema.correr(["pm2-startup", "install"])
-    ok("SFS y daemon en PM2, con arranque automatico")
+    codigo, _ = sistema.correr(["pm2-startup", "install"], timeout=120)
+    ok("SFS y daemon registrados en PM2")
+    if sistema.hay("pm2-startup"):
+        ok("arranque automatico con Windows")
+    else:
+        aviso("sin arranque automatico: al prender la PC hay que correr 'pm2 resurrect'")
 
     print(f"\n{C.VERDE}  LISTO - la instalacion quedo en BETA{C.FIN}")
     nota("\n  Antes de pasar a produccion:")

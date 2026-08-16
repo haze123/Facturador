@@ -7,12 +7,13 @@ romperia con cualquier actualizacion suya.
 """
 import json
 import os
-import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+
+import sistema
 
 BETA = "https://e-beta.sunat.gob.pe/ol-ti-itcpfegem-beta/billService"
 PRODUCCION = "https://e-factura.sunat.gob.pe/ol-ti-itcpfegem/billService"
@@ -164,6 +165,30 @@ def _post_sfs(base_url, ruta, cuerpo, timeout=60):
         return {"validacion": "FALLO", "mensaje": str(e)}
 
 
+def _motivo(respuesta):
+    """
+    El texto de error de una respuesta del SFS.
+
+    OJO: varios endpoints devuelven el motivo en la MISMA clave 'validacion' que
+    usan para decir 'EXITO' —confirmado en el bytecode de importarCertificado, que
+    hace put("validacion", "Debe ingresar la ruta del certificado")—. Buscarlo
+    solo en 'mensaje' mostraba un 'None' inutil teniendo el motivo a la vista.
+    """
+    if not isinstance(respuesta, dict):
+        return str(respuesta)
+    # "FALLO" lo pone _post_sfs cuando ni siquiera se pudo llamar al SFS; en ese
+    # caso el detalle esta en 'mensaje', no aca.
+    validacion = respuesta.get("validacion")
+    if validacion and validacion not in ("EXITO", "FALLO"):
+        return str(validacion)
+    for clave in ("mensaje", "Mensaje", "message", "error", "Error"):
+        if respuesta.get(clave):
+            return str(respuesta[clave])
+    # Sin texto util: se muestra todo menos la bandeja, que son miles de caracteres.
+    resumen = {k: v for k, v in respuesta.items() if k != "listaBandejaFacturador"}
+    return f"el SFS no devolvio ningun detalle. Respuesta completa: {resumen}"
+
+
 def esperar_sfs(base_url, segundos=90, avisar=print):
     """El SFS tarda en levantar; se espera a que conteste antes de configurarlo."""
     limite = time.time() + segundos
@@ -199,7 +224,7 @@ def cargar_en_sfs(base_url, datos, avisar=print):
         "cmbTiempoEnvia": "",
     })
     if r.get("validacion") != "EXITO":
-        return False, f"el SFS rechazo los datos del emisor: {r.get('mensaje')}"
+        return False, f"el SFS rechazo los datos del emisor: {_motivo(r)}"
     avisar("    emisor y credenciales SOL cargados (el SFS encripta las claves)")
 
     r = _post_sfs(base_url, "GrabarOtrosParametros.htm", {
@@ -212,17 +237,38 @@ def cargar_en_sfs(base_url, datos, avisar=print):
         "txtUrbanizacion": datos.get("urbanizacion", ""),
     })
     if r.get("validacion") != "EXITO":
-        return False, f"el SFS rechazo la direccion: {r.get('mensaje')}"
+        return False, f"el SFS rechazo la direccion: {_motivo(r)}"
     avisar("    direccion fiscal cargada")
 
+    # El SFS NO usa la ruta que se le pasa: arma la suya pegando su carpeta CERT
+    # con lo que reciba en 'nombreCertificado' (verificado en el bytecode de
+    # importarCertificado). Mandarle una ruta completa produce algo como
+    # "...\CERT\C:\otra\ruta\cert.p12", que no existe, y el SFS solo responde
+    # "el certificado no fue creado" sin decir que el problema es la ruta.
+    # Asi que el archivo se copia a CERT y se le manda unicamente el nombre.
+    nombre = _copiar_a_cert(datos["ruta_sfs"], datos["ruta_certificado"])
     r = _post_sfs(base_url, "ImportarCertificado.htm", {
-        "nombreCertificado": datos["ruta_certificado"],
+        "nombreCertificado": nombre,
         "passPrivateKey": datos["clave_certificado"],
     })
     if r.get("validacion") != "EXITO":
-        return False, f"el SFS rechazo el certificado: {r.get('mensaje')}"
-    avisar("    certificado importado")
+        return False, f"el SFS rechazo el certificado: {_motivo(r)}"
+    avisar(f"    certificado importado ({nombre})")
     return True, ""
+
+
+def _copiar_a_cert(ruta_sfs, origen):
+    """Deja el certificado en la carpeta CERT del SFS y devuelve su nombre."""
+    import shutil
+    destino_dir = os.path.join(ruta_sfs, "sunat_archivos", "sfs", "CERT")
+    os.makedirs(destino_dir, exist_ok=True)
+    nombre = os.path.basename(origen)
+    destino = os.path.join(destino_dir, nombre)
+    # Si ya es el mismo archivo no hay nada que copiar: copiarlo sobre si mismo
+    # falla y ademas lo dejaria en cero.
+    if os.path.abspath(origen) != os.path.abspath(destino):
+        shutil.copy2(origen, destino)
+    return nombre
 
 
 def fijar_ambiente(ruta_sfs, produccion):
@@ -261,6 +307,65 @@ def fijar_ambiente(ruta_sfs, produccion):
     return True, destino
 
 
+def escribir_config_pm2(raiz, ruta_sfs):
+    """
+    Genera sfs.config.js con las rutas reales de esta instalacion.
+
+    El archivo versionado trae rutas absolutas fijas, que solo sirven en la PC
+    donde se escribio: si el proyecto o el SFS quedan en otra carpeta, PM2
+    intenta arrancar los procesos en directorios que no existen. Y como lee todo
+    el archivo aunque se le pida un solo proceso, alcanza con que una ruta este
+    mal para que falle.
+    """
+    contenido = """// Generado por el instalador: las rutas son las de ESTA instalacion.
+module.exports = {
+  apps: [
+    {
+      name: "sfs",
+      script: "java",
+      args: "-jar facturadorApp-%(version)s.jar server prod.yaml",
+      cwd: %(sfs)s,
+      watch: false,
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 10,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/sfs-error.log",
+      out_file: "logs/sfs-out.log",
+      merge_logs: true,
+    },
+    {
+      name: "facturador",
+      script: "main.py",
+      interpreter: "python",
+      cwd: %(raiz)s,
+      watch: false,
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 10,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        PYTHONIOENCODING: "utf-8",
+      },
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/error.log",
+      out_file: "logs/out.log",
+      merge_logs: true,
+    },
+  ],
+};
+""" % {
+        # json.dumps escapa las barras invertidas de las rutas de Windows.
+        "sfs": json.dumps(ruta_sfs),
+        "raiz": json.dumps(raiz),
+        "version": sistema.VERSION_SFS,
+    }
+    destino = os.path.join(raiz, "sfs.config.js")
+    with open(destino, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(contenido)
+    return destino
+
+
 def escribir_env(raiz, datos, ruta_sfs):
     """Genera el .env del daemon. Devuelve la ruta del respaldo, si hubo."""
     contenido = f"""# Generado por el instalador el {datetime.now():%Y-%m-%d %H:%M}
@@ -293,13 +398,31 @@ DESFASE_BD_HORAS=auto
     # "﻿DATABASE_URL" y el daemon diria que falta teniendola.
     with open(destino, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(contenido)
-    _restringir_permisos(destino)
-    return respaldo
+    restringido = _restringir_permisos(destino)
+    return respaldo, restringido
 
 
 def _restringir_permisos(archivo):
-    """El .env lleva la clave SOL y la de la base en texto plano."""
-    import sistema
+    """
+    Limita el .env a su dueño: lleva la clave SOL y la de la base en texto plano.
+
+    Se comprueba despues que siga siendo legible, y si no se revierte. Sin esa
+    verificacion el endurecimiento puede dejar el archivo sin acceso para nadie
+    —paso: quitar la herencia y que el permiso otorgado no se aplique— y entonces
+    el daemon no arranca, con un PermissionError que no sugiere de donde viene.
+    """
     usuario = os.environ.get("USERNAME", "")
-    if usuario:
-        sistema.correr(f'icacls "{archivo}" /inheritance:r /grant:r "{usuario}:(F)"', timeout=30)
+    if not usuario:
+        return
+    dominio = os.environ.get("USERDOMAIN", "")
+    cuenta = f"{dominio}\\{usuario}" if dominio else usuario
+    sistema.correr(f'icacls "{archivo}" /inheritance:r /grant:r "{cuenta}:(F)"', timeout=30)
+
+    try:
+        with open(archivo, encoding="utf-8") as fh:
+            fh.read(1)
+    except OSError:
+        # Mejor un archivo legible de mas que una instalacion que no arranca.
+        sistema.correr(f'icacls "{archivo}" /reset', timeout=30)
+        return False
+    return True
