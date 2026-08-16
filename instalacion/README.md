@@ -62,3 +62,5 @@ Deja `FacturadorSetup.exe` en esta carpeta. No se versiona: se publica como rele
 | `construir.py` | Compila el `.exe` |
 
 `sfs.config.js`, en la raíz del proyecto, **lo genera la opción 2** con las rutas de cada PC. No se versiona: tenerlo en el repositorio hacía que una instalación nueva heredara las rutas de otra máquina y PM2 no arrancara.
+
+Ahí también se le ponen los topes de memoria al SFS (`-Xmx512m` y compañía). Sin ellos el JVM se toma hasta un cuarto de la RAM del equipo, y en una PC de 8 GB que además corre otras cosas se queda sin memoria para arrancar: levanta, sirve un rato y se muere sin escribir nada en su log. Con los topes usa 270 MB en vez de 850 MB.

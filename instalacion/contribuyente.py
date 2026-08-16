@@ -323,7 +323,13 @@ module.exports = {
     {
       name: "sfs",
       script: "java",
-      args: "-jar facturadorApp-%(version)s.jar server prod.yaml",
+      // Sin -Xmx, el JVM se reserva hasta 1/4 de la RAM del equipo y usa el
+      // recolector paralelo (un hilo por nucleo). Para una app que procesa unos
+      // pocos documentos por dia eso es desperdicio, y en una PC de 8 GB deja al
+      // SFS sin memoria para arrancar. Los topes no reservan nada: solo impiden
+      // que crezca sin control.
+      args: "-Xms64m -Xmx512m -XX:MaxMetaspaceSize=256m -XX:+UseSerialGC "
+            + "-jar facturadorApp-%(version)s.jar server prod.yaml",
       cwd: %(sfs)s,
       watch: false,
       autorestart: true,
