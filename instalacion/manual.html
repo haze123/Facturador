@@ -218,8 +218,21 @@
     body { font-size: 10.5pt; line-height: 1.5; background: #fff; }
     .envoltura { max-width: none; padding: 0; }
     header { padding-top: 0; }
-    .paso, .aviso, pre, table, .tabla-scroll, figure, .previo { break-inside: avoid; }
+
+    /* Las unidades que se leen de un vistazo no se parten. Un paso largo SI puede
+       repartirse entre hojas: pedirle que no se parta no lo impide —no entra en
+       una— y el navegador termina cortandolo por cualquier lado, incluso a mitad
+       de una fila de tabla. */
+    .aviso, pre, figure, .previo { break-inside: avoid; }
+    .paso { break-inside: auto; }
     h2 { break-after: avoid; }
+
+    /* La tabla se divide entre filas, nunca dentro de una, y el encabezado se
+       repite en cada hoja para no perder de vista que columna es cual. */
+    .tabla-scroll { overflow: visible; break-inside: auto; }
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    tr, td, th { break-inside: avoid; }
     pre { border: 1px solid var(--borde); font-size: 9pt; }
     .comentario { color: #5c6570; }
     a[href^="http"]::after {
