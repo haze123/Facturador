@@ -723,6 +723,20 @@ def obtener_items(conn, factura_id):
     return items
 
 
+# Comprobantes ya reportados como incompletos. Una venta a la que le falta un dato
+# se queda así hasta que alguien la corrija, y repetir el aviso en cada ciclo llenaría
+# el log de la misma línea cada 60 segundos. Se avisa una vez por corrida: si sigue
+# sin resolverse, vuelve a aparecer en el próximo arranque.
+_avisados_incompletos: set = set()
+
+
+def _avisar_incompleto(clave, mensaje: str, *args):
+    if clave in _avisados_incompletos:
+        return
+    _avisados_incompletos.add(clave)
+    logger.warning(mensaje, *args)
+
+
 def obtener_comprobantes_pendientes(conn):
     """
     Comprobantes por emitir, con los nombres de campo que espera el resto del daemon.
@@ -737,8 +751,10 @@ def obtener_comprobantes_pendientes(conn):
     # Los datos del comprobante viven en Factura: la tabla Comprobante se fusionó
     # dentro de ella, así que "id" y "factura_id" son la misma fila (se repite el
     # nombre solo porque obtener_receptor() y obtener_items() esperan esa clave).
-    # Se excluyen las facturas sin numeración: todavía no tienen número asignado y
-    # no hay nada que emitir.
+    # Las filas sin numeración NO se filtran acá: una venta cobrada a la que la
+    # aplicación nunca le asignó número igual no se puede emitir, pero descartarla en
+    # el SQL la hacía desaparecer sin una sola línea en el log. Pasa a la validación,
+    # que la reporta identificándola por su id.
     filas = _consultar(
         conn,
         'SELECT id, "tipoComprobante", tipo::text AS tipo_enum,'
@@ -747,7 +763,6 @@ def obtener_comprobantes_pendientes(conn):
         '       "motivoDocumentoAfectado", gravadas, igv, total, "montoLetras"'
         '  FROM public."Factura"'
         ' WHERE enviado IS NOT TRUE'
-        '   AND "numeracionComprobante" IS NOT NULL'
         ' ORDER BY "fechaEmision" ASC NULLS LAST',
     )
     pendientes = []
@@ -791,7 +806,6 @@ def obtener_boletas_para_resumen(conn) -> list:
         '       gravadas, igv, total, "montoLetras"'
         '  FROM public."Factura"'
         ' WHERE enviado IS NOT TRUE'
-        '   AND "numeracionComprobante" IS NOT NULL'
         ' ORDER BY "fechaEmision" ASC NULLS LAST',
     )
     hoy = datetime.now().date()
@@ -805,7 +819,8 @@ def obtener_boletas_para_resumen(conn) -> list:
             "total":                  f["total"],
         })
         if faltantes:
-            logger.warning(
+            _avisar_incompleto(
+                f["id"],
                 "Boleta %s sin datos obligatorios (%s); no entra al resumen hasta completarlos.",
                 f["numeracionComprobante"] or f["id"], ", ".join(faltantes),
             )
@@ -928,7 +943,8 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     # archivos huérfanos en DATA por un comprobante que igual no se puede armar bien.
     faltantes = _validar_campos_obligatorios(comp)
     if faltantes:
-        logger.warning(
+        _avisar_incompleto(
+            comp.get("factura_id") or num_comp,
             "Comprobante %s-%s sin datos obligatorios (%s); no se emite hasta completarlos.",
             tipo_comp, num_comp or "?", ", ".join(faltantes),
         )
