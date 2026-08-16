@@ -144,6 +144,23 @@ def configurar_cliente():
     import chequeos
     previo = chequeos.datos_sfs(os.path.join(ruta_sfs, "bd", "BDFacturador.db"))
 
+    # Reutilizar una PC que ya tenia otro cliente no puede pasar inadvertido:
+    # emitir con el certificado de otro contribuyente es facturar a su nombre.
+    if previo.get("NUMRUC"):
+        titulo("Esta PC ya tiene un contribuyente configurado")
+        nota(f"  RUC: {previo['NUMRUC']}   {previo.get('RAZON', '')}")
+        print()
+        aviso("Si es para OTRO cliente hay que borrar sus datos y su certificado.")
+        if confirmar("Borrar los datos del contribuyente anterior?"):
+            listo, mensaje = contribuyente.limpiar_contribuyente(ruta_sfs)
+            if not listo:
+                error(mensaje)
+                return False
+            ok(mensaje)
+            previo = {}
+        else:
+            nota("  Se conservan; verificar que sean del cliente correcto.")
+
     titulo("1. Datos del contribuyente")
     while True:
         ruc = preguntar("RUC (11 digitos)", previo.get("NUMRUC", ""), obligatorio=True)
