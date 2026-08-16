@@ -398,12 +398,31 @@ DESFASE_BD_HORAS=auto
     # "﻿DATABASE_URL" y el daemon diria que falta teniendola.
     with open(destino, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(contenido)
-    _restringir_permisos(destino)
-    return respaldo
+    restringido = _restringir_permisos(destino)
+    return respaldo, restringido
 
 
 def _restringir_permisos(archivo):
-    """El .env lleva la clave SOL y la de la base en texto plano."""
+    """
+    Limita el .env a su dueño: lleva la clave SOL y la de la base en texto plano.
+
+    Se comprueba despues que siga siendo legible, y si no se revierte. Sin esa
+    verificacion el endurecimiento puede dejar el archivo sin acceso para nadie
+    —paso: quitar la herencia y que el permiso otorgado no se aplique— y entonces
+    el daemon no arranca, con un PermissionError que no sugiere de donde viene.
+    """
     usuario = os.environ.get("USERNAME", "")
-    if usuario:
-        sistema.correr(f'icacls "{archivo}" /inheritance:r /grant:r "{usuario}:(F)"', timeout=30)
+    if not usuario:
+        return
+    dominio = os.environ.get("USERDOMAIN", "")
+    cuenta = f"{dominio}\\{usuario}" if dominio else usuario
+    sistema.correr(f'icacls "{archivo}" /inheritance:r /grant:r "{cuenta}:(F)"', timeout=30)
+
+    try:
+        with open(archivo, encoding="utf-8") as fh:
+            fh.read(1)
+    except OSError:
+        # Mejor un archivo legible de mas que una instalacion que no arranca.
+        sistema.correr(f'icacls "{archivo}" /reset', timeout=30)
+        return False
+    return True
