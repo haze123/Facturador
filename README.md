@@ -121,7 +121,7 @@ Cómo funciona, en cada ciclo:
 4. Cuando llega el CDR, como un resumen no es una fila de `Factura` sino que agrupa muchas, el cierre hace un `UPDATE ... WHERE "numeracionComprobante" = ANY(...)` con la lista de boletas que se guardó en `resumenes.json` al generarlo, en vez del `UPDATE` de una sola fila que usa el resto de los tipos.
 5. Un resumen rechazado se reintenta igual que cualquier otro documento (mismo tope `MAX_REINTENTOS_RECHAZO`); si se agota, queda `BLOQUEADO` y sus boletas no entran a un resumen nuevo hasta que se revise a mano.
 
-No cubre el rechazo parcial de una sola boleta dentro de un resumen aceptado por SUNAT: ese caso queda para revisión manual, igual que cualquier otra situación que el daemon no puede resolver solo.
+SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una viene en su propio `<cac:DocumentResponse>`, que el esquema declara repetible. El daemon los recorre todos, guarda la observación en la `Factura` correspondiente y lo avisa en el log. La boleta queda emitida —el resumen fue aceptado y ella entró en él—; si el reparo amerita rehacer el comprobante, esa decisión es de quien lo revise.
 
 ### Detalles del formato que costó descubrir
 
@@ -256,7 +256,7 @@ El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la
 
 ## Limitaciones conocidas
 
-**El resumen diario no maneja rechazo parcial de una línea.** Si SUNAT acepta el resumen pero observa una boleta puntual dentro de él, ese caso no se detecta automáticamente y necesita revisión manual (ver "Resumen diario de boletas").
+**Una boleta observada dentro de un resumen aceptado queda emitida.** SUNAT puede aceptar el resumen y aun así observar boletas puntuales; el daemon las detecta y guarda el motivo en `Factura.errors`, pero no las corrige ni las vuelve a emitir — no puede saber si la observación amerita rehacer el comprobante. Queda para revisión manual, con el detalle a la vista.
 
 **Una boleta puede quedar retenida esperando intervención.** Si un resumen desaparece sin dejar rastro —no figura en la bandeja del SFS y sus archivos ya no están en `DATA`— el daemon no puede saber si llegó a SUNAT, y retiene sus boletas en vez de arriesgarse a declararlas dos veces. Lo avisa en el log con la instrucción para destrabarlas: borrar ese resumen de `resumenes.json`. Es deliberado —una boleta retenida es reversible, una declarada dos veces no— pero requiere que alguien lo mire.
 
