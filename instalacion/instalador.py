@@ -218,8 +218,6 @@ def configurar_cliente():
     (ok if valido else aviso)(f"certificado: {mensaje}")
 
     titulo("4. Base de datos de la aplicacion")
-    aviso("Para una instalacion de PRUEBA, usar una base de prueba, NO la de produccion.")
-    nota("  Dos daemons sobre la misma base se pelean los mismos comprobantes.")
     while True:
         db_url = preguntar("DATABASE_URL", "", obligatorio=True)
         listo, mensaje = contribuyente.probar_base(db_url)
