@@ -29,7 +29,6 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import psycopg2
-import psycopg2.extras
 from dotenv import load_dotenv
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -53,10 +52,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_TIMEOUT_SEG = int(os.getenv("DB_TIMEOUT_SEG", "30"))
 
 # Rutas SFS
-SFS_DATA_DIR = p if os.path.exists(p := os.getenv("SFS_DATA_DIR", r"C:\SFS_v2.1\sunat_archivos\sfs\DATA")) else os.path.join(_BASE, "sunat_archivos", "DATA")
-SFS_RPTA_DIR = p if os.path.exists(p := os.getenv("SFS_RPTA_DIR", r"C:\SFS_v2.1\sunat_archivos\sfs\RPTA")) else os.path.join(_BASE, "sunat_archivos", "RPTA")
+SFS_DATA_DIR = p if os.path.exists(p := os.getenv("SFS_DATA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\DATA")) else os.path.join(_BASE, "sunat_archivos", "DATA")
+SFS_RPTA_DIR = p if os.path.exists(p := os.getenv("SFS_RPTA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\RPTA")) else os.path.join(_BASE, "sunat_archivos", "RPTA")
 
-SFS_BD_PATH  = os.getenv("SFS_BD_PATH",  r"C:\SFS_v2.1\bd\BDFacturador.db")
+SFS_BD_PATH  = os.getenv("SFS_BD_PATH",  r"C:\SFS_v-2.1\bd\BDFacturador.db")
 SFS_BASE_URL = os.getenv("SFS_BASE_URL", "http://localhost:9000")
 
 # Configuración del SFS: de acá sale a qué ambiente de SUNAT está enviando
