@@ -117,21 +117,17 @@ Cómo funciona, en cada ciclo:
 1. `obtener_boletas_para_resumen()` junta las boletas con `enviado=false` y `fechaEmision` anterior al día de hoy —las de hoy se dejan para el resumen de un día siguiente—, salvo las que ya estén dentro de un resumen que el SFS todavía tiene en curso.
 2. `generar_resumen_diario()` les asigna una numeración propia del daemon, `RC-YYYYMMDD-NNN` (correlativo persistido en `resumenes.json`, no se versiona), y escribe `.RDI` (una línea por boleta, 23 columnas) y `.TRD` (desglose de tributos por línea, 6 columnas) en `DATA`. Si un número ya tiene su CDR en disco se saltea y se avisa en el log: sin eso, un `resumenes.json` perdido devolvía el contador a 001 y el daemon tomaba el CDR anterior por la respuesta del resumen nuevo, cerrándolo sin haberlo enviado.
 3. El resumen se entrega al SFS igual que cualquier otro documento (`activar_procesamiento_sfs()`).
-3. SUNAT no devuelve el CDR en el acto como con una factura: responde un **ticket**. `recuperar_cdr_resumenes()` lo consulta por SOAP (`getStatus`) hasta que está listo y deja el CDR en `RPTA`.
-4. Cuando llega el CDR, como un resumen no es una fila de `Factura` sino que agrupa muchas, el cierre hace un `UPDATE ... WHERE "numeracionComprobante" = ANY(...)` con la lista de boletas que se guardó en `resumenes.json` al generarlo, en vez del `UPDATE` de una sola fila que usa el resto de los tipos.
-5. Un resumen rechazado se reintenta igual que cualquier otro documento (mismo tope `MAX_REINTENTOS_RECHAZO`); si se agota, queda `BLOQUEADO` y sus boletas no entran a un resumen nuevo hasta que se revise a mano.
+4. SUNAT no devuelve el CDR en el acto como con una factura: responde un **ticket**. `recuperar_cdr_resumenes()` lo consulta por SOAP (`getStatus`) hasta que está listo y deja el CDR en `RPTA`. El ticket **se consume al consultarlo**: si el resumen quedara abierto en la bandeja, el SFS volvería a consultarlo, recibiría *"El ticket no existe"* y lo dejaría en `05` (bloqueado) pese a estar bien emitido. Por eso el daemon lo cierra en la bandeja (`_cerrar_resumen_en_sfs()`) una vez procesado el CDR.
+5. Cuando llega el CDR, como un resumen no es una fila de `Factura` sino que agrupa muchas, el cierre hace un `UPDATE ... WHERE "numeracionComprobante" = ANY(...)` con la lista de boletas que se guardó en `resumenes.json` al generarlo, en vez del `UPDATE` de una sola fila que usa el resto de los tipos.
+6. Un resumen rechazado se reintenta igual que cualquier otro documento (mismo tope `MAX_REINTENTOS_RECHAZO`); si se agota, queda `BLOQUEADO` y sus boletas no entran a un resumen nuevo hasta que se revise a mano.
+
+Tres reglas del formato que no están en la documentación de SUNAT y que el `.RDI` no perdona:
+
+- **El nombre de archivo va sin el `RC-` del id.** `validarNombreArchivo()` exige exactamente 4 tramos separados por guión (`RUC-TIPO-SERIE-NÚMERO`); con el prefijo son 5 y el SFS **descarta el archivo en silencio**, sin generar el XML ni dejar rastro en su bandeja ni en su log. En todo lo demás (bandeja, API REST, CDR) el id sí lleva el `RC-`.
+- **`tipDocResumen` (columna 3) es el tipo de comprobante (`03`), no el estado de la línea.** Confundirlos da el error `2241`. El estado (`1` = nueva) va en la última columna.
+- **Los 4 campos de percepción son numéricos**: van en `0.00`, no en `-` como el resto de lo vacío (error *"'-' no es un valor válido para 'decimal'"*). Los 4 de documento modificado, en cambio, van **vacíos**: la plantilla del SFS los compara contra cadena vacía, así que un `-` le haría armar nodos con basura.
 
 SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una viene en su propio `<cac:DocumentResponse>`, que el esquema declara repetible. El daemon los recorre todos, guarda la observación en la `Factura` correspondiente y lo avisa en el log. La boleta queda emitida —el resumen fue aceptado y ella entró en él—; si el reparo amerita rehacer el comprobante, esa decisión es de quien lo revise.
-
-### Detalles del formato que costó descubrir
-
-Todo esto salió de decompilar el SFS y de rechazos reales en homologación, no de la documentación:
-
-- **El nombre de archivo va sin el `RC-` del id.** `validarNombreArchivo()` exige exactamente 4 tramos separados por guión (`RUC-TIPO-SERIE-NÚMERO`); con el prefijo quedaban 5 y **el SFS descartaba el archivo en silencio**, sin generar el XML ni dejar rastro en su bandeja ni en su log. En todo lo demás (bandeja, API REST, CDR) el id sí lleva el `RC-`.
-- **`.RDI` no es una cabecera única**: es una línea de 23 columnas *por cada boleta*. El `.TRD` es el desglose de tributos, 6 columnas, vinculado por la posición de la línea.
-- **`tipDocResumen` (columna 3) es el tipo de comprobante (`03`), no el estado de la línea.** Confundirlo da el error `2241`. El estado (`1` = nueva) va en la última columna.
-- **Los 4 campos de percepción son numéricos**: van en `0.00`, no en `-` como el resto de lo vacío (error *"'-' no es un valor válido para 'decimal'"*). Los 4 de documento modificado, en cambio, van **vacíos** — la plantilla del SFS los compara contra cadena vacía, así que un `-` haría que arme nodos con basura.
-- **El ticket se consume al consultarlo.** Si el daemon lo usa y el resumen queda en `08`, el SFS vuelve a consultarlo, recibe *"El ticket no existe"* y lo deja en `05` (bloqueado), con sus archivos atascados en `DATA` pese a estar bien emitido. Por eso, al bajar el CDR, el daemon cierra el resumen en la bandeja (`_cerrar_resumen_en_sfs()`).
 
 ## Requisitos
 
