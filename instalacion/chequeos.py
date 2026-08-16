@@ -9,7 +9,6 @@ No modifica nada.
 """
 import os
 import sqlite3
-import sys
 import urllib.request
 from datetime import datetime
 
