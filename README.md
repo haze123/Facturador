@@ -18,7 +18,7 @@ Por eso el daemon llama a `sincronizar_bandeja_sfs()` al inicio de cada ciclo y 
 
 ## Tipos de comprobante
 
-Se emiten factura (`01`), nota de crédito (`07`) y nota de débito (`08`) de forma individual, y boleta (`03`) agrupada en el resumen diario (`RC`, ver más abajo). La comunicación de baja (`RA`) todavía no.
+Se emiten factura (`01`), nota de crédito (`07`) y nota de débito (`08`) de forma individual, y boleta (`03`) agrupada en el resumen diario (`RC`, ver más abajo). Para anular un comprobante ya aceptado se usa la nota de crédito, no la comunicación de baja (ver "Limitaciones conocidas").
 
 Las notas exigen la referencia al documento que corrigen, y esos campos salen de `Factura`:
 
@@ -35,7 +35,9 @@ Si a una nota le falta `tipoNota`, `tipoDocumentoAfectado` o `numeracionDocument
 
 Antes de escribir cualquier archivo, todo comprobante (y cada boleta candidata a entrar al resumen diario) pasa por `_validar_campos_obligatorios()`: numeración, fecha de emisión válida y total. Los comprobantes individuales además necesitan al menos un ítem. Si falta algo, **no se genera nada** — se registra un WARNING con el detalle de qué falta y se reintenta en el próximo ciclo, cuando se corrija el dato en la BD. Antes de esto, una fecha ilegible terminaba como una excepción genérica en el log, sin decir qué comprobante era ni por qué.
 
-No valida (todavía) dígito verificador de RUC/DNI, cuadre de totales, ni ítems con IGV=0 (ver "Limitaciones conocidas").
+No valida (todavía) dígito verificador de RUC/DNI ni cuadre de totales.
+
+Tampoco mira el IGV de cada ítem: el detalle se arma siempre como gravado al 18% (`tipAfeIGV=10`). Es correcto para los servicios de estética, que es lo que se factura acá — pero un ítem exonerado o de cortesía haría que SUNAT rechace el comprobante con el error `3111`. Resolverlo exige una columna de tipo de afectación en `FacturaItem`, que la aplicación no tiene.
 
 ## Fecha de emisión y zona horaria
 
@@ -252,11 +254,9 @@ El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la
 
 ## Limitaciones conocidas
 
-**Un ítem sin IGV no se puede emitir.** El detalle se arma siempre como gravado al 18% (`tipAfeIGV=10`), sin mirar los datos. Si un ítem llega con IGV en 0 —una cortesía, un servicio exonerado— el XML declara "gravado al 18%" con importe 0 y SUNAT lo rechaza con el error `3111`. Resolverlo bien exige una columna de tipo de afectación en `FacturaItem`, que hoy no existe; el daemon no puede deducirlo del monto sin arriesgar una declaración incorrecta.
-
 **El valor unitario pierde precisión.** Se redondea a 2 decimales y luego se escribe con 6, así que `cantidad x valor_unitario` puede diferir en céntimos del valor de venta declarado. SUNAT lo tolera en comprobantes chicos, pero el error se acumula con la cantidad de líneas.
 
-**Sin comunicación de baja.** Anular un comprobante ya aceptado (`RA`) todavía no se emite desde acá.
+**No se emite comunicación de baja (`RA`), y es una decisión, no una falta.** Para anular un comprobante ya aceptado se usa una nota de crédito, que el daemon sí emite y que además no tiene el plazo de 7 días de la baja. La baja solo sería preferible ante un documento duplicado, donde revertirlo con una nota deja tres documentos en vez de uno; si ese caso aparece, se evalúa entonces.
 
 **El resumen diario no maneja rechazo parcial de una línea.** Si SUNAT acepta el resumen pero observa una boleta puntual dentro de él, ese caso no se detecta automáticamente y necesita revisión manual (ver "Resumen diario de boletas").
 
