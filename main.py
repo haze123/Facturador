@@ -2072,10 +2072,42 @@ def _extraer_numeracion(texto) -> str | None:
     return m.group(0) if m else None
 
 
+def _respuestas_por_documento(root) -> list:
+    """
+    [(numeracion, codigo, descripcion)] de cada <cac:DocumentResponse> del CDR.
+
+    El esquema los declara con maxOccurs="unbounded": un CDR de resumen puede
+    traer uno por el resumen entero y otro por cada boleta que SUNAT observe. Sin
+    recorrerlos todos, esas observaciones se pierden — el comprobante queda
+    aceptado y nadie se entera de que una línea salió con reparos.
+    """
+    respuestas = []
+    for elem in root.iter():
+        if not isinstance(elem.tag, str) or elem.tag.split("}")[-1] != "DocumentResponse":
+            continue
+        datos = {}
+        for hijo in elem.iter():
+            if not isinstance(hijo.tag, str):
+                continue
+            tag = hijo.tag.split("}")[-1].lower()
+            texto = _texto(hijo.text)
+            if texto and tag in ("referenceid", "responsecode", "description") and tag not in datos:
+                datos[tag] = texto
+        if datos:
+            respuestas.append((
+                _extraer_numeracion(datos.get("referenceid", "")),
+                datos.get("responsecode"),
+                datos.get("description"),
+            ))
+    return respuestas
+
+
 def parsear_xml_cdr(fuente) -> dict:
-    res = {"numeracion": None, "codigo": None, "descripcion": None, "status": "PENDIENTE"}
+    res = {"numeracion": None, "codigo": None, "descripcion": None,
+           "status": "PENDIENTE", "lineas": []}
     try:
         root = ET.fromstring(fuente) if isinstance(fuente, bytes) else ET.parse(fuente).getroot()
+        res["lineas"] = _respuestas_por_documento(root)
         # Las descripciones que cuelgan de un <Response> son las buenas; cualquier otra
         # queda de respaldo por si el CDR no trae ninguna en el lugar esperado.
         descripciones, respaldo = [], []
@@ -2124,6 +2156,48 @@ def parsear_xml_cdr(fuente) -> dict:
     return res
 
 
+def _anotar_observaciones_de_lineas(conn, numeracion_rc: str, boletas: list, parsed: dict):
+    """
+    Guarda en cada boleta la observación que SUNAT le haya puesto dentro de un
+    resumen aceptado.
+
+    SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una
+    viene en su propio <cac:DocumentResponse>. Sin esto, esas boletas quedaban en
+    enviado=true sin rastro del reparo, y nadie se enteraba de que salieron con
+    observaciones.
+
+    La boleta NO se marca como no enviada: el resumen fue aceptado y ella entró en
+    él. La observación queda en Factura.errors para que alguien la mire; corregirla
+    —si hace falta— es una decisión que el daemon no puede tomar solo.
+    """
+    incluidas = set(boletas)
+    observadas = [
+        (num, cod, desc) for num, cod, desc in parsed.get("lineas", [])
+        # La respuesta del resumen entero no es una observación de línea, y un
+        # código de solo ceros es la aceptación limpia.
+        if num in incluidas and (cod or "").strip("0") != ""
+    ]
+    if not observadas:
+        return
+
+    for num, cod, desc in observadas:
+        detalle = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Observada en el resumen {numeracion_rc}"
+        if cod:
+            detalle += f" — código {cod}"
+        if desc:
+            detalle += f": {desc}"
+        _actualizar(
+            conn,
+            'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante"=%s',
+            (detalle[:_MAX_ERRORS_SQL], num),
+        )
+    logger.warning(
+        "SUNAT aceptó el resumen %s pero observó %d boleta(s): %s. Quedan emitidas, "
+        "con el motivo guardado para revisión.",
+        numeracion_rc, len(observadas), ", ".join(n for n, _, _ in observadas),
+    )
+
+
 def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
     if not numeracion:
         logger.error(
@@ -2154,6 +2228,7 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
         )
         if filas > 0:
             _limpiar_reintento(numeracion)
+            _anotar_observaciones_de_lineas(conn, numeracion, boletas, parsed)
             # Recién ahora el resumen esta terminado de verdad: sus boletas ya
             # quedaron cerradas. Marcarlo antes liberaba las boletas mientras
             # todavia figuraban pendientes, y se generaba otro resumen con ellas.
