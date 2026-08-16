@@ -18,6 +18,68 @@ BETA = "https://e-beta.sunat.gob.pe/ol-ti-itcpfegem-beta/billService"
 PRODUCCION = "https://e-factura.sunat.gob.pe/ol-ti-itcpfegem/billService"
 
 
+# Datos del emisor que quedan en el SFS. Se vacian los valores pero NO se borran
+# las filas: el SFS espera encontrarlas y las actualiza por COD_PARA cuando se le
+# cargan los datos nuevos.
+_CAMPOS_EMISOR = (
+    "NUMRUC", "RAZON", "NOMCOM",
+    "USUSOL", "CLASOL", "USUSOLPRINCIPAL", "CLASOLPRINCIPAL",
+    "NOMCERT", "PRKCRT",
+    "UBIGEO", "DIRECC", "DEPAR", "PROVIN", "DISTR", "URBANIZA",
+    "CLIENT_ID", "CLIENT_SECRET",
+)
+
+
+def limpiar_contribuyente(ruta_sfs):
+    """
+    Borra del SFS los datos del contribuyente anterior y su certificado.
+
+    Hace falta al reutilizar una PC para otro cliente: el SFS conserva el RUC, las
+    credenciales SOL, el certificado y el historial de comprobantes, y emitir con
+    eso seria facturar a nombre del contribuyente anterior.
+
+    Devuelve (ok, mensaje). Respalda la base antes de tocarla.
+    """
+    import shutil
+    import sqlite3
+
+    bd = os.path.join(ruta_sfs, "bd", "BDFacturador.db")
+    dir_cert = os.path.join(ruta_sfs, "sunat_archivos", "sfs", "CERT")
+
+    borrados = 0
+    if os.path.isdir(dir_cert):
+        for archivo in os.listdir(dir_cert):
+            if archivo.lower().endswith((".p12", ".pfx")):
+                os.remove(os.path.join(dir_cert, archivo))
+                borrados += 1
+
+    if not os.path.exists(bd):
+        return True, f"{borrados} certificado(s) eliminado(s); no habia base del SFS"
+
+    # Si el operador se equivoco de PC, esto es lo unico que permite volver atras.
+    respaldo = f"{bd}.bak-{datetime.now():%Y%m%d%H%M%S}"
+    shutil.copy2(bd, respaldo)
+
+    try:
+        with sqlite3.connect(bd) as con:
+            marcas = ",".join("?" * len(_CAMPOS_EMISOR))
+            cur = con.execute(
+                f"UPDATE PARAMETRO SET VAL_PARA='' WHERE COD_PARA IN ({marcas})",
+                _CAMPOS_EMISOR,
+            )
+            parametros = cur.rowcount
+            # El historial es del contribuyente anterior: si quedara, el daemon lo
+            # leeria como documentos propios ya emitidos.
+            cur = con.execute("DELETE FROM DOCUMENTO")
+            documentos = cur.rowcount
+    except sqlite3.Error as e:
+        return False, f"no se pudo limpiar la base del SFS: {e}"
+
+    return True, (f"{parametros} dato(s) del emisor vaciados, {documentos} comprobante(s) "
+                  f"del historial y {borrados} certificado(s) eliminados\n"
+                  f"         respaldo en {os.path.basename(respaldo)}")
+
+
 def validar_ruc(ruc):
     """
     Digito verificador del RUC (modulo 11). Un RUC mal tipeado se descubriria
