@@ -140,15 +140,15 @@ Todo esto salió de decompilar el SFS y de rechazos reales en homologación, no 
 
 ## Instalación
 
-Para instalar en la PC de un cliente está el **instalador**, que se ocupa de todo —prerrequisitos, SFS, datos del contribuyente, certificado y procesos— y deja la máquina emitiendo:
+**Para poner el facturador en la PC de un cliente**, no hace falta nada de este README: lo hace todo el instalador `FacturadorSetup.exe` —prerrequisitos, SFS, datos del contribuyente, certificado y procesos— y deja la máquina emitiendo. El procedimiento está en el manual en PDF; cómo está armado, en [`instalacion/README.md`](instalacion/README.md).
 
-Cómo está armado y por qué: [`instalacion/README.md`](instalacion/README.md). El procedimiento paso a paso está en el manual en PDF, aparte del repositorio.
-
-Para trabajar sobre el código en una máquina que ya tiene el entorno:
+**Para trabajar sobre el código**, en cambio, hay que preparar el entorno a mano:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+El daemon corre con el Python de la máquina, no con el que lleva adentro el instalador: PM2 lo arranca como `main.py` con `interpreter: "python"`. Por eso esas tres dependencias tienen que estar instaladas en el sistema, y por eso el instalador lee `requirements.txt` en su primer paso.
 
 ## Configuración
 
