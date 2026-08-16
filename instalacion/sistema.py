@@ -243,4 +243,32 @@ def descargar_sfs(ruta_destino, version=VERSION_SFS, avisar=print):
     # Las carpetas de trabajo tienen que existir antes de emitir.
     for carpeta in ("DATA", "RPTA", "CERT"):
         os.makedirs(os.path.join(ruta_destino, "sunat_archivos", "sfs", carpeta), exist_ok=True)
+
+    sobrantes = _limpiar_data_de_ejemplo(ruta_destino)
+    if sobrantes:
+        avisar(f"    se quitaron {sobrantes} archivo(s) de ejemplo que traia el ZIP")
     return True, f"instalado en {ruta_destino}"
+
+
+def _limpiar_data_de_ejemplo(ruta_sfs):
+    """
+    Vacia DATA de los comprobantes que SUNAT deja en su ZIP.
+
+    La distribucion viene con archivos de prueba de OTRO contribuyente (se vieron
+    con RUC 20480072872). El SFS los levanta como documentos propios e intenta
+    emitirlos, asi que no pueden quedar en una instalacion nueva.
+    """
+    data = os.path.join(ruta_sfs, "sunat_archivos", "sfs", "DATA")
+    if not os.path.isdir(data):
+        return 0
+    borrados = 0
+    for nombre in os.listdir(data):
+        ruta = os.path.join(data, nombre)
+        # .gitkeep y cualquier subcarpeta se conservan: solo se van los comprobantes.
+        if os.path.isfile(ruta) and not nombre.startswith("."):
+            try:
+                os.remove(ruta)
+                borrados += 1
+            except OSError:
+                pass
+    return borrados
