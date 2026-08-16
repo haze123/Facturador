@@ -30,6 +30,8 @@ Si a una nota le falta `tipoNota`, `tipoDocumentoAfectado` o `numeracionDocument
 
 Antes de escribir cualquier archivo, todo comprobante —y cada boleta candidata al resumen— pasa por `_validar_campos_obligatorios()`: numeración, fecha de emisión válida y total; los individuales además necesitan al menos un ítem. Si falta algo **no se genera nada**: WARNING con el detalle y reintento en el próximo ciclo, cuando se corrija el dato.
 
+Eso incluye las ventas que la aplicación cobró pero nunca numeró. Antes se descartaban en el SQL de las consultas de pendientes y **desaparecían sin dejar una línea en el log**; ahora llegan a la validación, que las identifica por su `id` de fila ya que no tienen numeración. El aviso sale **una vez por corrida**, no en cada ciclo: el dato no se corrige solo y repetir la misma línea cada 60 segundos llenaría el log. Si sigue sin resolverse, reaparece en el próximo arranque.
+
 No valida dígito verificador de RUC/DNI ni cuadre de totales. Tampoco mira el IGV de cada ítem: el detalle se arma siempre como gravado al 18% (`tipAfeIGV=10`), correcto para los servicios de estética que es lo que se factura acá, pero un ítem exonerado o de cortesía haría que SUNAT rechace con el error `3111`. Resolverlo exige una columna de tipo de afectación en `FacturaItem`, que la aplicación no tiene.
 
 ## Fecha de emisión y zona horaria
@@ -163,11 +165,13 @@ Las rutas del SFS llevan **guión** en `SFS_v-2.1`, que es como lo nombra SUNAT.
 
 ## Uso
 
-`sfs.config.js` gestiona dos procesos: el **SFS** (la aplicación Java de SUNAT) y el **daemon**.
+`sfs.config.js` gestiona dos procesos: el **SFS** (la aplicación Java de SUNAT) y el **daemon**. Lo genera la opción 2 del instalador con las rutas de cada PC; no se versiona.
 
 ```bash
 pm2 start sfs.config.js
 ```
+
+Al SFS se lo arranca con topes de memoria (`-Xms64m -Xmx512m -XX:MaxMetaspaceSize=256m -XX:+UseSerialGC`). Sin ellos el JVM se autoasigna hasta un cuarto de la RAM del equipo y usa el recolector paralelo, con un hilo por núcleo: en una PC de 8 GB eso lo dejaba sin memoria para arrancar y **se moría en silencio**, sin escribir nada en su log de errores — y con el SFS caído el daemon no emite. Con los topes pasa de 850 MB a 270 MB. No reservan memoria: solo impiden que crezca sin control.
 
 Para que arranquen solos al encender la PC (Windows no tiene init system, así que `pm2 startup` no alcanza):
 
