@@ -4,3 +4,4 @@ __pycache__/
 logs/
 facturador.log
 reintentos.json
+resumenes.json

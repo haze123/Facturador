@@ -4,15 +4,21 @@ Daemon de Facturación Electrónica SUNAT (SFS v2.1).
 
 Corre en segundo plano y emite comprobantes electrónicos a SUNAT sin intervención: lee los pendientes de la base de datos de la aplicación, genera los archivos que necesita el SFS (Sistema de Facturación SUNAT), los entrega al facturador local —que firma el XML y lo envía— y procesa las respuestas (CDR) de SUNAT para cerrar cada comprobante.
 
-Emite facturas, boletas, notas de crédito y notas de débito.
+Emite facturas, notas de crédito y notas de débito de forma individual, y agrupa las boletas en un resumen diario.
 
 Corre dos hilos en paralelo:
 - **Hilo Generador**: cada `INTERVALO_GENERACION_SEG` segundos (60s por defecto) revisa si hay comprobantes por enviar.
 - **Hilo CDR**: monitorea en tiempo real la carpeta `RPTA` y procesa el ZIP en cuanto SUNAT responde, con un barrido de respaldo cada `INTERVALO_BARRIDO_RPTA_SEG` segundos.
 
+### El SFS solo lee DATA cuando se le pide
+
+El SFS **no vigila la carpeta `DATA`**: la escanea al cargar su pantalla (`cargarArchivosContribuyente` cuelga de `CargarPantalla.htm`) o desde un job programado que exige tener el temporizador prendido. Ni `GenerarComprobante.htm` ni `enviarXML.htm` lo hacen — esos operan solo sobre lo que ya está registrado en su bandeja.
+
+Por eso el daemon llama a `sincronizar_bandeja_sfs()` al inicio de cada ciclo y antes de entregar documentos nuevos. Sin eso dependería de que alguien tuviera la bandeja abierta en el navegador (donde la página refresca sola y de paso dispara el escaneo): con la ventana cerrada, los archivos se quedan en `DATA` sin que nadie los mire y **no se emite nada**.
+
 ## Tipos de comprobante
 
-Se emiten factura (`01`), boleta (`03`), nota de crédito (`07`) y nota de débito (`08`). El resumen diario (`RC`) y la comunicación de baja (`RA`) todavía no.
+Se emiten factura (`01`), nota de crédito (`07`) y nota de débito (`08`) de forma individual, y boleta (`03`) agrupada en el resumen diario (`RC`, ver más abajo). La comunicación de baja (`RA`) todavía no.
 
 Las notas exigen la referencia al documento que corrigen, y esos campos salen de `Factura`:
 
@@ -25,18 +31,32 @@ Las notas exigen la referencia al documento que corrigen, y esos campos salen de
 
 Si a una nota le falta `tipoNota`, `tipoDocumentoAfectado` o `numeracionDocumentoAfectado`, **no se emite**: se registra un WARNING y se reintenta cuando alguien complete el dato. El código de motivo no se deduce ni se rellena por defecto, porque una nota con el motivo equivocado es una declaración incorrecta ante SUNAT.
 
+## Validaciones previas
+
+Antes de escribir cualquier archivo, todo comprobante (y cada boleta candidata a entrar al resumen diario) pasa por `_validar_campos_obligatorios()`: numeración, fecha de emisión válida y total. Los comprobantes individuales además necesitan al menos un ítem. Si falta algo, **no se genera nada** — se registra un WARNING con el detalle de qué falta y se reintenta en el próximo ciclo, cuando se corrija el dato en la BD. Antes de esto, una fecha ilegible terminaba como una excepción genérica en el log, sin decir qué comprobante era ni por qué.
+
+No valida (todavía) dígito verificador de RUC/DNI, cuadre de totales, ni ítems con IGV=0 (ver "Limitaciones conocidas").
+
+## Fecha de emisión y zona horaria
+
+La aplicación guarda sus fechas con el reloj de su servidor de base de datos, que corre en **UTC**. SUNAT, en cambio, espera la fecha de emisión en la **hora local del emisor**. Sin corregir eso, toda venta hecha entre las 19:00 y la medianoche (Perú es UTC−5) queda registrada con la fecha del día siguiente, y a SUNAT se le declararía una fecha que todavía no llegó — que rechaza. En el resumen diario, además, esa boleta quedaría agrupada en el día equivocado.
+
+Por eso el daemon **mide** el desfase en vez de asumirlo: al inicio de cada ciclo compara el reloj de la BD con la hora local y aplica esa corrección (`detectar_desfase_bd()` → `fecha_local()`). Si alguien cambia la zona horaria del servidor —a hora de Lima, por ejemplo— el daemon se ajusta solo en el ciclo siguiente y lo deja anotado en el log; un valor fijo, en cambio, habría quedado al revés del problema, corriendo las fechas para el otro lado sin que nadie se entere. Si la medición falla, se conserva la última corrección conocida en lugar de arriesgar una fecha equivocada.
+
+Se puede forzar un valor con `DESFASE_BD_HORAS` (en horas) si hiciera falta.
+
 ## Archivos que genera en DATA
 
-No son los mismos para todos los tipos, y equivocarse hace que el SFS rechace el documento:
+No son los mismos para todos los tipos, y equivocarse hace que el SFS rechace el documento. Esta tabla es para los comprobantes que se envían individualmente (factura y notas); la boleta no genera estos archivos — va agrupada en el resumen diario (`.RDI`/`.TRD`, ver más abajo).
 
-| Archivo | Factura `01` | Boleta `03` | Notas `07` / `08` |
-|---|:---:|:---:|:---:|
-| `.cab` — cabecera, 18 columnas | ✓ | ✓ | — |
-| `.NOT` — cabecera de nota, 21 columnas | — | — | ✓ |
-| `.det` — detalle, **36 columnas** | ✓ | ✓ | ✓ |
-| `.tri` — tributos | ✓ | ✓ | ✓ |
-| `.ley` — leyenda | ✓ | ✓ | ✓ |
-| `.PAG` — forma de pago | ✓ | — | — |
+| Archivo | Factura `01` | Notas `07` / `08` |
+|---|:---:|:---:|
+| `.cab` — cabecera, 18 columnas | ✓ | — |
+| `.NOT` — cabecera de nota, 21 columnas | — | ✓ |
+| `.det` — detalle, **36 columnas** | ✓ | ✓ |
+| `.tri` — tributos | ✓ | ✓ |
+| `.ley` — leyenda | ✓ | ✓ |
+| `.PAG` — forma de pago | ✓ | — |
 
 Tres reglas que no están documentadas por SUNAT y que se descubrieron probando contra el ambiente beta:
 
@@ -54,7 +74,7 @@ El daemon se guía por el `IND_SITU` que el SFS lleva en su propia base:
 |---|---|---|
 | `03` / `04` | Aceptado (con o sin observaciones) | Cierra con `enviado=true` |
 | `05` | Anulado | Lo reporta como `BLOQUEADO`; **no** lo reenvía |
-| `06` | Con errores (p. ej. boleta de más de 5 días, que exige resumen diario) | Lo reporta como `BLOQUEADO`; no lo reenvía |
+| `06` | Con errores | Lo reporta como `BLOQUEADO`; no lo reenvía |
 | `10` | Rechazado por SUNAT | Lo regenera y lo reenvía, hasta `MAX_REINTENTOS_RECHAZO` veces |
 
 Cuando llega un CDR de rechazo, el motivo se guarda en `Factura.errors` (código y descripción de SUNAT, con fecha) además de quedar en el log, y el ZIP se archiva en `RPTA/errores/`. El comprobante nunca pasa a `enviado=true`.
@@ -83,6 +103,33 @@ Por eso, al inicio de cada ciclo, el daemon revisa los comprobantes que el SFS m
 - Ante cualquier otra respuesta —código desconocido, falla de red, credenciales ausentes— no toca nada. Ante la duda, nunca reenvía.
 
 Requiere `SOL_USUARIO` y `SOL_CLAVE` en el `.env`; si faltan, este paso simplemente no corre y el resto del daemon sigue igual. El servicio de consulta de SUNAT **solo existe en producción** (no tiene variante beta), pero consultar es de solo lectura: no emite nada y no depende de a qué ambiente esté apuntando el SFS para enviar.
+
+## Resumen diario de boletas
+
+Ninguna boleta se envía individualmente. Todas se acumulan y salen agrupadas en un resumen diario (`RC`), un tipo de documento más para el SFS (mismos endpoints REST, mismo patrón de dos pasadas) que por debajo SUNAT procesa con un flujo de ticket en vez de respuesta inmediata.
+
+Esto evita el problema de origen: una boleta enviada más de 5 días después de su emisión, SUNAT la rechaza para envío individual (`IND_SITU='06'`) y queda bloqueada para siempre. Agrupándolas en un resumen ese límite no aplica.
+
+Cómo funciona, en cada ciclo:
+
+1. `obtener_boletas_para_resumen()` junta las boletas con `enviado=false` y `fechaEmision` anterior al día de hoy —las de hoy se dejan para el resumen de un día siguiente—, salvo las que ya estén dentro de un resumen que el SFS todavía tiene en curso.
+2. `generar_resumen_diario()` les asigna una numeración propia del daemon, `RC-YYYYMMDD-NNN` (correlativo persistido en `resumenes.json`, no se versiona), y escribe `.RDI` (una línea por boleta, 23 columnas) y `.TRD` (desglose de tributos por línea, 6 columnas) en `DATA`.
+3. El resumen se entrega al SFS igual que cualquier otro documento (`activar_procesamiento_sfs()`).
+3. SUNAT no devuelve el CDR en el acto como con una factura: responde un **ticket**. `recuperar_cdr_resumenes()` lo consulta por SOAP (`getStatus`) hasta que está listo y deja el CDR en `RPTA`.
+4. Cuando llega el CDR, como un resumen no es una fila de `Factura` sino que agrupa muchas, el cierre hace un `UPDATE ... WHERE "numeracionComprobante" = ANY(...)` con la lista de boletas que se guardó en `resumenes.json` al generarlo, en vez del `UPDATE` de una sola fila que usa el resto de los tipos.
+5. Un resumen rechazado se reintenta igual que cualquier otro documento (mismo tope `MAX_REINTENTOS_RECHAZO`); si se agota, queda `BLOQUEADO` y sus boletas no entran a un resumen nuevo hasta que se revise a mano.
+
+No cubre el rechazo parcial de una sola boleta dentro de un resumen aceptado por SUNAT: ese caso queda para revisión manual, igual que cualquier otra situación que el daemon no puede resolver solo.
+
+### Detalles del formato que costó descubrir
+
+Todo esto salió de decompilar el SFS y de rechazos reales en homologación, no de la documentación:
+
+- **El nombre de archivo va sin el `RC-` del id.** `validarNombreArchivo()` exige exactamente 4 tramos separados por guión (`RUC-TIPO-SERIE-NÚMERO`); con el prefijo quedaban 5 y **el SFS descartaba el archivo en silencio**, sin generar el XML ni dejar rastro en su bandeja ni en su log. En todo lo demás (bandeja, API REST, CDR) el id sí lleva el `RC-`.
+- **`.RDI` no es una cabecera única**: es una línea de 23 columnas *por cada boleta*. El `.TRD` es el desglose de tributos, 6 columnas, vinculado por la posición de la línea.
+- **`tipDocResumen` (columna 3) es el tipo de comprobante (`03`), no el estado de la línea.** Confundirlo da el error `2241`. El estado (`1` = nueva) va en la última columna.
+- **Los 4 campos de percepción son numéricos**: van en `0.00`, no en `-` como el resto de lo vacío (error *"'-' no es un valor válido para 'decimal'"*). Los 4 de documento modificado, en cambio, van **vacíos** — la plantilla del SFS los compara contra cadena vacía, así que un `-` haría que arme nodos con basura.
+- **El ticket se consume al consultarlo.** Si el daemon lo usa y el resumen queda en `08`, el SFS vuelve a consultarlo, recibe *"El ticket no existe"* y lo deja en `05` (bloqueado), con sus archivos atascados en `DATA` pese a estar bien emitido. Por eso, al bajar el CDR, el daemon cierra el resumen en la bandeja (`_cerrar_resumen_en_sfs()`).
 
 ## Requisitos
 
@@ -125,28 +172,42 @@ EMISOR_RUC=
 # Cuántas veces se reenvía un comprobante rechazado por SUNAT. Opcional, por defecto 3.
 MAX_REINTENTOS_RECHAZO=3
 
-# Credenciales SOL, solo para consultar a SUNAT si un comprobante enviado quedó sin
-# CDR (ver "Recuperación tras un corte de conexión"). Opcional: sin esto, el daemon
-# sigue funcionando pero no intenta recuperar CDR perdidos.
+# Credenciales SOL, para las dos consultas que el daemon le hace a SUNAT: el ticket
+# de cada resumen diario y el CDR de un comprobante que quedó sin respuesta.
+# SIN ESTO NO SE CIERRA NINGÚN RESUMEN: su CDR llega detrás de un ticket y no hay
+# otra forma de traerlo (ver "Resumen diario de boletas").
 SOL_USUARIO=
 SOL_CLAVE=
 
 # Minutos sin CDR antes de consultar a SUNAT. Opcional, por defecto 10.
 CONSULTA_SUNAT_TRAS_MIN=10
+
+# Corrección horaria entre el reloj de la BD y la hora local, en horas. Por defecto
+# "auto": se mide en cada ciclo (ver "Fecha de emisión y zona horaria"). Solo poner
+# un número si hiciera falta forzarlo.
+DESFASE_BD_HORAS=auto
 ```
 
 ## Uso
 
-Ejecución directa:
-
-```bash
-python main.py
-```
-
-Con PM2 (usando `sfs.config.js`):
+`sfs.config.js` gestiona dos procesos: el **SFS** (la aplicación Java de SUNAT) y el **daemon**. Levantar los dos:
 
 ```bash
 pm2 start sfs.config.js
+```
+
+Para que arranquen solos al encender la PC (Windows no tiene init system, así que `pm2 startup` no alcanza):
+
+```bash
+npm install -g pm2-windows-startup
+pm2-startup install
+pm2 save
+```
+
+La bandeja del SFS (`http://localhost:9000`) no hace falta para que el daemon funcione — se abre solo para mirar. Ejecución directa, sin PM2:
+
+```bash
+python main.py
 ```
 
 Los logs se escriben en `facturador.log` y, si se usa PM2, también en `logs/out.log` / `logs/error.log`.
@@ -158,19 +219,30 @@ Factura (enviado=false)
         ↓
 ciclo_generacion() cada 60s
         ↓
-Genera los archivos del tipo en DATA (ver tabla más arriba)
-        ↓
-Envía al SFS local → XML firmado → SUNAT
-        ↓
-SUNAT responde con CDR (ZIP) en RPTA
-        ↓
-Hilo CDR detecta el ZIP y lo procesa
-        ↓
-Si ACEPTADO → enviado=true en la BD, ZIP movido a RPTA/procesados/
-                y se borran los archivos de DATA
+Factura y notas ─┐                    ┌─ Boletas: se acumulan y salen
+  una por una    │                    │  agrupadas en un resumen diario
+                 ↓                    ↓
+        Genera los archivos en DATA (ver tablas más arriba)
+                 ↓
+        El SFS relee DATA (sincronizar_bandeja_sfs)
+                 ↓
+        Envía al SFS local → XML firmado → SUNAT
+                 ↓
+    ┌────────────┴────────────┐
+    ↓                         ↓
+CDR directo            Ticket → getStatus
+(factura, notas)       (resumen diario)
+    └────────────┬────────────┘
+                 ↓
+        El CDR (ZIP) queda en RPTA
+                 ↓
+        Hilo CDR detecta el ZIP y lo procesa
+                 ↓
+Si ACEPTADO → enviado=true en la BD (una fila, o todas las boletas
+              del resumen), ZIP a RPTA/procesados/ y se borra DATA
 ```
 
-El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la segunda genera el XML, así que un comprobante nuevo suele necesitar **dos ciclos** para salir.
+El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la segunda genera el XML, así que un comprobante nuevo suele necesitar **dos ciclos** para salir. Un resumen tarda algo más, porque su CDR llega detrás de un ticket.
 
 ## Limitaciones conocidas
 
@@ -178,13 +250,17 @@ El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la
 
 **El valor unitario pierde precisión.** Se redondea a 2 decimales y luego se escribe con 6, así que `cantidad x valor_unitario` puede diferir en céntimos del valor de venta declarado. SUNAT lo tolera en comprobantes chicos, pero el error se acumula con la cantidad de líneas.
 
-**Sin resumen diario ni comunicación de baja.** Una boleta que pasa el plazo de envío queda en `IND_SITU='06'` y solo puede regularizarse con un resumen diario (`RC`), que todavía no se emite desde acá.
+**Sin comunicación de baja.** Anular un comprobante ya aceptado (`RA`) todavía no se emite desde acá.
+
+**El resumen diario no maneja rechazo parcial de una línea.** Si SUNAT acepta el resumen pero observa una boleta puntual dentro de él, ese caso no se detecta automáticamente y necesita revisión manual (ver "Resumen diario de boletas").
 
 **`facturador.log` no rota.** Con volumen alto conviene agregarle rotación.
 
 ## Pruebas contra el ambiente beta
 
-El SFS apunta a producción o a homologación según qué línea `RUTA_SERV_CDP` esté descomentada en `sunat_archivos/sfs/VALI/constantes.properties`. Mientras la activa sea `e-beta.sunat.gob.pe`, los comprobantes llegan a SUNAT pero **no tienen validez fiscal**: es el ambiente donde conviene probar cualquier cambio al generador de archivos.
+El SFS apunta a producción o a homologación según qué línea `RUTA_SERV_CDP` esté descomentada en `sunat_archivos/sfs/VALI/constantes.properties` (hay que reiniciarlo para que la tome: `pm2 restart sfs`). Mientras la activa sea `e-beta.sunat.gob.pe`, los comprobantes llegan a SUNAT pero **no tienen validez fiscal**: es el ambiente donde conviene probar cualquier cambio al generador de archivos. Las credenciales SOL son las mismas en los dos ambientes; lo único que cambia es esa URL.
+
+> **Mientras el SFS esté en beta, ningún comprobante real debe llegar a la cola.** El daemon lo daría por emitido (`enviado=true`) sobre un envío sin validez fiscal, y no hay nada en la base que después delate la diferencia. Conviene probar con una serie propia (`B999-*`, por ejemplo) y borrarla al terminar.
 
 Escenarios que vale la pena cubrir antes de dar por bueno un cambio, porque cada uno ejercita un camino distinto del código:
 
@@ -194,11 +270,14 @@ Escenarios que vale la pena cubrir antes de dar por bueno un cambio, porque cada
 - Nota de crédito sobre factura y sobre boleta
 - Nota de crédito con motivo de anulación total (`01`) y de devolución parcial (`07`)
 - Nota de débito, que es la única que se emite contra una factura
+- Resumen diario: boletas con fecha anterior a hoy, para confirmar que se agrupan y no se envían una por una
 
 ### Antes de pasar a producción
 
 1. Vaciar los comprobantes de prueba de `Factura` e `FacturaItem`
 2. Volver a poner `Correlativo.numeracion` en `0`, o la primera factura real no arrancará en 1
 3. Vaciar la tabla `DOCUMENTO` de la base del SFS y las carpetas `DATA` y `RPTA`
-4. En la configuración del SFS: certificado digital real, usuario y clave SOL reales, y los datos del emisor completos — un nombre comercial vacío se emite como `-` y SUNAT lo observa con el código `4092`
-5. Recién entonces, cambiar `RUTA_SERV_CDP` a producción y emitir **un solo** comprobante para confirmar antes de soltar el resto
+4. Borrar `resumenes.json`, o el correlativo de los resúmenes seguiría desde donde quedó en las pruebas
+5. En la configuración del SFS: certificado digital real, usuario y clave SOL reales, y los datos del emisor completos — un nombre comercial vacío se emite como `-` y SUNAT lo observa con el código `4092`
+6. Cambiar `RUTA_SERV_CDP` a producción y **reiniciar el SFS** (`pm2 restart sfs`); confirmar el cambio antes de seguir
+7. Recién entonces emitir **un solo** comprobante para verificar antes de soltar el resto
