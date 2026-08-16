@@ -165,6 +165,25 @@ def _post_sfs(base_url, ruta, cuerpo, timeout=60):
         return {"validacion": "FALLO", "mensaje": str(e)}
 
 
+def _motivo(respuesta):
+    """
+    El texto de error de una respuesta del SFS.
+
+    No siempre viene en 'mensaje': segun el endpoint usa 'Mensaje' con mayuscula,
+    o directamente no manda ninguno. Quedarse solo con 'mensaje' mostraba un
+    'None' que no decia nada, asi que como ultimo recurso se vuelca la respuesta
+    entera — fea, pero con la informacion a la vista.
+    """
+    if not isinstance(respuesta, dict):
+        return str(respuesta)
+    for clave in ("mensaje", "Mensaje", "message", "error", "Error"):
+        if respuesta.get(clave):
+            return str(respuesta[clave])
+    # Sin texto util: se muestra todo menos la bandeja, que son miles de caracteres.
+    resumen = {k: v for k, v in respuesta.items() if k != "listaBandejaFacturador"}
+    return f"el SFS no devolvio ningun detalle. Respuesta completa: {resumen}"
+
+
 def esperar_sfs(base_url, segundos=90, avisar=print):
     """El SFS tarda en levantar; se espera a que conteste antes de configurarlo."""
     limite = time.time() + segundos
@@ -200,7 +219,7 @@ def cargar_en_sfs(base_url, datos, avisar=print):
         "cmbTiempoEnvia": "",
     })
     if r.get("validacion") != "EXITO":
-        return False, f"el SFS rechazo los datos del emisor: {r.get('mensaje')}"
+        return False, f"el SFS rechazo los datos del emisor: {_motivo(r)}"
     avisar("    emisor y credenciales SOL cargados (el SFS encripta las claves)")
 
     r = _post_sfs(base_url, "GrabarOtrosParametros.htm", {
@@ -213,7 +232,7 @@ def cargar_en_sfs(base_url, datos, avisar=print):
         "txtUrbanizacion": datos.get("urbanizacion", ""),
     })
     if r.get("validacion") != "EXITO":
-        return False, f"el SFS rechazo la direccion: {r.get('mensaje')}"
+        return False, f"el SFS rechazo la direccion: {_motivo(r)}"
     avisar("    direccion fiscal cargada")
 
     r = _post_sfs(base_url, "ImportarCertificado.htm", {
@@ -221,7 +240,7 @@ def cargar_en_sfs(base_url, datos, avisar=print):
         "passPrivateKey": datos["clave_certificado"],
     })
     if r.get("validacion") != "EXITO":
-        return False, f"el SFS rechazo el certificado: {r.get('mensaje')}"
+        return False, f"el SFS rechazo el certificado: {_motivo(r)}"
     avisar("    certificado importado")
     return True, ""
 
