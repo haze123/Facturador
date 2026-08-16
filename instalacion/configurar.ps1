@@ -81,6 +81,21 @@ function Pedir($etiqueta, $valorActual, [switch]$Obligatorio) {
     }
 }
 
+function Ejecutar([scriptblock]$bloque) {
+    <#
+    Corre un programa externo y devuelve toda su salida, incluida la de error.
+
+    Hace falta porque en PowerShell 5.1 redirigir stderr con 2>&1 envuelve cada
+    linea en un ErrorRecord, y con $ErrorActionPreference = 'Stop' eso aborta el
+    script AUNQUE el programa haya terminado bien. pm2, npm y pip escriben ahi
+    sus avisos de rutina.
+    #>
+    $previo = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try     { return (& $bloque 2>&1 | Out-String) }
+    finally { $ErrorActionPreference = $previo }
+}
+
 function Texto-De([System.Security.SecureString]$seguro) {
     <# El texto plano se necesita para hablar con el SFS; se libera enseguida. #>
     $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($seguro)
@@ -137,7 +152,7 @@ Nota "Enter conserva el valor entre corchetes."
 $previo = @{}
 $bdSfs = Join-Path $RutaSFS "bd\BDFacturador.db"
 if (Test-Path $bdSfs) {
-    $salida = python (Join-Path $PSScriptRoot "_chequeos.py") $bdSfs 2>&1
+    $salida = (Ejecutar { python (Join-Path $PSScriptRoot "_chequeos.py") $bdSfs }) -split "`r?`n"
     foreach ($l in $salida) {
         if ("$l".Trim() -match "^sfs_([A-Z]+)=(.*)$") { $previo[$Matches[1]] = $Matches[2] }
     }
@@ -199,7 +214,7 @@ Ok "certificado valido hasta $($x509.NotAfter.ToString('yyyy-MM-dd')), RUC $ruc"
 Titulo "5. Base de datos de la aplicacion"
 $dbUrl = Pedir "DATABASE_URL" "" -Obligatorio
 $env:PGCONNECT_TIMEOUT = "10"
-$prueba = python -c "import sys,psycopg2,urllib.parse as u; p=u.urlsplit(sys.argv[1]); q=u.parse_qs(p.query); e=(q.get('schema') or ['public'])[0]; c=psycopg2.connect(u.urlunsplit((p.scheme,p.netloc,p.path,'','')), connect_timeout=10, options=f'-c search_path={e}'); c.close(); print('OK')" $dbUrl 2>&1 | Select-Object -Last 1
+$prueba = (Ejecutar { python -c "import sys,psycopg2,urllib.parse as u; p=u.urlsplit(sys.argv[1]); q=u.parse_qs(p.query); e=(q.get('schema') or ['public'])[0]; c=psycopg2.connect(u.urlunsplit((p.scheme,p.netloc,p.path,'','')), connect_timeout=10, options=f'-c search_path={e}'); c.close(); print('OK')" $dbUrl }).Trim() -split "`r?`n" | Select-Object -Last 1
 if ("$prueba".Trim() -ne "OK") {
     Error2 "no se pudo conectar a la base"
     Nota "$prueba"
@@ -216,7 +231,7 @@ try {
     Ok "el SFS ya esta corriendo"
 } catch {
     Nota "levantando el SFS..."
-    pm2 start (Join-Path $raiz "sfs.config.js") --only sfs 2>&1 | Out-Null
+    Ejecutar { pm2 start (Join-Path $raiz "sfs.config.js") --only sfs } | Out-Null
     $listo = $false
     foreach ($i in 1..30) {
         Start-Sleep -Seconds 2
@@ -345,14 +360,14 @@ Ok ".env escrito y restringido al usuario actual"
 # --- 9. Procesos ------------------------------------------------------------
 Titulo "9. Procesos"
 
-pm2 start (Join-Path $raiz "sfs.config.js") 2>&1 | Out-Null
-pm2 save 2>&1 | Out-Null
+Ejecutar { pm2 start (Join-Path $raiz "sfs.config.js") } | Out-Null
+Ejecutar { pm2 save } | Out-Null
 Ok "SFS y daemon registrados en PM2"
 
 if (-not (Get-Command "pm2-startup" -ErrorAction SilentlyContinue)) {
-    npm install -g pm2-windows-startup 2>&1 | Out-Null
+    Ejecutar { npm install -g pm2-windows-startup } | Out-Null
 }
-pm2-startup install 2>&1 | Out-Null
+Ejecutar { pm2-startup install } | Out-Null
 Ok "arranque automatico con Windows"
 
 # --- 10. Verificacion -------------------------------------------------------
