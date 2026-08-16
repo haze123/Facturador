@@ -56,6 +56,21 @@ function Hay($comando) {
     return [bool](Get-Command $comando -ErrorAction SilentlyContinue)
 }
 
+function Ejecutar([scriptblock]$bloque) {
+    <#
+    Corre un programa externo y devuelve toda su salida, incluida la de error.
+
+    Hace falta porque en PowerShell 5.1 redirigir stderr con 2>&1 envuelve cada
+    linea en un ErrorRecord, y con $ErrorActionPreference = 'Stop' eso aborta el
+    script AUNQUE el programa haya terminado bien. java escribe ahi su version, y
+    pip, npm y winget sus avisos, asi que sin esto la instalacion se cae sola.
+    #>
+    $previo = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try     { return (& $bloque 2>&1 | Out-String) }
+    finally { $ErrorActionPreference = $previo }
+}
+
 function Refrescar-Path {
     <#
     Vuelve a leer el PATH del registro. Un instalador lo modifica para las
@@ -68,13 +83,11 @@ function Refrescar-Path {
 }
 
 function Instalar-Con-Winget($id, $nombre) {
-    <# Devuelve $true si quedo instalado y utilizable. #>
     Paso "instalando $nombre..."
     # --silent evita los asistentes; --accept-*-agreements, los prompts legales.
-    winget install --id $id --exact --silent --disable-interactivity `
-                   --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+    Ejecutar { winget install --id $id --exact --silent --disable-interactivity `
+                              --accept-package-agreements --accept-source-agreements } | Out-Null
     Refrescar-Path
-    return $?
 }
 
 # ===========================================================================
@@ -90,7 +103,7 @@ $requeridos = @(
     @{ Comando = "python"; Nombre = "Python 3.12"; Id = "Python.Python.3.12"
        Manual  = "https://www.python.org/downloads/"
        # Un Python viejo tampoco sirve: main.py usa sintaxis de 3.10 en adelante.
-       Version = { ((python --version 2>&1 | Out-String) -match "Python (\d+)\.(\d+)") -and
+       Version = { ((Ejecutar { python --version }) -match "Python (\d+)\.(\d+)") -and
                    ([int]$Matches[1] -gt 3 -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -ge 10)) } }
     @{ Comando = "java";   Nombre = "Java 8 (Temurin)"; Id = "EclipseAdoptium.Temurin.8.JRE"
        Manual  = "https://adoptium.net/" }
@@ -115,9 +128,10 @@ foreach ($req in $requeridos) {
 
     if ($instalado) {
         $detalle = switch ($req.Comando) {
-            "python" { (python --version 2>&1 | Out-String).Trim() }
-            "java"   { ((java -version 2>&1 | Out-String).Trim() -split "`r?`n")[0] -replace '^java(\.exe)?\s*:\s*', '' }
-            "node"   { "Node $(node --version)" }
+            "python" { (Ejecutar { python --version }).Trim() }
+            # java escribe su version en stderr, no en stdout.
+            "java"   { ((Ejecutar { java -version }).Trim() -split "`r?`n")[0] -replace '^java(\.exe)?\s*:\s*', '' }
+            "node"   { "Node $((Ejecutar { node --version }).Trim())" }
         }
         Ok $detalle
         continue
@@ -153,9 +167,9 @@ $requisitos = Join-Path $raiz "requirements.txt"
 if (-not (Test-Path $requisitos)) { Abortar "no se encontro $requisitos" }
 
 Paso "instalando psycopg2, python-dotenv, watchdog..."
-$salida = python -m pip install -r $requisitos --disable-pip-version-check 2>&1 | Out-String
+$salida = Ejecutar { python -m pip install -r $requisitos --disable-pip-version-check }
 foreach ($paquete in @("psycopg2", "dotenv", "watchdog")) {
-    python -c "import $paquete" 2>$null
+    Ejecutar { python -c "import $paquete" } | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Ok "$paquete"
     } else {
@@ -168,10 +182,10 @@ foreach ($paquete in @("psycopg2", "dotenv", "watchdog")) {
 Titulo "3. PM2"
 
 if (Hay "pm2") {
-    Ok "PM2 ya instalado ($(pm2 --version 2>$null | Select-Object -Last 1))"
+    Ok "PM2 ya instalado ($((Ejecutar { pm2 --version }).Trim() -split "`r?`n" | Select-Object -Last 1))"
 } else {
     Paso "instalando PM2..."
-    npm install -g pm2 2>&1 | Out-Null
+    Ejecutar { npm install -g pm2 } | Out-Null
     if (Hay "pm2") { Ok "PM2 instalado" } else { Abortar "no se pudo instalar PM2" }
 }
 
@@ -181,7 +195,7 @@ if (Hay "pm2-startup") {
     Ok "pm2-windows-startup ya instalado"
 } else {
     Paso "instalando pm2-windows-startup..."
-    npm install -g pm2-windows-startup 2>&1 | Out-Null
+    Ejecutar { npm install -g pm2-windows-startup } | Out-Null
     if (Hay "pm2-startup") { Ok "pm2-windows-startup instalado" }
     else { Aviso "no se pudo instalar; el facturador no arrancara solo al prender la PC" }
 }
@@ -244,7 +258,7 @@ $bdSfs = Join-Path $RutaSFS "bd\BDFacturador.db"
 $ruc = ""
 if (Test-Path $bdSfs) {
     # Se reutiliza _chequeos.py, que ya sabe leer la configuracion del SFS.
-    $salida = python (Join-Path $PSScriptRoot "_chequeos.py") $bdSfs 2>&1
+    $salida = (Ejecutar { python (Join-Path $PSScriptRoot "_chequeos.py") $bdSfs }) -split "`r?`n"
     foreach ($l in $salida) {
         if ("$l".Trim() -match "^sfs_NUMRUC=(.*)$") { $ruc = $Matches[1].Trim() }
     }
@@ -272,7 +286,7 @@ if ($hayDatos -or $certs.Count -gt 0) {
             $respaldo = "$bdSfs.bak-$(Get-Date -Format 'yyyyMMddHHmmss')"
             Copy-Item $bdSfs $respaldo
             Nota "respaldo en $(Split-Path $respaldo -Leaf)"
-            $res = python (Join-Path $PSScriptRoot "_limpiar_contribuyente.py") $bdSfs 2>&1 |
+            $res = (Ejecutar { python (Join-Path $PSScriptRoot "_limpiar_contribuyente.py") $bdSfs }).Trim() -split "`r?`n" |
                    Select-Object -Last 1
             if ("$res" -notmatch "^ok\|") {
                 Abortar "no se pudieron borrar los datos anteriores: $res" `
