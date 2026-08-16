@@ -115,7 +115,7 @@ Esto evita el problema de origen: una boleta enviada más de 5 días después de
 Cómo funciona, en cada ciclo:
 
 1. `obtener_boletas_para_resumen()` junta las boletas con `enviado=false` y `fechaEmision` anterior al día de hoy —las de hoy se dejan para el resumen de un día siguiente—, salvo las que ya estén dentro de un resumen que el SFS todavía tiene en curso.
-2. `generar_resumen_diario()` les asigna una numeración propia del daemon, `RC-YYYYMMDD-NNN` (correlativo persistido en `resumenes.json`, no se versiona), y escribe `.RDI` (una línea por boleta, 23 columnas) y `.TRD` (desglose de tributos por línea, 6 columnas) en `DATA`.
+2. `generar_resumen_diario()` les asigna una numeración propia del daemon, `RC-YYYYMMDD-NNN` (correlativo persistido en `resumenes.json`, no se versiona), y escribe `.RDI` (una línea por boleta, 23 columnas) y `.TRD` (desglose de tributos por línea, 6 columnas) en `DATA`. Si un número ya tiene su CDR en disco se saltea y se avisa en el log: sin eso, un `resumenes.json` perdido devolvía el contador a 001 y el daemon tomaba el CDR anterior por la respuesta del resumen nuevo, cerrándolo sin haberlo enviado.
 3. El resumen se entrega al SFS igual que cualquier otro documento (`activar_procesamiento_sfs()`).
 3. SUNAT no devuelve el CDR en el acto como con una factura: responde un **ticket**. `recuperar_cdr_resumenes()` lo consulta por SOAP (`getStatus`) hasta que está listo y deja el CDR en `RPTA`.
 4. Cuando llega el CDR, como un resumen no es una fila de `Factura` sino que agrupa muchas, el cierre hace un `UPDATE ... WHERE "numeracionComprobante" = ANY(...)` con la lista de boletas que se guardó en `resumenes.json` al generarlo, en vez del `UPDATE` de una sola fila que usa el resto de los tipos.
@@ -220,6 +220,8 @@ python main.py
 
 Los logs se escriben en `facturador.log` y, si se usa PM2, también en `logs/out.log` / `logs/error.log`.
 
+`facturador.log` rota a los 5 MB y conserva 5 archivos —unos 25 MB en total—, suficiente para investigar un rechazo semanas después sin que crezca sin límite en una PC que va a estar años emitiendo. Se ajusta con `LOG_MAX_MB` y `LOG_ARCHIVOS`.
+
 ## Flujo del comprobante
 
 ```
@@ -254,15 +256,9 @@ El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la
 
 ## Limitaciones conocidas
 
-**El valor unitario pierde precisión.** Se redondea a 2 decimales y luego se escribe con 6, así que `cantidad x valor_unitario` puede diferir en céntimos del valor de venta declarado. SUNAT lo tolera en comprobantes chicos, pero el error se acumula con la cantidad de líneas.
-
 **El resumen diario no maneja rechazo parcial de una línea.** Si SUNAT acepta el resumen pero observa una boleta puntual dentro de él, ese caso no se detecta automáticamente y necesita revisión manual (ver "Resumen diario de boletas").
 
 **Una boleta puede quedar retenida esperando intervención.** Si un resumen desaparece sin dejar rastro —no figura en la bandeja del SFS y sus archivos ya no están en `DATA`— el daemon no puede saber si llegó a SUNAT, y retiene sus boletas en vez de arriesgarse a declararlas dos veces. Lo avisa en el log con la instrucción para destrabarlas: borrar ese resumen de `resumenes.json`. Es deliberado —una boleta retenida es reversible, una declarada dos veces no— pero requiere que alguien lo mire.
-
-**La numeración de los resúmenes vive en `resumenes.json`.** Si el archivo se pierde o se borra, el correlativo vuelve a empezar en 001. Y si quedaron CDR de resúmenes anteriores con esa misma numeración, el daemon los toma por la respuesta del resumen nuevo y lo da por enviado sin haberlo mandado. Antes de reiniciar el correlativo hay que limpiar también la bandeja del SFS y la carpeta `RPTA`.
-
-**`facturador.log` no rota.** Con volumen alto conviene agregarle rotación.
 
 ## Pruebas contra el ambiente beta
 
