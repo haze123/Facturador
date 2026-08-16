@@ -250,7 +250,9 @@ Si ACEPTADO → enviado=true en la BD (una fila, o todas las boletas
 
 El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la segunda genera el XML, así que un comprobante nuevo suele necesitar **dos ciclos** para salir. Un resumen tarda algo más, porque su CDR llega detrás de un ticket.
 
-## Limitaciones conocidas
+## Lo que el daemon no decide solo
+
+Dos situaciones en las que se detiene y deja el caso a la vista en vez de resolverlo por su cuenta:
 
 **Una boleta observada dentro de un resumen aceptado queda emitida.** SUNAT puede aceptar el resumen y aun así observar boletas puntuales; el daemon las detecta y guarda el motivo en `Factura.errors`, pero no las corrige ni las vuelve a emitir — no puede saber si la observación amerita rehacer el comprobante. Queda para revisión manual, con el detalle a la vista.
 
