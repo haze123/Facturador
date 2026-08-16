@@ -1,14 +1,15 @@
 # Instalación en un cliente nuevo
 
-Tres scripts, uno por problema distinto. Se corren desde esta carpeta, en PowerShell.
+Todo se hace desde **`FacturadorSetup.exe`**: un solo ejecutable con menú, que lleva adentro su propio Python. Por eso corre en una PC recién formateada, donde todavía no hay nada instalado.
 
-| Script | Qué hace | Cuándo |
-|---|---|---|
-| `instalar.ps1` | Prerrequisitos, dependencias, PM2 y descarga del SFS | Una vez por PC |
-| `configurar.ps1` | Carga los datos del cliente y deja todo andando | Al instalar, y cuando cambia una clave o vence el certificado |
-| `verificar.ps1` | Diagnostica una instalación existente | Cuando "no está emitiendo" |
+```
+   1  Instalar el entorno (prerrequisitos, PM2, SFS)
+   2  Configurar un cliente
+   3  Verificar la instalacion
+   4  Pasar a produccion
+```
 
-Separar configurar de instalar importa: cuando a un cliente le vence el certificado —que pasa— no hay que reinstalar nada, se corre un script de 30 segundos.
+Están separados a propósito: cuando a un cliente le vence el certificado —que pasa— no hay que reinstalar nada, se corre solo la opción 2.
 
 ## Antes de empezar
 
@@ -19,24 +20,24 @@ Hay que tener a mano, del cliente:
 - El **certificado digital** `.p12` o `.pfx` y su contraseña
 - La `DATABASE_URL` de la aplicación
 
-Los prerrequisitos de la PC —Python 3.10+, Java 8 y Node.js— **los instala el script solo**, con `winget` (viene con Windows 10 1809+ y Windows 11). Si `winget` no está disponible, avisa cuáles faltan con su enlace y se detiene.
-
-Lo único que hay que tener antes es **Git**, para traer el código — o descargar el ZIP del repositorio desde GitHub y descomprimirlo.
+Python, Java y Node los instala el propio programa con `winget`.
 
 ## El procedimiento
 
-```powershell
-.\instalar.ps1        # prepara el entorno (descarga ~90 MB de SUNAT)
-.\configurar.ps1      # pide los datos del cliente; queda en BETA
-```
+1. Copiar la carpeta del proyecto a la PC (clonar el repositorio o descomprimir el ZIP)
+2. Doble click en **`FacturadorSetup.exe`**
+3. Opción **1** — instala prerrequisitos, PM2 y descarga el SFS (~90 MB)
+4. Opción **2** — pide los datos del cliente y deja todo andando
 
-Después de configurar, **la instalación queda apuntando a beta**. Eso es a propósito:
+Al terminar el paso 4 **la instalación queda apuntando a beta**. Eso es deliberado:
 
 1. Emitir un comprobante de prueba y confirmar que SUNAT lo acepte
 2. Borrar los comprobantes de prueba de la base de la aplicación
-3. Recién entonces: `.\configurar.ps1 -Produccion`
+3. Recién entonces, opción **4** — pasar a producción
 
-**Por qué no instalar directo en producción.** Si algo está mal configurado y un comprobante real sale contra beta, el daemon lo marca como `enviado=true` en la base de la aplicación pero ante SUNAT no existe — y después nada delata la diferencia. Es el peor error posible de este sistema, y arrancar en beta lo vuelve imposible.
+**Por qué no instalar directo en producción.** Si algo está mal configurado y un comprobante real sale contra beta, el daemon lo marca como `enviado=true` en la base pero ante SUNAT no existe — y después nada delata la diferencia. Es el peor error posible de este sistema, y arrancar en beta lo vuelve imposible.
+
+> **La primera vez que se abre en una PC nueva, Windows muestra "Windows protegió su PC".** Es SmartScreen, porque el ejecutable no está firmado: *Más información → Ejecutar de todas formas*. Evitarlo requiere un certificado de firma de código (200–400 USD al año).
 
 ## Lo que el instalador no hace, y por qué
 
@@ -46,28 +47,46 @@ Después de configurar, **la instalación queda apuntando a beta**. Eso es a pro
 
 **No prende el temporizador del SFS.** Sus jobs internos de generar y enviar harían por su cuenta lo mismo que el daemon hace por REST, compitiendo por los mismos documentos.
 
-## Reutilizar una PC que ya tenía otro cliente
-
-`instalar.ps1` lo detecta y pregunta antes de borrar nada. Si se responde que sí, vacía los datos del contribuyente anterior (RUC, credenciales, certificado y el historial de comprobantes) dejando un respaldo de la base. Si se responde que no, avisa y sigue — pero conviene estar seguro: emitir con el certificado de otro contribuyente es facturar a su nombre.
-
 ## Versión del SFS
 
-Por defecto se instala la **2.1**. SUNAT publica hasta la 2.4 en
+Se instala la **2.1**. SUNAT publica hasta la 2.4 en
 `http://www2.sunat.gob.pe/facturador/SFS_v-<versión>.zip` (descarga pública, sin clave SOL; el nombre lleva un guión después de la `v`).
 
-Se fija la 2.1 porque es la única contra la que se verificó el formato de los archivos planos que genera el daemon, incluido el del resumen diario de boletas. Actualizar es una decisión aparte: hay que volver a probar la emisión de cada tipo de comprobante antes de darla por buena.
-
-```powershell
-.\instalar.ps1 -VersionSFS "2.4"   # solo después de probarlo
-```
+Se fija la 2.1 porque es la única contra la que se verificó el formato de los archivos planos que genera el daemon, incluido el del resumen diario de boletas. Actualizar es una decisión aparte: hay que volver a probar la emisión de cada tipo de comprobante.
 
 ## Diagnóstico
 
-```powershell
-.\verificar.ps1                 # revisa todo
-.\verificar.ps1 -ConCertificado # además: vencimiento y titular del certificado
+La opción **3** revisa prerrequisitos, `.env`, la base de la aplicación, la configuración del SFS, **si apunta a producción o beta**, el certificado, los procesos de PM2 y el trabajo pendiente. No modifica nada, y no escribe en `facturador.log` — que es donde se investiga qué pasó con un comprobante real.
+
+## Base de prueba
+
+Para probar una instalación sin apuntarla a producción:
+
+```
+python crear_bd_prueba.py "<DATABASE_URL de produccion>" facturador_prueba
 ```
 
-Revisa prerrequisitos, `.env`, la base de la aplicación, la configuración del SFS, **si apunta a producción o beta**, el certificado, los procesos de PM2 y el trabajo pendiente. No modifica nada y no escribe en `facturador.log`, que es donde se investiga qué pasó con un comprobante real.
+Copia solo la estructura de las cuatro tablas que consulta el daemon, sin ningún dato. Es imprescindible: si dos daemons leen la misma base, el de prueba toma los comprobantes reales pendientes, los manda a beta y los marca como enviados. El real nunca los emitiría.
 
-Devuelve código de salida distinto de cero si encuentra fallas, así que sirve para monitoreo automático.
+## Compilar el ejecutable
+
+Solo hace falta al cambiar el código del instalador:
+
+```
+python -m pip install pyinstaller
+python construir.py
+```
+
+Deja `FacturadorSetup.exe` en esta carpeta. No se versiona: se genera al publicar.
+
+## Los archivos
+
+| Archivo | Qué es |
+|---|---|
+| `instalador.py` | El menú y el flujo de cada operación |
+| `sistema.py` | Prerrequisitos, winget, PM2, descarga del SFS |
+| `contribuyente.py` | Validaciones, carga en el SFS, `.env`, ambiente |
+| `chequeos.py` | El diagnóstico |
+| `crear_bd_prueba.py` | Base de prueba sin datos |
+| `_limpiar_contribuyente.py` | Borra los datos del contribuyente anterior |
+| `construir.py` | Compila el `.exe` |

@@ -5,3 +5,7 @@ logs/
 facturador.log
 reintentos.json
 resumenes.json
+
+# Artefactos de compilacion del instalador
+instalacion/FacturadorSetup.exe
+instalacion/_build/
