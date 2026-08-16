@@ -12,6 +12,7 @@ import base64
 import binascii
 import json
 import logging
+import logging.handlers   # submodulo aparte: 'import logging' no lo trae
 import os
 import re
 import sqlite3
@@ -323,14 +324,23 @@ _lock_cdr = threading.Lock()
 # Logging
 # ---------------------------------------------------------------------------
 
+# El log rota a los 5 MB y se conservan 5 archivos: unos 25 MB en total. Es el
+# registro de qué pasó con cada comprobante, así que hay que poder mirar atrás
+# —un rechazo puede investigarse semanas después—, pero sin que crezca sin
+# límite en una PC que va a estar años emitiendo.
+LOG_MAX_MB       = int(os.getenv("LOG_MAX_MB", "5"))
+LOG_ARCHIVOS     = int(os.getenv("LOG_ARCHIVOS", "5"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
+        logging.handlers.RotatingFileHandler(
             os.path.join(_BASE, "facturador.log"),
+            maxBytes=LOG_MAX_MB * 1024 * 1024,
+            backupCount=LOG_ARCHIVOS,
             encoding="utf-8",
         ),
     ],
@@ -399,13 +409,23 @@ def _desglosar_igv(precio_unitario, cantidad, total_linea):
     return float(unitario), valor_venta, igv
 
 
-def formatear_decimal(valor) -> Decimal:
+def formatear_decimal(valor, decimales: int = 2) -> Decimal:
+    """
+    Importe redondeado, con 2 decimales salvo que se pidan otros.
+
+    El valor unitario es el único campo que necesita más: se declara con 6 porque
+    SUNAT verifica que cantidad × valor unitario cuadre con el valor de venta, y
+    con 2 decimales la cuenta no cierra. Un servicio de S/10 en 3 unidades da
+    2.823333 por unidad; redondeado a 2.82, tres unidades suman 8.46 contra los
+    8.47 declarados como valor de venta.
+    """
     if valor is None:
-        return Decimal("0.00")
+        return Decimal(0).quantize(Decimal(1).scaleb(-decimales))
     try:
-        return Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return Decimal(str(valor)).quantize(Decimal(1).scaleb(-decimales),
+                                            rounding=ROUND_HALF_UP)
     except (InvalidOperation, ValueError, TypeError):
-        return Decimal("0.00")
+        return Decimal(0).quantize(Decimal(1).scaleb(-decimales))
 
 
 _UNIDADES = ("", "UNO", "DOS", "TRES", "CUATRO", "CINCO", "SEIS", "SIETE", "OCHO", "NUEVE",
@@ -879,7 +899,9 @@ def _validar_campos_obligatorios(comp: dict) -> list:
 def _linea_detalle(item: dict) -> str:
     """Una línea del archivo .det: las 36 columnas en el orden que lee el SFS."""
     cant   = formatear_decimal(item.get("dec_cantidad") or item.get("cantidad_venta") or item.get("cantidad", 1))
-    v_unit = formatear_decimal(item.get("valor"))
+    # Con 6 decimales, no 2: es lo que hace cuadrar cantidad × valor unitario
+    # contra el valor de venta, que es lo que SUNAT verifica.
+    v_unit = formatear_decimal(item.get("valor"), 6)
     v_vta  = formatear_decimal(item.get("valor_venta"))
     igv_it = formatear_decimal(item.get("igv_venta"))
     p_unit = formatear_decimal(item.get("precio"))
@@ -1795,13 +1817,28 @@ def _siguiente_numeracion_rc(fecha: str) -> str:
     usa SUNAT en el XML, la que el SFS guarda en DOCUMENTO.NUM_DOCU y espera en su
     API REST, y la que vuelve en el CDR. La ÚNICA excepción es el nombre de archivo
     en DATA, que se arma sin el prefijo (ver _nombre_archivo_rc).
+
+    El correlativo no sale solo del archivo: se saltean los números que ya tengan
+    un CDR en disco. Si resumenes.json se pierde o se borra a mano, el contador
+    vuelve a 001 — y un CDR anterior con esa misma numeración haría que el daemon
+    diera por contestado un resumen que nunca envió, cerrándolo sin que llegue a
+    SUNAT. Pasó de verdad al reiniciar el contador.
     """
     with _lock_resumenes:
         datos = _leer_resumenes()
-        n = int(datos.get("ultimo_correlativo", 0)) + 1
+        n = int(datos.get("ultimo_correlativo", 0))
+        while True:
+            n += 1
+            numeracion = f"{_TIPO_RC}-{fecha}-{n:03d}"
+            if not _tiene_cdr(EMISOR_RUC_OVERRIDE, _TIPO_RC, numeracion):
+                break
+            logger.warning(
+                "Ya existe un CDR para %s; se saltea ese número. El contador de "
+                "resúmenes venía atrasado respecto de lo ya emitido.", numeracion,
+            )
         datos["ultimo_correlativo"] = n
         _guardar_resumenes(datos)
-    return f"{_TIPO_RC}-{fecha}-{n:03d}"
+    return numeracion
 
 
 def _nombre_archivo_rc(ruc_emisor: str, numeracion_rc: str) -> str:
