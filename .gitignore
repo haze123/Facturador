@@ -6,6 +6,10 @@ facturador.log
 reintentos.json
 resumenes.json
 
+# Lo genera el instalador con las rutas de cada PC. Versionarlo hacia que
+# una instalacion nueva heredara las rutas de otra maquina y PM2 fallara.
+sfs.config.js
+
 # Artefactos de compilacion del instalador
 instalacion/FacturadorSetup.exe
 instalacion/_build/

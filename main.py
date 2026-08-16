@@ -12,6 +12,7 @@ import base64
 import binascii
 import json
 import logging
+import logging.handlers   # submodulo aparte: 'import logging' no lo trae
 import os
 import re
 import sqlite3
@@ -28,7 +29,6 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import psycopg2
-import psycopg2.extras
 from dotenv import load_dotenv
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -52,10 +52,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_TIMEOUT_SEG = int(os.getenv("DB_TIMEOUT_SEG", "30"))
 
 # Rutas SFS
-SFS_DATA_DIR = p if os.path.exists(p := os.getenv("SFS_DATA_DIR", r"C:\SFS_v2.1\sunat_archivos\sfs\DATA")) else os.path.join(_BASE, "sunat_archivos", "DATA")
-SFS_RPTA_DIR = p if os.path.exists(p := os.getenv("SFS_RPTA_DIR", r"C:\SFS_v2.1\sunat_archivos\sfs\RPTA")) else os.path.join(_BASE, "sunat_archivos", "RPTA")
+SFS_DATA_DIR = p if os.path.exists(p := os.getenv("SFS_DATA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\DATA")) else os.path.join(_BASE, "sunat_archivos", "DATA")
+SFS_RPTA_DIR = p if os.path.exists(p := os.getenv("SFS_RPTA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\RPTA")) else os.path.join(_BASE, "sunat_archivos", "RPTA")
 
-SFS_BD_PATH  = os.getenv("SFS_BD_PATH",  r"C:\SFS_v2.1\bd\BDFacturador.db")
+SFS_BD_PATH  = os.getenv("SFS_BD_PATH",  r"C:\SFS_v-2.1\bd\BDFacturador.db")
 SFS_BASE_URL = os.getenv("SFS_BASE_URL", "http://localhost:9000")
 
 # Configuración del SFS: de acá sale a qué ambiente de SUNAT está enviando
@@ -323,14 +323,23 @@ _lock_cdr = threading.Lock()
 # Logging
 # ---------------------------------------------------------------------------
 
+# El log rota a los 5 MB y se conservan 5 archivos: unos 25 MB en total. Es el
+# registro de qué pasó con cada comprobante, así que hay que poder mirar atrás
+# —un rechazo puede investigarse semanas después—, pero sin que crezca sin
+# límite en una PC que va a estar años emitiendo.
+LOG_MAX_MB       = int(os.getenv("LOG_MAX_MB", "5"))
+LOG_ARCHIVOS     = int(os.getenv("LOG_ARCHIVOS", "5"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
+        logging.handlers.RotatingFileHandler(
             os.path.join(_BASE, "facturador.log"),
+            maxBytes=LOG_MAX_MB * 1024 * 1024,
+            backupCount=LOG_ARCHIVOS,
             encoding="utf-8",
         ),
     ],
@@ -399,13 +408,23 @@ def _desglosar_igv(precio_unitario, cantidad, total_linea):
     return float(unitario), valor_venta, igv
 
 
-def formatear_decimal(valor) -> Decimal:
+def formatear_decimal(valor, decimales: int = 2) -> Decimal:
+    """
+    Importe redondeado, con 2 decimales salvo que se pidan otros.
+
+    El valor unitario es el único campo que necesita más: se declara con 6 porque
+    SUNAT verifica que cantidad × valor unitario cuadre con el valor de venta, y
+    con 2 decimales la cuenta no cierra. Un servicio de S/10 en 3 unidades da
+    2.823333 por unidad; redondeado a 2.82, tres unidades suman 8.46 contra los
+    8.47 declarados como valor de venta.
+    """
     if valor is None:
-        return Decimal("0.00")
+        return Decimal(0).quantize(Decimal(1).scaleb(-decimales))
     try:
-        return Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return Decimal(str(valor)).quantize(Decimal(1).scaleb(-decimales),
+                                            rounding=ROUND_HALF_UP)
     except (InvalidOperation, ValueError, TypeError):
-        return Decimal("0.00")
+        return Decimal(0).quantize(Decimal(1).scaleb(-decimales))
 
 
 _UNIDADES = ("", "UNO", "DOS", "TRES", "CUATRO", "CINCO", "SEIS", "SIETE", "OCHO", "NUEVE",
@@ -879,7 +898,9 @@ def _validar_campos_obligatorios(comp: dict) -> list:
 def _linea_detalle(item: dict) -> str:
     """Una línea del archivo .det: las 36 columnas en el orden que lee el SFS."""
     cant   = formatear_decimal(item.get("dec_cantidad") or item.get("cantidad_venta") or item.get("cantidad", 1))
-    v_unit = formatear_decimal(item.get("valor"))
+    # Con 6 decimales, no 2: es lo que hace cuadrar cantidad × valor unitario
+    # contra el valor de venta, que es lo que SUNAT verifica.
+    v_unit = formatear_decimal(item.get("valor"), 6)
     v_vta  = formatear_decimal(item.get("valor_venta"))
     igv_it = formatear_decimal(item.get("igv_venta"))
     p_unit = formatear_decimal(item.get("precio"))
@@ -1024,6 +1045,10 @@ def _linea_rdi(fecha_emision: str, fecha_resumen: str, boleta: dict, receptor: d
         "", "", "", "",
         "1",
     ]
+    # Una columna de más o de menos hace que el SFS rechace el archivo entero con
+    # un mensaje que no dice cuál falta; mejor que salte acá.
+    if len(campos) != _COLS_RDI:
+        raise ValueError(f".RDI: {len(campos)} columnas, se esperan {_COLS_RDI}")
     return "|".join(campos) + "|\n"
 
 
@@ -1036,7 +1061,10 @@ def _linea_trd(id_linea: int, boleta: dict) -> str:
     """
     grav = formatear_decimal(boleta["gravadas"])
     igv  = formatear_decimal(boleta["igv"])
-    return f"{id_linea}|1000|IGV|VAT|{grav:.2f}|{igv:.2f}|\n"
+    campos = [str(id_linea), "1000", "IGV", "VAT", f"{grav:.2f}", f"{igv:.2f}"]
+    if len(campos) != _COLS_TRD:
+        raise ValueError(f".TRD: {len(campos)} columnas, se esperan {_COLS_TRD}")
+    return "|".join(campos) + "|\n"
 
 
 def generar_resumen_diario(conn, ruc_emisor: str):
@@ -1788,13 +1816,28 @@ def _siguiente_numeracion_rc(fecha: str) -> str:
     usa SUNAT en el XML, la que el SFS guarda en DOCUMENTO.NUM_DOCU y espera en su
     API REST, y la que vuelve en el CDR. La ÚNICA excepción es el nombre de archivo
     en DATA, que se arma sin el prefijo (ver _nombre_archivo_rc).
+
+    El correlativo no sale solo del archivo: se saltean los números que ya tengan
+    un CDR en disco. Si resumenes.json se pierde o se borra a mano, el contador
+    vuelve a 001 — y un CDR anterior con esa misma numeración haría que el daemon
+    diera por contestado un resumen que nunca envió, cerrándolo sin que llegue a
+    SUNAT. Pasó de verdad al reiniciar el contador.
     """
     with _lock_resumenes:
         datos = _leer_resumenes()
-        n = int(datos.get("ultimo_correlativo", 0)) + 1
+        n = int(datos.get("ultimo_correlativo", 0))
+        while True:
+            n += 1
+            numeracion = f"{_TIPO_RC}-{fecha}-{n:03d}"
+            if not _tiene_cdr(EMISOR_RUC_OVERRIDE, _TIPO_RC, numeracion):
+                break
+            logger.warning(
+                "Ya existe un CDR para %s; se saltea ese número. El contador de "
+                "resúmenes venía atrasado respecto de lo ya emitido.", numeracion,
+            )
         datos["ultimo_correlativo"] = n
         _guardar_resumenes(datos)
-    return f"{_TIPO_RC}-{fecha}-{n:03d}"
+    return numeracion
 
 
 def _nombre_archivo_rc(ruc_emisor: str, numeracion_rc: str) -> str:
@@ -2028,10 +2071,42 @@ def _extraer_numeracion(texto) -> str | None:
     return m.group(0) if m else None
 
 
+def _respuestas_por_documento(root) -> list:
+    """
+    [(numeracion, codigo, descripcion)] de cada <cac:DocumentResponse> del CDR.
+
+    El esquema los declara con maxOccurs="unbounded": un CDR de resumen puede
+    traer uno por el resumen entero y otro por cada boleta que SUNAT observe. Sin
+    recorrerlos todos, esas observaciones se pierden — el comprobante queda
+    aceptado y nadie se entera de que una línea salió con reparos.
+    """
+    respuestas = []
+    for elem in root.iter():
+        if not isinstance(elem.tag, str) or elem.tag.split("}")[-1] != "DocumentResponse":
+            continue
+        datos = {}
+        for hijo in elem.iter():
+            if not isinstance(hijo.tag, str):
+                continue
+            tag = hijo.tag.split("}")[-1].lower()
+            texto = _texto(hijo.text)
+            if texto and tag in ("referenceid", "responsecode", "description") and tag not in datos:
+                datos[tag] = texto
+        if datos:
+            respuestas.append((
+                _extraer_numeracion(datos.get("referenceid", "")),
+                datos.get("responsecode"),
+                datos.get("description"),
+            ))
+    return respuestas
+
+
 def parsear_xml_cdr(fuente) -> dict:
-    res = {"numeracion": None, "codigo": None, "descripcion": None, "status": "PENDIENTE"}
+    res = {"numeracion": None, "codigo": None, "descripcion": None,
+           "status": "PENDIENTE", "lineas": []}
     try:
         root = ET.fromstring(fuente) if isinstance(fuente, bytes) else ET.parse(fuente).getroot()
+        res["lineas"] = _respuestas_por_documento(root)
         # Las descripciones que cuelgan de un <Response> son las buenas; cualquier otra
         # queda de respaldo por si el CDR no trae ninguna en el lugar esperado.
         descripciones, respaldo = [], []
@@ -2080,6 +2155,48 @@ def parsear_xml_cdr(fuente) -> dict:
     return res
 
 
+def _anotar_observaciones_de_lineas(conn, numeracion_rc: str, boletas: list, parsed: dict):
+    """
+    Guarda en cada boleta la observación que SUNAT le haya puesto dentro de un
+    resumen aceptado.
+
+    SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una
+    viene en su propio <cac:DocumentResponse>. Sin esto, esas boletas quedaban en
+    enviado=true sin rastro del reparo, y nadie se enteraba de que salieron con
+    observaciones.
+
+    La boleta NO se marca como no enviada: el resumen fue aceptado y ella entró en
+    él. La observación queda en Factura.errors para que alguien la mire; corregirla
+    —si hace falta— es una decisión que el daemon no puede tomar solo.
+    """
+    incluidas = set(boletas)
+    observadas = [
+        (num, cod, desc) for num, cod, desc in parsed.get("lineas", [])
+        # La respuesta del resumen entero no es una observación de línea, y un
+        # código de solo ceros es la aceptación limpia.
+        if num in incluidas and (cod or "").strip("0") != ""
+    ]
+    if not observadas:
+        return
+
+    for num, cod, desc in observadas:
+        detalle = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Observada en el resumen {numeracion_rc}"
+        if cod:
+            detalle += f" — código {cod}"
+        if desc:
+            detalle += f": {desc}"
+        _actualizar(
+            conn,
+            'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante"=%s',
+            (detalle[:_MAX_ERRORS_SQL], num),
+        )
+    logger.warning(
+        "SUNAT aceptó el resumen %s pero observó %d boleta(s): %s. Quedan emitidas, "
+        "con el motivo guardado para revisión.",
+        numeracion_rc, len(observadas), ", ".join(n for n, _, _ in observadas),
+    )
+
+
 def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
     if not numeracion:
         logger.error(
@@ -2110,6 +2227,7 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
         )
         if filas > 0:
             _limpiar_reintento(numeracion)
+            _anotar_observaciones_de_lineas(conn, numeracion, boletas, parsed)
             # Recién ahora el resumen esta terminado de verdad: sus boletas ya
             # quedaron cerradas. Marcarlo antes liberaba las boletas mientras
             # todavia figuraban pendientes, y se generaba otro resumen con ellas.
