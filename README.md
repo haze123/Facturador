@@ -260,6 +260,10 @@ El SFS trabaja en dos pasadas: la primera registra el archivo en su bandeja y la
 
 **El resumen diario no maneja rechazo parcial de una línea.** Si SUNAT acepta el resumen pero observa una boleta puntual dentro de él, ese caso no se detecta automáticamente y necesita revisión manual (ver "Resumen diario de boletas").
 
+**Una boleta puede quedar retenida esperando intervención.** Si un resumen desaparece sin dejar rastro —no figura en la bandeja del SFS y sus archivos ya no están en `DATA`— el daemon no puede saber si llegó a SUNAT, y retiene sus boletas en vez de arriesgarse a declararlas dos veces. Lo avisa en el log con la instrucción para destrabarlas: borrar ese resumen de `resumenes.json`. Es deliberado —una boleta retenida es reversible, una declarada dos veces no— pero requiere que alguien lo mire.
+
+**La numeración de los resúmenes vive en `resumenes.json`.** Si el archivo se pierde o se borra, el correlativo vuelve a empezar en 001. Y si quedaron CDR de resúmenes anteriores con esa misma numeración, el daemon los toma por la respuesta del resumen nuevo y lo da por enviado sin haberlo mandado. Antes de reiniciar el correlativo hay que limpiar también la bandeja del SFS y la carpeta `RPTA`.
+
 **`facturador.log` no rota.** Con volumen alto conviene agregarle rotación.
 
 ## Pruebas contra el ambiente beta
