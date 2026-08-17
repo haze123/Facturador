@@ -4,10 +4,14 @@ Instalador del Facturador SUNAT.
 Se compila a un unico .exe con PyInstaller (ver construir.py), asi que corre en
 una PC donde todavia no hay Python: el interprete viaja adentro del ejecutable.
 
-Tres operaciones, las mismas de siempre pero en un solo programa:
+Del 1 al 4, en el orden en que se hacen al instalar por primera vez:
   1. Instalar el entorno   (prerrequisitos, PM2, descarga del SFS)
   2. Configurar un cliente (datos del contribuyente, .env, procesos)
   3. Verificar             (diagnostico de una instalacion existente)
+  4. Pasar a produccion    (cambia el ambiente del SFS y limpia las pruebas)
+
+Y aparte, para cuando la instalacion ya existe:
+  5. Actualizar desde el archivo del cliente (aplica solo lo que cambio)
 """
 import os
 import sys
@@ -567,13 +571,20 @@ def actualizar_desde_archivo():
     return True
 
 
+# Del 1 al 4 en el orden en que se hacen al instalar por primera vez; despues, con
+# una linea en blanco de por medio, lo que se usa cuando la instalacion ya existe.
+# Con "actualizar" metido en el medio, quien venia de hacer 1, 2 y 3 leia el 4 como
+# el paso siguiente, cuando el que continuaba la secuencia era el de mas abajo.
 OPCIONES = (
     ("1", "Instalar el entorno (prerrequisitos, PM2, SFS)", instalar_entorno),
     ("2", "Configurar un cliente", configurar_cliente),
     ("3", "Verificar la instalacion", None),      # se resuelve al importar chequeos
-    ("4", "Actualizar desde el archivo del cliente", actualizar_desde_archivo),
-    ("5", "Pasar a produccion", pasar_a_produccion),
+    ("4", "Pasar a produccion", pasar_a_produccion),
+    ("5", "Actualizar desde el archivo del cliente", actualizar_desde_archivo),
 )
+
+# Antes de que opcion se corta la secuencia de instalacion.
+_SEPARADOR = "5"
 
 
 def main():
@@ -591,8 +602,10 @@ def main():
         print(f"{C.GRIS}  Proyecto en: {RAIZ}{C.FIN}")
         print(f"{C.NEGRITA}{'=' * 58}{C.FIN}\n")
         for codigo, (texto, _) in acciones.items():
+            if codigo == _SEPARADOR:
+                print()
             print(f"   {C.CYAN}{codigo}{C.FIN}  {texto}")
-        print(f"   {C.CYAN}0{C.FIN}  Salir\n")
+        print(f"\n   {C.CYAN}0{C.FIN}  Salir\n")
 
         eleccion = input("  Opcion: ").strip()
         if eleccion == "0":

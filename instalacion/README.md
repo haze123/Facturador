@@ -6,9 +6,12 @@ Un solo ejecutable con menú, `FacturadorSetup.exe`, que lleva adentro su propio
    1  Instalar el entorno (prerrequisitos, PM2, SFS)
    2  Configurar un cliente
    3  Verificar la instalacion
-   4  Actualizar desde el archivo del cliente
-   5  Pasar a produccion
+   4  Pasar a produccion
+
+   5  Actualizar desde el archivo del cliente
 ```
+
+Del 1 al 4 en el orden en que se hacen al instalar por primera vez; abajo, separado, lo que se usa cuando la instalación ya existe. Con "actualizar" en el medio, quien venía de hacer 1, 2 y 3 leía el 4 como el paso siguiente cuando el que continuaba la secuencia era el de más abajo.
 
 **El procedimiento paso a paso está en el manual en PDF**, que se distribuye aparte del repositorio. Este documento cubre lo demás: por qué el instalador está armado así y qué hacer cuando algo se sale del camino.
 
@@ -18,7 +21,7 @@ Las cuatro opciones están separadas a propósito: cuando a un cliente le vence 
 
 Configurar un cliente de cero (opción 2) pide catorce datos. Un mes después, cuando vence el certificado o corrigen el distrito, volver a recorrer todo es absurdo — y encima obliga a retipear la clave SOL, que no tiene nada que ver con lo que cambió.
 
-Para eso está la **opción 4**: un archivo de texto por cliente con sus datos, que el instalador compara contra lo instalado y aplica solo la diferencia.
+Para eso está la **opción 5**: un archivo de texto por cliente con sus datos, que el instalador compara contra lo instalado y aplica solo la diferencia.
 
 ```
   Distrito             LOS OLIVOS
@@ -29,7 +32,7 @@ Para eso está la **opción 4**: un archivo de texto por cliente con sus datos, 
 
 Funciona porque el SFS tiene **tres endpoints independientes** —emisor, dirección y certificado—, así que se llama únicamente al que corresponde. Y de ahí sale lo mejor: **cada clave se pide solo si su endpoint cambió**. Mover el distrito no pide ninguna; renovar el certificado pide la del certificado y nada más.
 
-Si el archivo no existe, la opción 4 lo genera con los datos que la PC ya tiene, listo para editar con el Bloc de notas.
+Si el archivo no existe, la opción 5 lo genera con los datos que la PC ya tiene, listo para editar con el Bloc de notas.
 
 **Las claves se preguntan siempre, aparte del diff**, porque son lo único que la comparación no puede detectar: no están en el archivo y el SFS las guarda cifradas, así que no hay contra qué compararlas. Si un cliente renueva su clave SOL y no cambia ningún otro dato, el diff sale vacío — y sin ese paso no tendría por dónde actualizarla.
 
@@ -46,12 +49,12 @@ Si el archivo no existe, la opción 4 lo genera con los datos que la PC ya tiene
 
 **Las claves no van en el archivo.** Hoy la clave SOL y la del certificado se tipean una vez y el SFS las guarda cifradas: nunca tocan el disco en texto plano. Un `.txt` con la clave SOL en la PC del cliente es otra cosa — se copia, se manda por chat, queda en el Escritorio y sobrevive a que echen al empleado que lo tenía. Por eso el archivo trae la conexión a la base **sin contraseña**, y las dos claves del SFS no figuran en ningún campo.
 
-Cambiar de motor tambien entra por acá: se edita `base_datos` en el archivo y la opción 4 lo detecta como un cambio más. Usa la conexión que dice el archivo y pide **solo la contraseña** —lo único que el archivo no puede llevar—, la prueba antes de guardar, y si no conecta deja el `.env` como estaba en vez de dejarlo apuntando a una base a la que el daemon no llega.
+Cambiar de motor tambien entra por acá: se edita `base_datos` en el archivo y la opción 5 lo detecta como un cambio más. Usa la conexión que dice el archivo y pide **solo la contraseña** —lo único que el archivo no puede llevar—, la prueba antes de guardar, y si no conecta deja el `.env` como estaba en vez de dejarlo apuntando a una base a la que el daemon no llega.
 
 Dos detalles que costaron pensar:
 
 - **El certificado se compara por contenido, no por nombre.** Uno renovado suele llamarse igual que el que vence; mirar el nombre diría "sin cambios" justo el día que hay que reemplazarlo.
-- **Cambiar el RUC no es un campo más.** Es otro contribuyente: el certificado está atado a él y el historial emitido pertenece al anterior. La opción 4 frena y pide confirmación explícita, y sugiere la opción 2, que sí limpia lo anterior.
+- **Cambiar el RUC no es un campo más.** Es otro contribuyente: el certificado está atado a él y el historial emitido pertenece al anterior. La opción 5 frena y pide confirmación explícita, y sugiere la opción 2, que sí limpia lo anterior.
 
 ## La base de datos de cada cliente
 
