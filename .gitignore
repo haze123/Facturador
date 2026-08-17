@@ -10,8 +10,9 @@ resumenes.json
 # una instalacion nueva heredara las rutas de otra maquina y PM2 fallara.
 sfs.config.js
 
-# Artefactos de compilacion del instalador
-instalacion/FacturadorSetup.exe
+# Artefactos de compilacion del instalador. Se distribuyen por release, no aca.
+instalacion/FacturadorSetup/
+instalacion/FacturadorSetup.zip
 instalacion/_build/
 
 # Datos del contribuyente de cada instalacion. No lleva claves, pero si el RUC,

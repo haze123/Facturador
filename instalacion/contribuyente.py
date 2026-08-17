@@ -8,7 +8,6 @@ romperia con cualquier actualizacion suya.
 import json
 import os
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -133,6 +132,24 @@ def revisar_certificado(ruta, clave, ruc):
     return True, f"vigente hasta {vence:%Y-%m-%d}", vence
 
 
+def limpiar_url(texto):
+    """
+    Saca comillas y espacios de una URL pegada.
+
+    En el .env de Prisma la URL va entrecomillada, asi que copiarla de ahi y pegarla
+    trae las comillas puestas. Sin limpiarlas, urlsplit lee el esquema vacio y el
+    error resultante —"no se reconoce el motor"— manda a buscar el problema al lugar
+    equivocado.
+    """
+    limpio = (texto or "").strip()
+    for comilla in ('"', "'", "“", "”"):
+        if limpio.startswith(comilla):
+            limpio = limpio[1:]
+        if limpio.endswith(comilla):
+            limpio = limpio[:-1]
+    return limpio.strip()
+
+
 def url_sin_clave(url):
     """La URL con la contrasena tapada, para poder mostrarla en pantalla."""
     import re
@@ -140,7 +157,7 @@ def url_sin_clave(url):
 
 
 def armar_url(motor, servidor, puerto, base, usuario="", clave="",
-              esquema="public", windows=False):
+              esquema="public", windows=False, instancia=""):
     """
     La DATABASE_URL que va al .env, armada a partir de los datos sueltos.
 
@@ -151,10 +168,19 @@ def armar_url(motor, servidor, puerto, base, usuario="", clave="",
     if usuario and not windows:
         credenciales = f"{urllib.parse.quote(usuario, safe='')}:" \
                        f"{urllib.parse.quote(clave, safe='')}@"
-    destino = f"{servidor}:{puerto}/{base}"
     if motor == "postgres":
+        destino = f"{servidor}:{puerto}/{base}"
         return f"postgresql://{credenciales}{destino}?schema={esquema or 'public'}"
-    return f"sqlserver://{credenciales}{destino}" + ("?trusted=yes" if windows else "")
+
+    # Con instancia con nombre no va el puerto: lo resuelve el SQL Browser, y ademas
+    # suele ser dinamico.
+    destino = f"{servidor}/{base}" if instancia else f"{servidor}:{puerto}/{base}"
+    opciones = []
+    if instancia:
+        opciones.append(f"instancia={urllib.parse.quote(instancia, safe='')}")
+    if windows:
+        opciones.append("trusted=yes")
+    return f"sqlserver://{credenciales}{destino}" + ("?" + "&".join(opciones) if opciones else "")
 
 
 def necesita_clave(url):

@@ -19,13 +19,35 @@ import sys
 import contribuyente
 import sistema
 
-# Al correr como .exe, sys.executable apunta al propio ejecutable; el proyecto
-# esta en la carpeta que lo contiene o en su padre.
+# Al correr como .exe, sys.executable apunta al propio ejecutable.
 if getattr(sys, "frozen", False):
     _AQUI = os.path.dirname(sys.executable)
 else:
     _AQUI = os.path.dirname(os.path.abspath(__file__))
-RAIZ = _AQUI if os.path.exists(os.path.join(_AQUI, "main.py")) else os.path.dirname(_AQUI)
+
+
+def _buscar_raiz(desde, niveles=4):
+    """
+    La carpeta del proyecto: la primera hacia arriba que tenga main.py.
+
+    Se sube varios niveles y no uno solo porque el ejecutable puede quedar a
+    distinta profundidad: suelto en la raiz, dentro de instalacion/, o —compilado
+    con --onedir— en su propia subcarpeta junto a las DLLs. Mirar un solo nivel
+    funcionaba para los dos primeros casos y fallaba en el tercero, buscando main.py
+    donde no esta y dando por bueno un proyecto que no existe.
+    """
+    actual = desde
+    for _ in range(niveles):
+        if os.path.exists(os.path.join(actual, "main.py")):
+            return actual
+        padre = os.path.dirname(actual)
+        if padre == actual:      # se llego a la raiz del disco
+            break
+        actual = padre
+    return os.path.dirname(desde)
+
+
+RAIZ = _buscar_raiz(_AQUI)
 
 
 # --- salida ----------------------------------------------------------------
@@ -106,9 +128,10 @@ def pedir_base_de_datos():
 
     while True:
         if pegar:
-            url = preguntar("DATABASE_URL", "", obligatorio=True)
+            url = contribuyente.limpiar_url(preguntar("DATABASE_URL", "", obligatorio=True))
         elif motor == "1":
-            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
+            servidor = preguntar("Servidor (Enter = esta misma PC)", "localhost",
+                                 obligatorio=True)
             puerto   = preguntar("Puerto", "5432")
             base     = preguntar("Base de datos", "postgres", obligatorio=True)
             usuario  = preguntar("Usuario", "", obligatorio=True)
@@ -117,8 +140,26 @@ def pedir_base_de_datos():
             url = contribuyente.armar_url("postgres", servidor, puerto, base,
                                           usuario, clave, esquema=esquema)
         else:
-            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
-            puerto   = preguntar("Puerto", "1433")
+            nota("         Enter si SQL Server esta en esta misma PC. Si esta en otra")
+            nota("         maquina, su IP o su nombre de red.")
+            servidor = preguntar("Servidor (Enter = esta misma PC)", "localhost",
+                                 obligatorio=True)
+
+            # SQL Server Express se instala como instancia con nombre (SQLEXPRESS),
+            # que no se direcciona por puerto: la resuelve el servicio SQL Browser.
+            # Es lo mas comun en negocios chicos, asi que se ofrecen las que haya.
+            halladas = sistema.instancias_sql()
+            if halladas:
+                nota(f"         Instancias en esta PC: {', '.join(halladas)}")
+            nota("         Dejar vacio si es la instancia predeterminada.")
+            instancia = preguntar("Instancia")
+            if instancia.upper() == "MSSQLSERVER":
+                # Es el nombre interno de la predeterminada: pasarlo como instancia
+                # con nombre no conecta.
+                nota("         (MSSQLSERVER es la predeterminada: se deja vacia)")
+                instancia = ""
+
+            puerto   = "1433" if instancia else preguntar("Puerto", "1433")
             base     = preguntar("Base de datos", "", obligatorio=True)
             # Con autenticacion de Windows el daemon entra con el usuario que corre
             # el proceso; sirve cuando el SQL Server esta en la misma PC.
@@ -128,7 +169,8 @@ def pedir_base_de_datos():
                 usuario = preguntar("Usuario de SQL Server", "sa", obligatorio=True)
                 clave   = preguntar_clave("Clave (no se ve al escribir)")
             url = contribuyente.armar_url("sqlserver", servidor, puerto, base,
-                                          usuario, clave, windows=windows)
+                                          usuario, clave, windows=windows,
+                                          instancia=instancia)
 
         nota(f"         {contribuyente.url_sin_clave(url)}")
         listo, mensaje = contribuyente.probar_base(url)

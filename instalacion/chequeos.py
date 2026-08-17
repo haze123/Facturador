@@ -288,9 +288,12 @@ r.addHandler(logging.NullHandler()); r.setLevel(logging.CRITICAL)
 con = None
 try:
     con = m.conectar_bd()
-    c = con.cursor()
-    c.execute('SELECT count(*) FROM public."Factura" WHERE enviado IS NOT TRUE')
-    print(json.dumps({"pendientes": c.fetchone()[0], "desfase": m.detectar_desfase_bd(con)}))
+    # Se le pregunta al adaptador del motor, no se arma SQL aca: escribir la consulta
+    # a mano la ataba a PostgreSQL, y en SQL Server fallaba con "Incorrect syntax
+    # near the keyword 'public'" — un error que no dice que el problema es que el
+    # diagnostico tiene su propia copia del SQL.
+    print(json.dumps({"pendientes": len(m._bd().pendientes(con)),
+                      "desfase": m.detectar_desfase_bd(con)}))
 except Exception as e:
     print(json.dumps({"error": "%s: %s" % (type(e).__name__, str(e).strip().splitlines()[0])}))
 finally:

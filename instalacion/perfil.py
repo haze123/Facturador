@@ -99,7 +99,11 @@ def leer(ruta):
             clave, valor = l.split("=", 1)
             # Se corta el comentario al final de la linea, salvo que sea parte de
             # una ruta o una URL, donde '#' no separa nada.
-            datos[clave.strip().lower()] = valor.strip()
+            valor = valor.strip()
+            # Quien copia la URL del .env de Prisma la trae entrecomillada.
+            if len(valor) > 1 and valor[0] == valor[-1] and valor[0] in ('"', "'"):
+                valor = valor[1:-1].strip()
+            datos[clave.strip().lower()] = valor
     return datos
 
 

@@ -128,9 +128,15 @@ Lo que cambia de un cliente a otro vive ahí adentro y en ningún otro lado: nom
 
 Para un cliente con su propio esquema se copia el adaptador más parecido y se le cambian las consultas. **No hay un mapeador genérico configurable, y es deliberado**: cinco archivos de sesenta líneas con su SQL a la vista se depuran leyéndolos; un mapeo indirecto hay que descifrarlo justo cuando algo está fallando.
 
+**Qué tiene que entregar la base para que el facturador funcione está en [`repositorio/README.md`](repositorio/README.md)**: las diez operaciones, las catorce claves de cada comprobante, cuáles son obligatorias y qué se calcula cuando faltan. Es el documento que se le pasa a un cliente cuyo sistema no es el nuestro.
+
 ## Instalación
 
-**En la PC de un cliente** no hace falta nada de este README: lo hace todo `FacturadorSetup.exe` —prerrequisitos, SFS, datos del contribuyente, certificado y procesos—. El procedimiento está en el manual en PDF; cómo está armado, en [`instalacion/README.md`](instalacion/README.md).
+**En la PC de un cliente** no hace falta nada de este README: lo hace todo el instalador —prerrequisitos, SFS, datos del contribuyente, certificado y procesos—. Se distribuye como `FacturadorSetup.zip` en las releases del repositorio; se descomprime y se ejecuta el `.exe` de adentro.
+
+Al terminar deja un `cliente.conf` con los datos de ese contribuyente, **sin ninguna clave**. Cuando algo cambia —vence el certificado, se mudan de local, migran la base— se edita ese archivo y la opción 5 del instalador aplica solo la diferencia, en vez de reconfigurar todo.
+
+El procedimiento paso a paso está en el manual en PDF; cómo está armado, en [`instalacion/README.md`](instalacion/README.md).
 
 **Para trabajar sobre el código**, en cambio:
 
@@ -138,7 +144,9 @@ Para un cliente con su propio esquema se copia el adaptador más parecido y se l
 pip install -r requirements.txt
 ```
 
-El daemon corre con el Python de la máquina, no con el que lleva adentro el instalador: PM2 lo arranca como `main.py` con `interpreter: "python"`. Por eso esas tres dependencias van instaladas en el sistema, y por eso el instalador lee `requirements.txt` en su primer paso.
+El daemon corre con el Python de la máquina, no con el que lleva adentro el instalador: PM2 lo arranca como `main.py` con `interpreter: "python"`. Por eso las dependencias van instaladas en el sistema, y por eso el instalador lee `requirements.txt` en su primer paso.
+
+Son cuatro: `python-dotenv` y `watchdog` siempre, y de los dos drivers de base —`psycopg2-binary` y `pyodbc`— cada instalación usa solo el de su motor. Se instalan los dos igual, que es más simple que preguntar antes de saber a qué base va a apuntar; el diagnóstico del instalador, en cambio, sí exige únicamente el que corresponde.
 
 ## Configuración
 
@@ -151,6 +159,7 @@ Un archivo `.env` en la raíz (no se versiona). Solo las cuatro primeras son obl
 #   postgresql://usuario:clave@host:5432/base?schema=public
 #   sqlserver://usuario:clave@host:1433/base
 #   sqlserver://host:1433/base?trusted=yes      (autenticación de Windows)
+#   sqlserver://host/base?instancia=SQLEXPRESS  (instancia con nombre: sin puerto)
 DATABASE_URL=postgresql://usuario:clave@host:5432/postgres?schema=public
 
 SFS_DATA_DIR=C:\SFS_v-2.1\sunat_archivos\sfs\DATA

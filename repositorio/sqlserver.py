@@ -70,8 +70,15 @@ def _cadena_odbc(url: str, timeout: int) -> str:
     if not base:
         raise RuntimeError("Falta el nombre de la base en DATABASE_URL (sqlserver://host/BASE)")
 
+    # Una instancia con nombre (SQL Server Express se instala como SQLEXPRESS) no
+    # se direcciona por puerto sino por nombre: el servicio SQL Browser resuelve el
+    # puerto, que ademas suele ser dinamico. Por eso van excluyentes: o instancia,
+    # o puerto.
     servidor = p.hostname or "localhost"
-    if p.port:
+    instancia = (opciones.get("instancia") or [""])[0].strip()
+    if instancia:
+        servidor = servidor + "\\" + instancia
+    elif p.port:
         servidor = f"{servidor},{p.port}"
 
     partes = [

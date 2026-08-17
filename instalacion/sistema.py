@@ -272,3 +272,32 @@ def _limpiar_data_de_ejemplo(ruta_sfs):
             except OSError:
                 pass
     return borrados
+
+
+def instancias_sql():
+    """
+    Nombres de las instancias de SQL Server instaladas en esta PC.
+
+    Sirve para no tener que adivinarlas: SQL Server Express se instala como
+    'SQLEXPRESS' y quien configura el daemon rara vez sabe eso de memoria. Lista
+    vacia si no hay ninguna o no se puede leer el registro.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return []
+    try:
+        clave = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL")
+    except OSError:
+        return []
+    nombres, i = [], 0
+    while True:
+        try:
+            nombre, _, _ = winreg.EnumValue(clave, i)
+        except OSError:
+            break
+        nombres.append(nombre)
+        i += 1
+    return nombres
