@@ -30,7 +30,13 @@ def main():
 
     comando = [
         sys.executable, "-m", "PyInstaller",
-        "--onefile",              # un solo archivo, sin carpeta de dependencias
+        # --onedir y no --onefile: el segundo mete todo comprimido en un unico .exe
+        # que al arrancar SE DESCOMPRIME SOLO en una carpeta temporal y corre desde
+        # ahi. Esa es la misma tecnica que usan los empaquetadores de malware, y los
+        # antivirus la marcan por heuristica sin mirar que hace el programa. Con
+        # --onedir el .exe queda con sus DLLs al lado y ese comportamiento desaparece.
+        # El costo es que se distribuye una carpeta en vez de un archivo suelto.
+        "--onedir",
         "--console",              # es un menu de consola, no una app grafica
         "--name", NOMBRE,
         "--distpath", AQUI,       # el .exe queda junto a los fuentes
@@ -63,11 +69,27 @@ def main():
     # Restos del proceso de compilacion.
     shutil.rmtree(os.path.join(AQUI, "_build"), ignore_errors=True)
 
-    exe = os.path.join(AQUI, f"{NOMBRE}.exe")
+    # Con --onedir el ejecutable queda dentro de su propia carpeta, junto a las DLLs.
+    carpeta = os.path.join(AQUI, NOMBRE)
+    exe = os.path.join(carpeta, f"{NOMBRE}.exe")
     if not os.path.exists(exe):
         print("\nNo se genero el ejecutable.")
         return 1
-    print(f"\nListo: {exe}  ({os.path.getsize(exe) / 1048576:.1f} MB)")
+
+    # Se distribuye comprimido: son cientos de archivos y bajarlos sueltos de una
+    # release no es practico.
+    zip_base = os.path.join(AQUI, NOMBRE)
+    if os.path.exists(zip_base + ".zip"):
+        os.remove(zip_base + ".zip")
+    shutil.make_archive(zip_base, "zip", AQUI, NOMBRE)
+
+    archivos = sum(len(fs) for _, _, fs in os.walk(carpeta))
+    total = sum(os.path.getsize(os.path.join(r, f))
+                for r, _, fs in os.walk(carpeta) for f in fs)
+    print(f"\nListo: {carpeta}")
+    print(f"       {total / 1048576:.1f} MB en {archivos} archivos")
+    print(f"       para distribuir: {zip_base}.zip "
+          f"({os.path.getsize(zip_base + '.zip') / 1048576:.1f} MB)")
     return 0
 
 

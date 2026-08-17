@@ -19,13 +19,35 @@ import sys
 import contribuyente
 import sistema
 
-# Al correr como .exe, sys.executable apunta al propio ejecutable; el proyecto
-# esta en la carpeta que lo contiene o en su padre.
+# Al correr como .exe, sys.executable apunta al propio ejecutable.
 if getattr(sys, "frozen", False):
     _AQUI = os.path.dirname(sys.executable)
 else:
     _AQUI = os.path.dirname(os.path.abspath(__file__))
-RAIZ = _AQUI if os.path.exists(os.path.join(_AQUI, "main.py")) else os.path.dirname(_AQUI)
+
+
+def _buscar_raiz(desde, niveles=4):
+    """
+    La carpeta del proyecto: la primera hacia arriba que tenga main.py.
+
+    Se sube varios niveles y no uno solo porque el ejecutable puede quedar a
+    distinta profundidad: suelto en la raiz, dentro de instalacion/, o —compilado
+    con --onedir— en su propia subcarpeta junto a las DLLs. Mirar un solo nivel
+    funcionaba para los dos primeros casos y fallaba en el tercero, buscando main.py
+    donde no esta y dando por bueno un proyecto que no existe.
+    """
+    actual = desde
+    for _ in range(niveles):
+        if os.path.exists(os.path.join(actual, "main.py")):
+            return actual
+        padre = os.path.dirname(actual)
+        if padre == actual:      # se llego a la raiz del disco
+            break
+        actual = padre
+    return os.path.dirname(desde)
+
+
+RAIZ = _buscar_raiz(_AQUI)
 
 
 # --- salida ----------------------------------------------------------------
