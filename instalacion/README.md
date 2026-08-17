@@ -31,6 +31,19 @@ Funciona porque el SFS tiene **tres endpoints independientes** —emisor, direcc
 
 Si el archivo no existe, la opción 4 lo genera con los datos que la PC ya tiene, listo para editar con el Bloc de notas.
 
+**Las claves se preguntan siempre, aparte del diff**, porque son lo único que la comparación no puede detectar: no están en el archivo y el SFS las guarda cifradas, así que no hay contra qué compararlas. Si un cliente renueva su clave SOL y no cambia ningún otro dato, el diff sale vacío — y sin ese paso no tendría por dónde actualizarla.
+
+```
+  Claves
+  ------
+       No se pueden comparar: el SFS las guarda cifradas y el archivo no
+       las lleva. Si alguna cambio, hay que decirlo aca.
+    1  Ninguna
+    2  La clave SOL
+    3  La contrasena del certificado
+    4  Las dos
+```
+
 **Las claves no van en el archivo.** Hoy la clave SOL y la del certificado se tipean una vez y el SFS las guarda cifradas: nunca tocan el disco en texto plano. Un `.txt` con la clave SOL en la PC del cliente es otra cosa — se copia, se manda por chat, queda en el Escritorio y sobrevive a que echen al empleado que lo tenía. Por eso el archivo trae la conexión a la base **sin contraseña**, y las dos claves del SFS no figuran en ningún campo.
 
 Dos detalles que costaron pensar:

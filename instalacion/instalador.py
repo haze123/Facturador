@@ -436,29 +436,51 @@ def actualizar_desde_archivo():
 
     env = chequeos._leer_env(RAIZ) or {}
     cambios = perfil.comparar(datos, previo, ruta_sfs, env.get("DATABASE_URL", ""))
-    if not cambios:
-        ok("no hay nada que cambiar: la instalacion ya coincide con el archivo")
-        return True
+    if cambios:
+        titulo("Cambios a aplicar")
+        for etiqueta, actual, nuevo, _ in cambios:
+            print(f"    {etiqueta:20} {actual or '(vacio)'}")
+            print(f"    {'':20} {C.CYAN}-> {nuevo}{C.FIN}")
 
-    titulo("Cambios a aplicar")
-    for etiqueta, actual, nuevo, _ in cambios:
-        print(f"    {etiqueta:20} {actual or '(vacio)'}")
-        print(f"    {'':20} {C.CYAN}-> {nuevo}{C.FIN}")
+        # Un RUC distinto no es un campo mas: es otro contribuyente. El certificado
+        # esta atado a el y el historial emitido pertenece al anterior.
+        if any(e == "RUC" for e, _, _, _ in cambios):
+            print()
+            aviso("EL RUC CAMBIA. Eso es otro contribuyente, no una correccion menor:")
+            nota("         el certificado esta atado al RUC y el historial de comprobantes")
+            nota("         emitidos pertenece al anterior. Si es una PC que pasa a otro")
+            nota("         cliente, corresponde la opcion 2, que limpia lo anterior.")
+            if not confirmar("Aplicar igual el cambio de RUC?"):
+                return False
+    else:
+        ok("el archivo coincide con lo instalado: ningun campo cambio")
 
-    # Un RUC distinto no es un campo mas: es otro contribuyente. El certificado esta
-    # atado a el y el historial emitido pertenece al anterior.
-    if any(e == "RUC" for e, _, _, _ in cambios):
-        print()
-        aviso("EL RUC CAMBIA. Eso es otro contribuyente, no una correccion menor:")
-        nota("         el certificado esta atado al RUC y el historial de comprobantes")
-        nota("         emitidos pertenece al anterior. Si es una PC que pasa a otro")
-        nota("         cliente, corresponde la opcion 2, que limpia lo anterior.")
-        if not confirmar("Aplicar igual el cambio de RUC?"):
-            return False
+    # Las claves se preguntan aparte y siempre, porque son lo unico que la
+    # comparacion NO puede detectar: no estan en el archivo y el SFS las guarda
+    # cifradas, asi que no hay contra que compararlas. Sin este paso, un cliente que
+    # solo cambio su clave SOL no tendria por donde actualizarla.
+    titulo("Claves")
+    nota("         No se pueden comparar: el SFS las guarda cifradas y el archivo no")
+    nota("         las lleva. Si alguna cambio, hay que decirlo aca.")
+    eleccion = elegir_opcion("Actualizar alguna clave", [
+        ("1", "Ninguna"),
+        ("2", "La clave SOL"),
+        ("3", "La contrasena del certificado"),
+        ("4", "Las dos"),
+    ])
 
     afectados = {endpoint for _, _, _, endpoint in cambios}
+    if eleccion in ("2", "4"):
+        afectados.add("emisor")
+    if eleccion in ("3", "4"):
+        afectados.add("certificado")
+
+    if not afectados:
+        ok("no hay nada que aplicar")
+        return True
+
     print()
-    if not confirmar(f"Aplicar {len(cambios)} cambio(s)?"):
+    if not confirmar("Aplicar?"):
         return False
 
     base_url = "http://localhost:9000"
@@ -473,11 +495,12 @@ def actualizar_desde_archivo():
         "ruta_certificado": datos["certificado"],
     }
 
-    # Cada clave se pide solo si su endpoint esta entre los que cambian.
+    # Cada clave se pide solo si su endpoint esta entre los afectados: porque algun
+    # campo suyo cambio, o porque se pidio actualizar esa clave.
     if "emisor" in afectados:
         titulo("Clave SOL")
-        nota("         El SFS la guarda cifrada y no se puede recuperar, asi que hay")
-        nota("         que volver a escribirla para tocar los datos del emisor.")
+        nota("         El endpoint del emisor la lleva siempre, y el SFS no la devuelve")
+        nota("         nunca: aunque no haya cambiado, hay que volver a escribirla.")
         datos_sfs["clave_sol"] = preguntar_clave("Clave SOL (no se ve al escribir)")
         if not datos_sfs["clave_sol"]:
             error("sin la clave SOL no se pueden grabar los datos del emisor")
