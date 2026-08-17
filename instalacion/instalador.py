@@ -130,7 +130,8 @@ def pedir_base_de_datos():
         if pegar:
             url = contribuyente.limpiar_url(preguntar("DATABASE_URL", "", obligatorio=True))
         elif motor == "1":
-            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
+            servidor = preguntar("Servidor (Enter = esta misma PC)", "localhost",
+                                 obligatorio=True)
             puerto   = preguntar("Puerto", "5432")
             base     = preguntar("Base de datos", "postgres", obligatorio=True)
             usuario  = preguntar("Usuario", "", obligatorio=True)
@@ -139,9 +140,10 @@ def pedir_base_de_datos():
             url = contribuyente.armar_url("postgres", servidor, puerto, base,
                                           usuario, clave, esquema=esquema)
         else:
-            nota("         El servidor es 'localhost' si SQL Server esta en esta misma")
-            nota("         PC, o la IP o el nombre de la maquina donde este.")
-            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
+            nota("         Enter si SQL Server esta en esta misma PC. Si esta en otra")
+            nota("         maquina, su IP o su nombre de red.")
+            servidor = preguntar("Servidor (Enter = esta misma PC)", "localhost",
+                                 obligatorio=True)
 
             # SQL Server Express se instala como instancia con nombre (SQLEXPRESS),
             # que no se direcciona por puerto: la resuelve el servicio SQL Browser.
