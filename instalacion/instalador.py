@@ -128,7 +128,7 @@ def pedir_base_de_datos():
 
     while True:
         if pegar:
-            url = preguntar("DATABASE_URL", "", obligatorio=True)
+            url = contribuyente.limpiar_url(preguntar("DATABASE_URL", "", obligatorio=True))
         elif motor == "1":
             servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
             puerto   = preguntar("Puerto", "5432")

@@ -133,6 +133,24 @@ def revisar_certificado(ruta, clave, ruc):
     return True, f"vigente hasta {vence:%Y-%m-%d}", vence
 
 
+def limpiar_url(texto):
+    """
+    Saca comillas y espacios de una URL pegada.
+
+    En el .env de Prisma la URL va entrecomillada, asi que copiarla de ahi y pegarla
+    trae las comillas puestas. Sin limpiarlas, urlsplit lee el esquema vacio y el
+    error resultante —"no se reconoce el motor"— manda a buscar el problema al lugar
+    equivocado.
+    """
+    limpio = (texto or "").strip()
+    for comilla in ('"', "'", "“", "”"):
+        if limpio.startswith(comilla):
+            limpio = limpio[1:]
+        if limpio.endswith(comilla):
+            limpio = limpio[:-1]
+    return limpio.strip()
+
+
 def url_sin_clave(url):
     """La URL con la contrasena tapada, para poder mostrarla en pantalla."""
     import re
