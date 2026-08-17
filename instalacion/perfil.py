@@ -18,8 +18,13 @@ import os
 #
 # El endpoint importa porque decide que clave hay que pedir: 'emisor' necesita la
 # clave SOL, 'certificado' la del certificado, y 'direccion' ninguna.
+#
+# El RUC NO esta en esta lista, y es a proposito: no es un dato actualizable sino la
+# identidad del contribuyente. Un RUC distinto es otro cliente, y cambiarlo desde aca
+# convertiria la PC de uno en la de otro sin limpiar el historial, el certificado ni
+# los correlativos del anterior. Para eso esta la opcion 2. Aca el RUC sirve de
+# control: identifica de quien es el archivo (ver verificar_identidad).
 CAMPOS = (
-    ("ruc",              "NUMRUC",   "RUC",              "emisor"),
     ("razon_social",     "RAZON",    "Razon social",     "emisor"),
     ("usuario_sol",      "USUSOL",   "Usuario SOL",      "emisor"),
     ("nombre_comercial", "NOMCOM",   "Nombre comercial", "direccion"),
@@ -42,7 +47,12 @@ PLANTILLA = """\
 # pide cuando hacen falta y el SFS las guarda cifradas. Poner una clave en un
 # archivo de texto es dejarla al alcance de cualquiera que use esa PC.
 
+# El RUC identifica de quien es este archivo. NO se puede cambiar desde aca: un RUC
+# distinto es otro contribuyente, y para eso esta la opcion 2 del instalador, que
+# ademas limpia el historial y el certificado del anterior. Si no coincide con el
+# que la PC tiene configurado, la actualizacion se rechaza.
 ruc              = {ruc}
+
 razon_social     = {razon_social}
 nombre_comercial = {nombre_comercial}
 usuario_sol      = {usuario_sol}
@@ -131,6 +141,24 @@ def validar(datos, validar_ruc=None):
     return problemas
 
 
+def verificar_identidad(datos, previo):
+    """
+    "" si el archivo es de este contribuyente; si no, el motivo.
+
+    Teniendo un archivo por cliente, nada impide abrir el equivocado: sin este
+    control, aplicarlo reconfiguraria la PC con los datos de otro y recien se
+    notaria cuando SUNAT rechazara los comprobantes por no coincidir el certificado.
+    """
+    del_archivo = (datos.get("ruc") or "").strip()
+    instalado = (previo.get("NUMRUC") or "").strip()
+    if not del_archivo:
+        return "el archivo no dice de que RUC es"
+    if instalado and del_archivo != instalado:
+        return (f"el archivo es del RUC {del_archivo} y esta PC tiene configurado el "
+                f"{instalado}")
+    return ""
+
+
 def _certificado_cambio(ruta_origen, ruta_sfs, nombre_instalado):
     """
     True si el .p12 del archivo es distinto del que ya esta en el SFS.
@@ -193,6 +221,9 @@ def _sin_credenciales(url):
 def desde_sfs(previo, ruta_sfs, url_actual=""):
     """Los datos actuales en formato de archivo, para poder exportarlos."""
     datos = {campo: previo.get(parametro, "") for campo, parametro, _, _ in CAMPOS}
+    # El RUC va aparte porque no esta en CAMPOS: no es actualizable, identifica el
+    # archivo. Sin el, lo exportado no pasaria su propio control de identidad.
+    datos["ruc"] = previo.get("NUMRUC", "")
     nombre = previo.get("NOMCERT", "")
     datos["certificado"] = (
         os.path.join(ruta_sfs, "sunat_archivos", "sfs", "CERT", nombre) if nombre else "")

@@ -438,6 +438,19 @@ def actualizar_desde_archivo():
         return False
     ok("archivo valido")
 
+    # El archivo tiene que ser de ESTE contribuyente. Teniendo uno por cliente, abrir
+    # el equivocado es cuestion de tiempo, y aplicarlo reconfiguraria la PC con los
+    # datos de otro sin limpiar nada: se notaria recien cuando SUNAT rechazara los
+    # comprobantes por no coincidir el certificado.
+    ajeno = perfil.verificar_identidad(datos, previo)
+    if ajeno:
+        error(ajeno)
+        nota("         Un RUC distinto es otro contribuyente. Si esta PC pasa a otro")
+        nota("         cliente, corresponde la opcion 2: ademas de cargar los datos")
+        nota("         nuevos, limpia el historial y el certificado del anterior.")
+        return False
+    ok(f"el archivo es del contribuyente instalado ({datos['ruc']})")
+
     env = chequeos._leer_env(RAIZ) or {}
     cambios = perfil.comparar(datos, previo, ruta_sfs, env.get("DATABASE_URL", ""))
     if cambios:
@@ -446,16 +459,6 @@ def actualizar_desde_archivo():
             print(f"    {etiqueta:20} {actual or '(vacio)'}")
             print(f"    {'':20} {C.CYAN}-> {nuevo}{C.FIN}")
 
-        # Un RUC distinto no es un campo mas: es otro contribuyente. El certificado
-        # esta atado a el y el historial emitido pertenece al anterior.
-        if any(e == "RUC" for e, _, _, _ in cambios):
-            print()
-            aviso("EL RUC CAMBIA. Eso es otro contribuyente, no una correccion menor:")
-            nota("         el certificado esta atado al RUC y el historial de comprobantes")
-            nota("         emitidos pertenece al anterior. Si es una PC que pasa a otro")
-            nota("         cliente, corresponde la opcion 2, que limpia lo anterior.")
-            if not confirmar("Aplicar igual el cambio de RUC?"):
-                return False
     else:
         ok("el archivo coincide con lo instalado: ningun campo cambio")
 
@@ -477,15 +480,6 @@ def actualizar_desde_archivo():
     if eleccion in ("2", "4"):
         afectados.add("emisor")
     if eleccion in ("3", "4"):
-        afectados.add("certificado")
-
-    # Un certificado esta emitido a nombre de un RUC. Si el RUC cambia, el que
-    # estaba instalado ya no sirve, asi que se fuerza el paso del certificado:
-    # revisar_certificado() comprueba que el titular sea el RUC nuevo y frena si
-    # se olvidaron de actualizar esa linea del archivo. Sin esto se aplicaria el
-    # RUC nuevo con el certificado del contribuyente anterior, y SUNAT rechazaria
-    # todo lo que se emitiera.
-    if any(e == "RUC" for e, _, _, _ in cambios):
         afectados.add("certificado")
 
     if not afectados:

@@ -51,10 +51,21 @@ Si el archivo no existe, la opción 5 lo genera con los datos que la PC ya tiene
 
 Cambiar de motor tambien entra por acá: se edita `base_datos` en el archivo y la opción 5 lo detecta como un cambio más. Usa la conexión que dice el archivo y pide **solo la contraseña** —lo único que el archivo no puede llevar—, la prueba antes de guardar, y si no conecta deja el `.env` como estaba en vez de dejarlo apuntando a una base a la que el daemon no llega.
 
-Dos detalles que costaron pensar:
+**El RUC no es un campo actualizable: es la identidad del archivo.** Está ahí, pero la opción 5 no lo aplica nunca — lo usa para comprobar que el archivo sea de este contribuyente y **rechaza el que no coincida**:
+
+```
+  [ERROR] el archivo es del RUC 20512345671 y esta PC tiene configurado el 20608699679
+          Un RUC distinto es otro contribuyente. Si esta PC pasa a otro
+          cliente, corresponde la opcion 2...
+```
+
+Sirve para dos cosas a la vez. Impide convertir la PC de un cliente en la de otro sin limpiar su historial, su certificado y sus correlativos —para eso está la opción 2—, y con un archivo por cliente atrapa el error de abrir el equivocado, que sin ese control se descubriría recién cuando SUNAT rechazara los comprobantes.
+
+Sí se pueden actualizar **razón social** y **nombre comercial**: una empresa puede cambiarlos conservando su RUC.
+
+Un detalle que costó pensar:
 
 - **El certificado se compara por contenido, no por nombre.** Uno renovado suele llamarse igual que el que vence; mirar el nombre diría "sin cambios" justo el día que hay que reemplazarlo.
-- **Cambiar el RUC no es un campo más.** Es otro contribuyente: el certificado está atado a él y el historial emitido pertenece al anterior. La opción 5 frena y pide confirmación explícita, y sugiere la opción 2, que sí limpia lo anterior. Además **arrastra el certificado aunque el archivo `.p12` no haya cambiado**: lo valida contra el RUC nuevo, que es lo que atrapa el caso de cambiar el RUC y olvidarse de actualizar esa línea — sin eso se emitiría con el certificado del contribuyente anterior y SUNAT rechazaría todo.
 
 ## La base de datos de cada cliente
 
