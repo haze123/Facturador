@@ -95,9 +95,9 @@ def pedir_base_de_datos():
         ("2", "SQL Server"),
     ])
 
-    pegar = motor == "1" and elegir_opcion("Como cargar los datos", [
-        ("1", "Pegar la DATABASE_URL de la aplicacion (la del .env de Prisma)"),
-        ("2", "Cargarlos uno por uno"),
+    pegar = motor == "1" and elegir_opcion("Como cargar la conexion", [
+        ("1", "Pegar la DATABASE_URL completa (la que ya usa la aplicacion)"),
+        ("2", "Escribir servidor, puerto, base, usuario y clave por separado"),
     ]) == "1"
 
     while True:
