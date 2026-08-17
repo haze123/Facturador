@@ -158,7 +158,7 @@ def url_sin_clave(url):
 
 
 def armar_url(motor, servidor, puerto, base, usuario="", clave="",
-              esquema="public", windows=False):
+              esquema="public", windows=False, instancia=""):
     """
     La DATABASE_URL que va al .env, armada a partir de los datos sueltos.
 
@@ -169,10 +169,19 @@ def armar_url(motor, servidor, puerto, base, usuario="", clave="",
     if usuario and not windows:
         credenciales = f"{urllib.parse.quote(usuario, safe='')}:" \
                        f"{urllib.parse.quote(clave, safe='')}@"
-    destino = f"{servidor}:{puerto}/{base}"
     if motor == "postgres":
+        destino = f"{servidor}:{puerto}/{base}"
         return f"postgresql://{credenciales}{destino}?schema={esquema or 'public'}"
-    return f"sqlserver://{credenciales}{destino}" + ("?trusted=yes" if windows else "")
+
+    # Con instancia con nombre no va el puerto: lo resuelve el SQL Browser, y ademas
+    # suele ser dinamico.
+    destino = f"{servidor}/{base}" if instancia else f"{servidor}:{puerto}/{base}"
+    opciones = []
+    if instancia:
+        opciones.append(f"instancia={urllib.parse.quote(instancia, safe='')}")
+    if windows:
+        opciones.append("trusted=yes")
+    return f"sqlserver://{credenciales}{destino}" + ("?" + "&".join(opciones) if opciones else "")
 
 
 def necesita_clave(url):

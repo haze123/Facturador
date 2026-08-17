@@ -71,7 +71,9 @@ Un detalle que costó pensar:
 
 ## La base de datos de cada cliente
 
-La opción 2 pregunta el motor —PostgreSQL o SQL Server— y pide los datos que correspondan: servidor, puerto, base, y usuario y clave o autenticación de Windows. Con eso arma la `DATABASE_URL`. Se pregunta por partes porque nadie recuerda la sintaxis de memoria y una URL mal escrita falla con un mensaje del driver que no dice cuál es el pedazo equivocado; igual se puede pegar entera, para el que ya la tiene.
+La opción 2 pregunta el motor —PostgreSQL o SQL Server— y pide los datos que correspondan: servidor, puerto, base, y usuario y clave o autenticación de Windows.
+
+Con SQL Server pregunta además la **instancia**, y ofrece las que encuentre en esa PC. Importa porque SQL Server Express —el gratuito, el más común en negocios chicos— se instala como instancia con nombre (`SERVIDOR\SQLEXPRESS`), y esas **no se direccionan por puerto**: lo resuelve el servicio SQL Browser y suele ser dinámico. Sin eso, un cliente con Express no se podía configurar. Con eso arma la `DATABASE_URL`. Se pregunta por partes porque nadie recuerda la sintaxis de memoria y una URL mal escrita falla con un mensaje del driver que no dice cuál es el pedazo equivocado; igual se puede pegar entera, para el que ya la tiene.
 
 La conexión se prueba antes de guardar nada, **con el mismo código que después usa el daemon** (`repositorio/`). Antes esto duplicaba la conexión de psycopg2: solo sabía de PostgreSQL y podía quedar desincronizado del daemon sin que nadie lo notara. Ahora, si el instalador dice que conecta, el daemon conecta.
 

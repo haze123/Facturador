@@ -139,8 +139,25 @@ def pedir_base_de_datos():
             url = contribuyente.armar_url("postgres", servidor, puerto, base,
                                           usuario, clave, esquema=esquema)
         else:
+            nota("         El servidor es 'localhost' si SQL Server esta en esta misma")
+            nota("         PC, o la IP o el nombre de la maquina donde este.")
             servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
-            puerto   = preguntar("Puerto", "1433")
+
+            # SQL Server Express se instala como instancia con nombre (SQLEXPRESS),
+            # que no se direcciona por puerto: la resuelve el servicio SQL Browser.
+            # Es lo mas comun en negocios chicos, asi que se ofrecen las que haya.
+            halladas = sistema.instancias_sql()
+            if halladas:
+                nota(f"         Instancias en esta PC: {', '.join(halladas)}")
+            nota("         Dejar vacio si es la instancia predeterminada.")
+            instancia = preguntar("Instancia")
+            if instancia.upper() == "MSSQLSERVER":
+                # Es el nombre interno de la predeterminada: pasarlo como instancia
+                # con nombre no conecta.
+                nota("         (MSSQLSERVER es la predeterminada: se deja vacia)")
+                instancia = ""
+
+            puerto   = "1433" if instancia else preguntar("Puerto", "1433")
             base     = preguntar("Base de datos", "", obligatorio=True)
             # Con autenticacion de Windows el daemon entra con el usuario que corre
             # el proceso; sirve cuando el SQL Server esta en la misma PC.
@@ -150,7 +167,8 @@ def pedir_base_de_datos():
                 usuario = preguntar("Usuario de SQL Server", "sa", obligatorio=True)
                 clave   = preguntar_clave("Clave (no se ve al escribir)")
             url = contribuyente.armar_url("sqlserver", servidor, puerto, base,
-                                          usuario, clave, windows=windows)
+                                          usuario, clave, windows=windows,
+                                          instancia=instancia)
 
         nota(f"         {contribuyente.url_sin_clave(url)}")
         listo, mensaje = contribuyente.probar_base(url)
