@@ -352,6 +352,25 @@ def configurar_cliente():
         ok(".env escrito")
         aviso("no se pudo restringir su acceso; lleva claves en texto plano")
 
+    # El archivo del cliente se genera aca y no despues: en este punto estan todos
+    # los datos recien tipeados. Sin esto habria que volver a juntarlos a mano la
+    # primera vez que haga falta actualizar algo (opcion 5), o al reinstalar tras un
+    # formateo. No lleva ninguna clave.
+    import perfil
+    ruta_perfil = perfil.escribir(os.path.join(RAIZ, "cliente.conf"), {
+        "ruc": datos["ruc"], "razon_social": datos["razon"],
+        "nombre_comercial": datos["comercial"], "usuario_sol": datos["usuario_sol"],
+        "ubigeo": datos["ubigeo"], "direccion": datos["direccion"],
+        "departamento": datos["departamento"], "provincia": datos["provincia"],
+        "distrito": datos["distrito"], "urbanizacion": datos.get("urbanizacion", ""),
+        "certificado": datos["ruta_certificado"],
+        "base_datos": perfil.url_para_archivo(datos["database_url"]),
+        "ruta_sfs": ruta_sfs,
+    })
+    ok(f"datos del cliente guardados en {os.path.basename(ruta_perfil)}")
+    nota("         Sirve para actualizar despues (opcion 5) sin volver a cargar todo.")
+    nota("         No lleva claves: conviene guardar una copia fuera de esta PC.")
+
     sistema.correr(["pm2", "start", config])
     sistema.correr(["pm2", "save"])
     codigo, _ = sistema.correr(["pm2-startup", "install"], timeout=120)

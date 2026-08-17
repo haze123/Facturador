@@ -206,6 +206,27 @@ def comparar(datos, previo, ruta_sfs, url_actual=""):
     return cambios
 
 
+def url_para_archivo(url):
+    """
+    La URL sin la contrasena, conservando el usuario.
+
+    Es la forma en que la conexion va al archivo: el servidor, el puerto, la base y
+    el usuario son datos de configuracion, la contrasena no. Distinto de
+    _sin_credenciales(), que saca tambien el usuario porque solo sirve para comparar
+    destinos.
+    """
+    import urllib.parse
+    p = urllib.parse.urlsplit(url or "")
+    if not p.hostname:
+        return url or ""
+    destino = p.hostname
+    if p.port:
+        destino += f":{p.port}"
+    if p.username:
+        destino = f"{urllib.parse.quote(p.username, safe='')}@{destino}"
+    return urllib.parse.urlunsplit((p.scheme, destino, p.path, p.query, p.fragment))
+
+
 def _sin_credenciales(url):
     """La URL sin usuario ni clave, para comparar solo el destino."""
     import urllib.parse
@@ -227,6 +248,6 @@ def desde_sfs(previo, ruta_sfs, url_actual=""):
     nombre = previo.get("NOMCERT", "")
     datos["certificado"] = (
         os.path.join(ruta_sfs, "sunat_archivos", "sfs", "CERT", nombre) if nombre else "")
-    datos["base_datos"] = _sin_credenciales(url_actual)
+    datos["base_datos"] = url_para_archivo(url_actual)
     datos["ruta_sfs"] = ruta_sfs
     return datos

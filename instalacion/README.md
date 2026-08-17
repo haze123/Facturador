@@ -32,7 +32,9 @@ Para eso está la **opción 5**: un archivo de texto por cliente con sus datos, 
 
 Funciona porque el SFS tiene **tres endpoints independientes** —emisor, dirección y certificado—, así que se llama únicamente al que corresponde. Y de ahí sale lo mejor: **cada clave se pide solo si su endpoint cambió**. Mover el distrito no pide ninguna; renovar el certificado pide la del certificado y nada más.
 
-Si el archivo no existe, la opción 5 lo genera con los datos que la PC ya tiene, listo para editar con el Bloc de notas.
+**El archivo lo crea la opción 2 al terminar de configurar el cliente**, y no se descarga de ningún lado: lleva el RUC, la dirección fiscal y la ruta al certificado de un cliente concreto, así que no puede vivir en el repositorio (está en el `.gitignore`). Generarlo ahí es gratis —los catorce datos acaban de tipearse— y evita tener que juntarlos otra vez el día que haya que actualizar algo.
+
+Para las PC configuradas antes de que esto existiera, la opción 5 lo genera a partir de lo que la máquina ya tiene.
 
 **Las claves se preguntan siempre, aparte del diff**, porque son lo único que la comparación no puede detectar: no están en el archivo y el SFS las guarda cifradas, así que no hay contra qué compararlas. Si un cliente renueva su clave SOL y no cambia ningún otro dato, el diff sale vacío — y sin ese paso no tendría por dónde actualizarla.
 
