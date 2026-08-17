@@ -66,6 +66,68 @@ def confirmar(pregunta):
     return input(f"  {pregunta} (si/no): ").strip().lower() in ("si", "s", "sí")
 
 
+def elegir_opcion(etiqueta, opciones, por_defecto="1"):
+    """Menu corto de una sola tecla. Devuelve la clave elegida."""
+    for clave, texto in opciones:
+        print(f"    {clave}  {texto}")
+    while True:
+        r = input(f"  {etiqueta} [{por_defecto}]: ").strip() or por_defecto
+        if r in dict(opciones):
+            return r
+        print(f"    {C.AMAR}(elegir una de las opciones){C.FIN}")
+
+
+def pedir_base_de_datos():
+    """
+    Los datos de conexion segun el motor. Devuelve la DATABASE_URL, o "" si se cancela.
+
+    Se pregunta por partes en vez de pedir la URL entera porque nadie recuerda la
+    sintaxis de memoria, y una URL mal escrita falla con un mensaje del driver que no
+    dice cual es el pedazo equivocado. Igual se deja pegarla completa: el que ya la
+    tiene —la misma que usa la aplicacion— no tiene por que desarmarla.
+    """
+    motor = elegir_opcion("Motor", [
+        ("1", "PostgreSQL"),
+        ("2", "SQL Server"),
+        ("3", "Pegar la DATABASE_URL completa"),
+    ])
+
+    while True:
+        if motor == "3":
+            url = preguntar("DATABASE_URL", "", obligatorio=True)
+        elif motor == "1":
+            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
+            puerto   = preguntar("Puerto", "5432")
+            base     = preguntar("Base de datos", "postgres", obligatorio=True)
+            usuario  = preguntar("Usuario", "", obligatorio=True)
+            clave    = preguntar_clave("Clave (no se ve al escribir)")
+            esquema  = preguntar("Schema", "public")
+            url = contribuyente.armar_url("postgres", servidor, puerto, base,
+                                          usuario, clave, esquema=esquema)
+        else:
+            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
+            puerto   = preguntar("Puerto", "1433")
+            base     = preguntar("Base de datos", "", obligatorio=True)
+            # Con autenticacion de Windows el daemon entra con el usuario que corre
+            # el proceso; sirve cuando el SQL Server esta en la misma PC.
+            windows  = confirmar("Usar autenticacion de Windows?")
+            usuario = clave = ""
+            if not windows:
+                usuario = preguntar("Usuario de SQL Server", "sa", obligatorio=True)
+                clave   = preguntar_clave("Clave (no se ve al escribir)")
+            url = contribuyente.armar_url("sqlserver", servidor, puerto, base,
+                                          usuario, clave, windows=windows)
+
+        nota(f"         {contribuyente.url_sin_clave(url)}")
+        listo, mensaje = contribuyente.probar_base(url)
+        if listo:
+            ok(mensaje)
+            return url
+        error(f"no se pudo conectar: {mensaje}")
+        if not confirmar("Volver a intentar?"):
+            return ""
+
+
 def pausa():
     input(f"\n  {C.GRIS}Enter para volver al menu...{C.FIN}")
 
@@ -218,15 +280,9 @@ def configurar_cliente():
     (ok if valido else aviso)(f"certificado: {mensaje}")
 
     titulo("4. Base de datos de la aplicacion")
-    while True:
-        db_url = preguntar("DATABASE_URL", "", obligatorio=True)
-        listo, mensaje = contribuyente.probar_base(db_url)
-        if listo:
-            ok(mensaje)
-            break
-        error(f"no se pudo conectar: {mensaje}")
-        if not confirmar("Volver a intentar?"):
-            return False
+    db_url = pedir_base_de_datos()
+    if not db_url:
+        return False
 
     datos = {
         "ruc": ruc, "razon": razon, "comercial": comercial,

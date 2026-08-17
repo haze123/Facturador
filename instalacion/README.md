@@ -13,6 +13,12 @@ Un solo ejecutable con menú, `FacturadorSetup.exe`, que lleva adentro su propio
 
 Las cuatro opciones están separadas a propósito: cuando a un cliente le vence el certificado —que pasa— no hay que reinstalar nada, se corre solo la opción 2.
 
+## La base de datos de cada cliente
+
+La opción 2 pregunta el motor —PostgreSQL o SQL Server— y pide los datos que correspondan: servidor, puerto, base, y usuario y clave o autenticación de Windows. Con eso arma la `DATABASE_URL`. Se pregunta por partes porque nadie recuerda la sintaxis de memoria y una URL mal escrita falla con un mensaje del driver que no dice cuál es el pedazo equivocado; igual se puede pegar entera, para el que ya la tiene.
+
+La conexión se prueba antes de guardar nada, **con el mismo código que después usa el daemon** (`repositorio/`). Antes esto duplicaba la conexión de psycopg2: solo sabía de PostgreSQL y podía quedar desincronizado del daemon sin que nadie lo notara. Ahora, si el instalador dice que conecta, el daemon conecta.
+
 ## Lo que el instalador no hace, y por qué
 
 **No trae el certificado.** Es la clave privada con la que se firman los comprobantes: copiarlo entre clientes sería darle a uno la capacidad de facturar a nombre de otro. Lo aporta cada cliente al instalar.

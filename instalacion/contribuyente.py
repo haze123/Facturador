@@ -133,20 +133,54 @@ def revisar_certificado(ruta, clave, ruc):
     return True, f"vigente hasta {vence:%Y-%m-%d}", vence
 
 
+def url_sin_clave(url):
+    """La URL con la contrasena tapada, para poder mostrarla en pantalla."""
+    import re
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", url or "") or "(sin configurar)"
+
+
+def armar_url(motor, servidor, puerto, base, usuario="", clave="",
+              esquema="public", windows=False):
+    """
+    La DATABASE_URL que va al .env, armada a partir de los datos sueltos.
+
+    La clave se codifica: una contrasena con '@' o '/' partiria la URL en el lugar
+    equivocado y el daemon terminaria conectando a otro servidor, o a ninguno.
+    """
+    credenciales = ""
+    if usuario and not windows:
+        credenciales = f"{urllib.parse.quote(usuario, safe='')}:" \
+                       f"{urllib.parse.quote(clave, safe='')}@"
+    destino = f"{servidor}:{puerto}/{base}"
+    if motor == "postgres":
+        return f"postgresql://{credenciales}{destino}?schema={esquema or 'public'}"
+    return f"sqlserver://{credenciales}{destino}" + ("?trusted=yes" if windows else "")
+
+
 def probar_base(url):
-    """(ok, mensaje) conectando con la misma logica que usa el daemon."""
+    """
+    (ok, mensaje) conectando con el MISMO codigo que usa el daemon.
+
+    Antes esto duplicaba la conexion de psycopg2, asi que solo sabia de PostgreSQL y
+    podia quedar desincronizado del daemon sin que nadie lo notara. Ahora usa el
+    adaptador que corresponda al motor: si el instalador dice que conecta, el daemon
+    conecta.
+    """
     try:
-        import psycopg2
+        import repositorio
     except ImportError:
-        return False, "falta psycopg2 (correr primero la instalacion del entorno)"
-    p = urllib.parse.urlsplit(url)
-    consulta = urllib.parse.parse_qs(p.query)
-    esquema = (consulta.get("schema") or ["public"])[0]
-    limpia = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+        return False, "no se encontro el paquete repositorio/ del daemon"
     try:
-        con = psycopg2.connect(limpia, connect_timeout=10, options=f"-c search_path={esquema}")
+        adaptador = repositorio.elegir(url)
+    except RuntimeError as e:
+        return False, str(e)
+    except ImportError as e:
+        # Falta el driver del motor elegido (psycopg2 o pyodbc).
+        return False, f"falta el driver de ese motor: {e}"
+    try:
+        con = adaptador.conectar(url, 10)
         con.close()
-        return True, "conexion verificada"
+        return True, f"conexion verificada ({repositorio.motor_de(url)})"
     except Exception as e:
         return False, str(e).strip().splitlines()[0]
 

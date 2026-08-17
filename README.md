@@ -118,7 +118,15 @@ SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una v
 
 ## Requisitos
 
-Python 3.10+, PostgreSQL accesible, SFS v2.1 corriendo localmente y [PM2](https://pm2.keymetrics.io/) (opcional, para gestionar el proceso).
+Python 3.10+, la base de la aplicación accesible (PostgreSQL o SQL Server), SFS v2.1 corriendo localmente y [PM2](https://pm2.keymetrics.io/) (opcional, para gestionar el proceso).
+
+## De dónde salen los comprobantes
+
+El daemon no sabe con qué base está hablando. Pide siempre las mismas diez operaciones —los pendientes, el receptor, los ítems, marcar enviado— y recibe diccionarios con el mismo vocabulario, venga de donde venga. Cada motor tiene su adaptador en [`repositorio/`](repositorio/), elegido por el esquema de `DATABASE_URL`.
+
+Lo que cambia de un cliente a otro vive ahí adentro y en ningún otro lado: nombres de tablas y columnas, y las diferencias de dialecto. Entre PostgreSQL y SQL Server son cuatro: los marcadores (`%s` contra `?`), el booleano (`enviado` es `BIT`, así que "no enviado" es `= 0 OR IS NULL`), el `ANY(lista)` del cierre de resúmenes —que en SQL Server hay que armar como `IN (?,?,…)`— y el `NULLS LAST`, que se suple con un `CASE`.
+
+Para un cliente con su propio esquema se copia el adaptador más parecido y se le cambian las consultas. **No hay un mapeador genérico configurable, y es deliberado**: cinco archivos de sesenta líneas con su SQL a la vista se depuran leyéndolos; un mapeo indirecto hay que descifrarlo justo cuando algo está fallando.
 
 ## Instalación
 
@@ -137,8 +145,12 @@ El daemon corre con el Python de la máquina, no con el que lleva adentro el ins
 Un archivo `.env` en la raíz (no se versiona). Solo las cuatro primeras son obligatorias; el resto tiene valor por defecto.
 
 ```env
-# Base de la aplicación. La misma DATABASE_URL que usa el sistema: los
-# parámetros de Prisma (?schema=...) se traducen solos.
+# Base de la aplicación. El motor sale del esquema de la URL —no hay una segunda
+# variable que pueda quedar en desacuerdo con esta— y los parámetros de Prisma
+# (?schema=...) se traducen solos.
+#   postgresql://usuario:clave@host:5432/base?schema=public
+#   sqlserver://usuario:clave@host:1433/base
+#   sqlserver://host:1433/base?trusted=yes      (autenticación de Windows)
 DATABASE_URL=postgresql://usuario:clave@host:5432/postgres?schema=public
 
 SFS_DATA_DIR=C:\SFS_v-2.1\sunat_archivos\sfs\DATA
