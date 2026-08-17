@@ -157,6 +157,36 @@ def armar_url(motor, servidor, puerto, base, usuario="", clave="",
     return f"sqlserver://{credenciales}{destino}" + ("?trusted=yes" if windows else "")
 
 
+def necesita_clave(url):
+    """
+    True si la URL trae usuario pero no contrasena.
+
+    Es el caso normal de la que viene en el archivo del cliente: se guarda sin clave
+    a proposito. Con autenticacion de Windows no hay usuario y no falta nada.
+    """
+    p = urllib.parse.urlsplit(url or "")
+    return bool(p.username) and not p.password
+
+
+def con_clave(url, clave):
+    """La misma URL con la contrasena puesta, codificada."""
+    p = urllib.parse.urlsplit(url)
+    if not p.username or p.password:
+        return url
+    credenciales = (f"{urllib.parse.quote(p.username, safe='')}:"
+                    f"{urllib.parse.quote(clave, safe='')}")
+    destino = p.hostname or ""
+    if p.port:
+        destino += f":{p.port}"
+    return urllib.parse.urlunsplit(
+        (p.scheme, f"{credenciales}@{destino}", p.path, p.query, p.fragment))
+
+
+def usuario_de(url):
+    """El usuario de la URL, para poder nombrarlo al pedir su clave."""
+    return urllib.parse.unquote(urllib.parse.urlsplit(url or "").username or "")
+
+
 def probar_base(url):
     """
     (ok, mensaje) conectando con el MISMO codigo que usa el daemon.

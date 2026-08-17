@@ -519,10 +519,27 @@ def actualizar_desde_archivo():
 
     if "base" in afectados:
         titulo("Base de datos")
-        nota("         El archivo trae la conexion sin la clave.")
-        db_url = pedir_base_de_datos()
-        if not db_url:
-            return False
+        # Se usa la conexion del archivo —para eso esta— y solo se pide lo unico que
+        # el archivo no puede llevar: la contrasena. Volver a preguntar servidor,
+        # puerto y base seria pedir de nuevo lo que ya esta escrito ahi.
+        db_url = datos["base_datos"]
+        if contribuyente.necesita_clave(db_url):
+            usuario = contribuyente.usuario_de(db_url)
+            nota("         El archivo trae la conexion sin la clave, como corresponde.")
+            db_url = contribuyente.con_clave(
+                db_url, preguntar_clave(f"Clave de '{usuario}' (no se ve al escribir)"))
+        nota(f"         {contribuyente.url_sin_clave(db_url)}")
+
+        listo, mensaje = contribuyente.probar_base(db_url)
+        if listo:
+            ok(mensaje)
+        else:
+            error(f"no se pudo conectar: {mensaje}")
+            if not confirmar("Cargar la conexion a mano?"):
+                return False
+            db_url = pedir_base_de_datos()
+            if not db_url:
+                return False
         # Solo la linea de DATABASE_URL: rehacer el .env entero borraria SOL_CLAVE,
         # que no se puede recuperar de ningun lado.
         respaldo, _ = contribuyente.actualizar_env(RAIZ, {"DATABASE_URL": db_url})

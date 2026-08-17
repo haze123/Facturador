@@ -46,6 +46,8 @@ Si el archivo no existe, la opción 4 lo genera con los datos que la PC ya tiene
 
 **Las claves no van en el archivo.** Hoy la clave SOL y la del certificado se tipean una vez y el SFS las guarda cifradas: nunca tocan el disco en texto plano. Un `.txt` con la clave SOL en la PC del cliente es otra cosa — se copia, se manda por chat, queda en el Escritorio y sobrevive a que echen al empleado que lo tenía. Por eso el archivo trae la conexión a la base **sin contraseña**, y las dos claves del SFS no figuran en ningún campo.
 
+Cambiar de motor tambien entra por acá: se edita `base_datos` en el archivo y la opción 4 lo detecta como un cambio más. Usa la conexión que dice el archivo y pide **solo la contraseña** —lo único que el archivo no puede llevar—, la prueba antes de guardar, y si no conecta deja el `.env` como estaba en vez de dejarlo apuntando a una base a la que el daemon no llega.
+
 Dos detalles que costaron pensar:
 
 - **El certificado se compara por contenido, no por nombre.** Uno renovado suele llamarse igual que el que vence; mirar el nombre diría "sin cambios" justo el día que hay que reemplazarlo.
