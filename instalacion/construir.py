@@ -45,6 +45,7 @@ def main():
         "--hidden-import", "sistema",
         "--hidden-import", "contribuyente",
         "--hidden-import", "chequeos",
+        "--hidden-import", "perfil",
         # Los adaptadores se eligen en tiempo de ejecucion segun DATABASE_URL, asi
         # que hay que nombrarlos: si falta uno, ese motor no se puede ni probar.
         "--hidden-import", "repositorio",

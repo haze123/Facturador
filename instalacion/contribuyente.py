@@ -235,11 +235,8 @@ def esperar_sfs(base_url, segundos=90, avisar=print):
     return False
 
 
-def cargar_en_sfs(base_url, datos, avisar=print):
-    """
-    Manda los datos a los tres endpoints del SFS. Devuelve (ok, mensaje_error).
-    Se corta en el primero que falle para no dejar una configuracion a medias.
-    """
+def cargar_emisor(base_url, datos, avisar=print):
+    """RUC, razon social y credenciales SOL. Necesita la clave SOL."""
     # cmbFuncionamiento='02' y temporizadores vacios: el SFS NO debe correr sus
     # propios jobs de generar/enviar, porque harian por su cuenta lo mismo que el
     # daemon hace por REST y competirian por los mismos documentos.
@@ -260,7 +257,11 @@ def cargar_en_sfs(base_url, datos, avisar=print):
     if r.get("validacion") != "EXITO":
         return False, f"el SFS rechazo los datos del emisor: {_motivo(r)}"
     avisar("    emisor y credenciales SOL cargados (el SFS encripta las claves)")
+    return True, ""
 
+
+def cargar_direccion(base_url, datos, avisar=print):
+    """Nombre comercial y direccion fiscal. No lleva ninguna clave."""
     r = _post_sfs(base_url, "GrabarOtrosParametros.htm", {
         "txtNombreComercial": datos["comercial"],
         "txtUbigeo": datos["ubigeo"],
@@ -273,11 +274,15 @@ def cargar_en_sfs(base_url, datos, avisar=print):
     if r.get("validacion") != "EXITO":
         return False, f"el SFS rechazo la direccion: {_motivo(r)}"
     avisar("    direccion fiscal cargada")
+    return True, ""
 
+
+def cargar_certificado(base_url, datos, avisar=print):
+    """Importa el .p12. Necesita la contrasena del certificado."""
     # El SFS NO usa la ruta que se le pasa: arma la suya pegando su carpeta CERT
     # con lo que reciba en 'nombreCertificado' (verificado en el bytecode de
     # importarCertificado). Mandarle una ruta completa produce algo como
-    # "...\CERT\C:\otra\ruta\cert.p12", que no existe, y el SFS solo responde
+    # "...CERT + C:/otra/ruta/cert.p12", que no existe, y el SFS solo responde
     # "el certificado no fue creado" sin decir que el problema es la ruta.
     # Asi que el archivo se copia a CERT y se le manda unicamente el nombre.
     nombre = _copiar_a_cert(datos["ruta_sfs"], datos["ruta_certificado"])
@@ -288,6 +293,21 @@ def cargar_en_sfs(base_url, datos, avisar=print):
     if r.get("validacion") != "EXITO":
         return False, f"el SFS rechazo el certificado: {_motivo(r)}"
     avisar(f"    certificado importado ({nombre})")
+    return True, ""
+
+
+def cargar_en_sfs(base_url, datos, avisar=print):
+    """
+    Los tres endpoints, en orden. Devuelve (ok, mensaje_error).
+
+    Se corta en el primero que falle para no dejar una configuracion a medias. Son
+    independientes entre si, y por eso una reconfiguracion puede llamar solo al que
+    corresponde en vez de rehacer todo (ver perfil.py).
+    """
+    for cargar in (cargar_emisor, cargar_direccion, cargar_certificado):
+        listo, error = cargar(base_url, datos, avisar)
+        if not listo:
+            return False, error
     return True, ""
 
 
@@ -404,6 +424,47 @@ module.exports = {
     with open(destino, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(contenido)
     return destino
+
+
+def actualizar_env(raiz, cambios):
+    """
+    Cambia solo las claves indicadas del .env, dejando el resto tal cual.
+
+    Hace falta porque escribir_env() rehace el archivo entero: usarlo para cambiar
+    un solo dato borraria SOL_CLAVE —que no se puede recuperar de ningun lado— sin
+    que nadie lo note hasta que ningun resumen diario vuelva a cerrarse.
+
+    Devuelve (ruta_respaldo, claves_agregadas).
+    """
+    destino = os.path.join(raiz, ".env")
+    if not os.path.exists(destino):
+        return None, []
+
+    with open(destino, encoding="utf-8-sig", errors="replace") as fh:
+        lineas = fh.read().splitlines()
+
+    pendientes = dict(cambios)
+    salida = []
+    for linea in lineas:
+        limpia = linea.strip()
+        if limpia and not limpia.startswith("#") and "=" in limpia:
+            clave = limpia.split("=", 1)[0].strip()
+            if clave in pendientes:
+                salida.append(f"{clave}={pendientes.pop(clave)}")
+                continue
+        salida.append(linea)
+
+    # Lo que no estaba en el archivo se agrega al final, para no perderlo.
+    agregadas = list(pendientes)
+    for clave, valor in pendientes.items():
+        salida.append(f"{clave}={valor}")
+
+    respaldo = f"{destino}.bak-{datetime.now():%Y%m%d%H%M%S}"
+    os.replace(destino, respaldo)
+    with open(destino, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(salida) + "\n")
+    _restringir_permisos(destino)
+    return respaldo, agregadas
 
 
 def escribir_env(raiz, datos, ruta_sfs):

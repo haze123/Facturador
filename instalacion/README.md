@@ -6,12 +6,37 @@ Un solo ejecutable con menú, `FacturadorSetup.exe`, que lleva adentro su propio
    1  Instalar el entorno (prerrequisitos, PM2, SFS)
    2  Configurar un cliente
    3  Verificar la instalacion
-   4  Pasar a produccion
+   4  Actualizar desde el archivo del cliente
+   5  Pasar a produccion
 ```
 
 **El procedimiento paso a paso está en el manual en PDF**, que se distribuye aparte del repositorio. Este documento cubre lo demás: por qué el instalador está armado así y qué hacer cuando algo se sale del camino.
 
 Las cuatro opciones están separadas a propósito: cuando a un cliente le vence el certificado —que pasa— no hay que reinstalar nada, se corre solo la opción 2.
+
+## El archivo de cada cliente
+
+Configurar un cliente de cero (opción 2) pide catorce datos. Un mes después, cuando vence el certificado o corrigen el distrito, volver a recorrer todo es absurdo — y encima obliga a retipear la clave SOL, que no tiene nada que ver con lo que cambió.
+
+Para eso está la **opción 4**: un archivo de texto por cliente con sus datos, que el instalador compara contra lo instalado y aplica solo la diferencia.
+
+```
+  Distrito             LOS OLIVOS
+                       -> SURQUILLO
+
+  1 cambio(s). Aplicar? (si/no):
+```
+
+Funciona porque el SFS tiene **tres endpoints independientes** —emisor, dirección y certificado—, así que se llama únicamente al que corresponde. Y de ahí sale lo mejor: **cada clave se pide solo si su endpoint cambió**. Mover el distrito no pide ninguna; renovar el certificado pide la del certificado y nada más.
+
+Si el archivo no existe, la opción 4 lo genera con los datos que la PC ya tiene, listo para editar con el Bloc de notas.
+
+**Las claves no van en el archivo.** Hoy la clave SOL y la del certificado se tipean una vez y el SFS las guarda cifradas: nunca tocan el disco en texto plano. Un `.txt` con la clave SOL en la PC del cliente es otra cosa — se copia, se manda por chat, queda en el Escritorio y sobrevive a que echen al empleado que lo tenía. Por eso el archivo trae la conexión a la base **sin contraseña**, y las dos claves del SFS no figuran en ningún campo.
+
+Dos detalles que costaron pensar:
+
+- **El certificado se compara por contenido, no por nombre.** Uno renovado suele llamarse igual que el que vence; mirar el nombre diría "sin cambios" justo el día que hay que reemplazarlo.
+- **Cambiar el RUC no es un campo más.** Es otro contribuyente: el certificado está atado a él y el historial emitido pertenece al anterior. La opción 4 frena y pide confirmación explícita, y sugiere la opción 2, que sí limpia lo anterior.
 
 ## La base de datos de cada cliente
 

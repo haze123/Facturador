@@ -13,3 +13,7 @@ sfs.config.js
 # Artefactos de compilacion del instalador
 instalacion/FacturadorSetup.exe
 instalacion/_build/
+
+# Datos del contribuyente de cada instalacion. No lleva claves, pero si el RUC,
+# la direccion fiscal y la ruta al certificado de un cliente concreto.
+cliente.conf

@@ -388,11 +388,151 @@ def pasar_a_produccion():
 
 # --- Menu -------------------------------------------------------------------
 
+def actualizar_desde_archivo():
+    """
+    Lee el archivo del cliente, muestra que cambia y aplica solo eso.
+
+    Evita el camino de "reconfigurar todo" cuando lo unico que paso es que vencio el
+    certificado o cambiaron un dato: cada endpoint del SFS es independiente, asi que
+    se llama unicamente al que corresponde, y se piden solo las claves que ese
+    endpoint necesita.
+    """
+    import chequeos
+    import perfil
+
+    ruta_sfs = preguntar("Ruta del SFS", sistema.RUTA_SFS_POR_DEFECTO)
+    ruta_bd = os.path.join(ruta_sfs, "bd", "BDFacturador.db")
+    previo = chequeos.datos_sfs(ruta_bd)
+    if not previo.get("NUMRUC"):
+        error("esta PC todavia no tiene un contribuyente configurado")
+        nota("         Usar primero la opcion 2.")
+        return False
+
+    ruta_archivo = preguntar("Archivo del cliente", os.path.join(RAIZ, "cliente.conf"))
+    if not os.path.exists(ruta_archivo):
+        aviso(f"no existe {ruta_archivo}")
+        if not confirmar("Crearlo con los datos que ya tiene esta PC?"):
+            return False
+        env = chequeos._leer_env(RAIZ) or {}
+        perfil.escribir(ruta_archivo,
+                        perfil.desde_sfs(previo, ruta_sfs, env.get("DATABASE_URL", "")))
+        ok(f"creado {ruta_archivo}")
+        nota("         Editarlo con el Bloc de notas y volver a esta opcion.")
+        return True
+
+    try:
+        datos = perfil.leer(ruta_archivo)
+    except ValueError as e:
+        error(f"no se pudo leer el archivo: {e}")
+        return False
+
+    problemas = perfil.validar(datos, contribuyente.validar_ruc)
+    if problemas:
+        error("el archivo tiene problemas:")
+        for p in problemas:
+            nota(f"         - {p}")
+        return False
+    ok("archivo valido")
+
+    env = chequeos._leer_env(RAIZ) or {}
+    cambios = perfil.comparar(datos, previo, ruta_sfs, env.get("DATABASE_URL", ""))
+    if not cambios:
+        ok("no hay nada que cambiar: la instalacion ya coincide con el archivo")
+        return True
+
+    titulo("Cambios a aplicar")
+    for etiqueta, actual, nuevo, _ in cambios:
+        print(f"    {etiqueta:20} {actual or '(vacio)'}")
+        print(f"    {'':20} {C.CYAN}-> {nuevo}{C.FIN}")
+
+    # Un RUC distinto no es un campo mas: es otro contribuyente. El certificado esta
+    # atado a el y el historial emitido pertenece al anterior.
+    if any(e == "RUC" for e, _, _, _ in cambios):
+        print()
+        aviso("EL RUC CAMBIA. Eso es otro contribuyente, no una correccion menor:")
+        nota("         el certificado esta atado al RUC y el historial de comprobantes")
+        nota("         emitidos pertenece al anterior. Si es una PC que pasa a otro")
+        nota("         cliente, corresponde la opcion 2, que limpia lo anterior.")
+        if not confirmar("Aplicar igual el cambio de RUC?"):
+            return False
+
+    afectados = {endpoint for _, _, _, endpoint in cambios}
+    print()
+    if not confirmar(f"Aplicar {len(cambios)} cambio(s)?"):
+        return False
+
+    base_url = "http://localhost:9000"
+    datos_sfs = {
+        "ruc": datos["ruc"], "razon": datos["razon_social"],
+        "comercial": datos.get("nombre_comercial") or datos["razon_social"],
+        "usuario_sol": datos["usuario_sol"], "ubigeo": datos["ubigeo"],
+        "direccion": datos["direccion"], "departamento": datos["departamento"],
+        "provincia": datos["provincia"], "distrito": datos["distrito"],
+        "urbanizacion": datos.get("urbanizacion", ""),
+        "ruta_sfs": datos.get("ruta_sfs") or ruta_sfs,
+        "ruta_certificado": datos["certificado"],
+    }
+
+    # Cada clave se pide solo si su endpoint esta entre los que cambian.
+    if "emisor" in afectados:
+        titulo("Clave SOL")
+        nota("         El SFS la guarda cifrada y no se puede recuperar, asi que hay")
+        nota("         que volver a escribirla para tocar los datos del emisor.")
+        datos_sfs["clave_sol"] = preguntar_clave("Clave SOL (no se ve al escribir)")
+        if not datos_sfs["clave_sol"]:
+            error("sin la clave SOL no se pueden grabar los datos del emisor")
+            return False
+
+    if "certificado" in afectados:
+        titulo("Certificado")
+        datos_sfs["clave_certificado"] = preguntar_clave(
+            "Contrasena del certificado (no se ve al escribir)")
+        valido, mensaje, _ = contribuyente.revisar_certificado(
+            datos["certificado"], datos_sfs["clave_certificado"], datos["ruc"])
+        if valido is False:
+            error(f"certificado: {mensaje}")
+            return False
+        (ok if valido else aviso)(f"certificado: {mensaje}")
+
+    if "base" in afectados:
+        titulo("Base de datos")
+        nota("         El archivo trae la conexion sin la clave.")
+        db_url = pedir_base_de_datos()
+        if not db_url:
+            return False
+        # Solo la linea de DATABASE_URL: rehacer el .env entero borraria SOL_CLAVE,
+        # que no se puede recuperar de ningun lado.
+        respaldo, _ = contribuyente.actualizar_env(RAIZ, {"DATABASE_URL": db_url})
+        ok("conexion actualizada en el .env")
+        if respaldo:
+            nota(f"         respaldo del anterior en {os.path.basename(respaldo)}")
+
+    titulo("Aplicando en el SFS")
+    if not contribuyente.esperar_sfs(base_url, segundos=5):
+        error("el SFS no responde; levantarlo con 'pm2 start sfs' y reintentar")
+        return False
+
+    for nombre, cargar in (("emisor", contribuyente.cargar_emisor),
+                           ("direccion", contribuyente.cargar_direccion),
+                           ("certificado", contribuyente.cargar_certificado)):
+        if nombre not in afectados:
+            continue
+        listo, mensaje = cargar(base_url, datos_sfs, paso)
+        if not listo:
+            error(mensaje)
+            return False
+
+    ok("actualizado")
+    nota("         Reiniciar el daemon para que tome los cambios: pm2 restart facturador")
+    return True
+
+
 OPCIONES = (
     ("1", "Instalar el entorno (prerrequisitos, PM2, SFS)", instalar_entorno),
     ("2", "Configurar un cliente", configurar_cliente),
     ("3", "Verificar la instalacion", None),      # se resuelve al importar chequeos
-    ("4", "Pasar a produccion", pasar_a_produccion),
+    ("4", "Actualizar desde el archivo del cliente", actualizar_desde_archivo),
+    ("5", "Pasar a produccion", pasar_a_produccion),
 )
 
 
