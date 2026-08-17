@@ -28,8 +28,8 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-import psycopg2
 from dotenv import load_dotenv
+import repositorio
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -511,8 +511,8 @@ def detectar_desfase_bd(conn) -> float:
     if DESFASE_BD_HORAS != "auto":
         return _desfase_horas
     try:
-        filas = _consultar(conn, "SELECT now() AT TIME ZONE 'utc' AS utc, now() AS con_zona")
-        # now() vuelve con zona; se compara su lectura "de pared" contra el reloj local.
+        filas = _bd().reloj(conn)
+        # Se compara la lectura "de pared" del servidor contra el reloj local.
         pared = filas[0]["con_zona"].replace(tzinfo=None)
         crudo = (pared - datetime.now()).total_seconds() / 3600
         medido = round(crudo * 2) / 2
@@ -585,48 +585,36 @@ def _mover(ruta: str, carpeta: str):
 
 def _url_sin_clave(url: str) -> str:
     """La URL de conexión sin la contraseña, para poder mostrarla en el log."""
-    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", url) or "(sin configurar)"
+    return repositorio.url_sin_clave(url)
 
 
-def _dsn_desde_url(url: str):
+def _bd():
     """
-    Separa la URL de Prisma en algo que psycopg2 entienda.
+    El adaptador del motor que indique DATABASE_URL.
 
-    Se usa la misma DATABASE_URL que la aplicación para no declarar la conexión dos
-    veces, pero trae parámetros propios de Prisma —?schema, connection_limit— que
-    psycopg2 rechaza. El schema se traduce a search_path y el resto se descarta.
+    El daemon no sabe con qué base está hablando: pide siempre lo mismo y cada
+    adaptador traduce a su esquema y su dialecto (ver repositorio/).
     """
-    partes = urllib.parse.urlsplit(url)
-    consulta = urllib.parse.parse_qs(partes.query)
-    esquema = (consulta.get("schema") or ["public"])[0]
-    limpia = urllib.parse.urlunsplit((partes.scheme, partes.netloc, partes.path, "", ""))
-    return limpia, f"-c search_path={esquema}"
+    if not DATABASE_URL:
+        raise RuntimeError("Falta DATABASE_URL en el .env")
+    return repositorio.elegir(DATABASE_URL)
 
 
 def conectar_bd():
-    if not DATABASE_URL:
-        raise RuntimeError("Falta DATABASE_URL en el .env")
-    dsn, opciones = _dsn_desde_url(DATABASE_URL)
-    return psycopg2.connect(dsn, connect_timeout=DB_TIMEOUT_SEG, options=opciones)
+    return _bd().conectar(DATABASE_URL, DB_TIMEOUT_SEG)
 
 
-def _consultar(conn, sql: str, params: tuple = ()) -> list:
-    """Filas de un SELECT como diccionarios columna -> valor."""
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    columnas = [d[0] for d in cur.description]
-    return [dict(zip(columnas, fila)) for fila in cur.fetchall()]
+def _escribir_bd(operacion, *args) -> int:
+    """
+    Ejecuta una escritura del adaptador. Devuelve las filas afectadas, o -1 si falló.
 
-
-def _actualizar(conn, sql: str, params: tuple) -> int:
-    """UPDATE con commit. Devuelve las filas afectadas, o -1 si la sentencia falló."""
+    El try va acá y no en cada adaptador para que un motor nuevo no tenga que
+    acordarse de replicar el manejo de errores.
+    """
     try:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        conn.commit()
-        return cur.rowcount
+        return operacion(*args)
     except Exception:
-        logger.exception("Error ejecutando UPDATE: %s", sql)
+        logger.exception("Error escribiendo en la BD (%s)", getattr(operacion, "__name__", "?"))
         return -1
 
 
@@ -651,8 +639,7 @@ def obtener_emisor(conn):
     Datos del emisor. La aplicación no tiene tabla de emisores —solo guarda el nombre
     en Configuracion—, así que el RUC sale de EMISOR_RUC en el .env.
     """
-    filas = _consultar(conn, 'SELECT "nombreEmpresa" FROM public."Configuracion" LIMIT 1')
-    razon = _texto(filas[0]["nombreEmpresa"]) if filas else ""
+    razon = _texto(_bd().emisor(conn))
     if not EMISOR_RUC_OVERRIDE:
         return None
     return {"ruc": EMISOR_RUC_OVERRIDE, "razon_social": razon}
@@ -660,33 +647,13 @@ def obtener_emisor(conn):
 
 def obtener_receptor(conn, factura_id):
     """
-    Receptor del comprobante, que cuelga de la factura (Comprobante -> Factura -> Cliente).
-
-    Cliente no guarda tipo ni número de documento por separado, así que se deducen:
-    con RUC es una empresa (catálogo 06 tipo '6') y con DNI una persona (tipo '1').
-    Sin ninguno de los dos, queda como consumidor final, que es lo correcto para una
-    boleta de mostrador.
+    Receptor del comprobante. Cada esquema lo guarda distinto —uno separa tipo y
+    número de documento, otro los deduce del RUC o el DNI—, así que la traducción vive
+    en el adaptador y acá llega ya normalizado.
     """
     if not factura_id:
         return {}
-    filas = _consultar(
-        conn,
-        'SELECT c.dni, c.ruc, c."razonSocial", c.nombre '
-        '  FROM public."Factura" f JOIN public."Cliente" c ON c.id = f."clienteId" '
-        ' WHERE f.id = %s',
-        (factura_id,),
-    )
-    if not filas:
-        return {}
-    cli = filas[0]
-    ruc, dni = _texto(cli["ruc"]), _texto(cli["dni"])
-    if ruc:
-        return {"tipo_documento": "6", "numero_documento": ruc,
-                "razon_social": _texto(cli["razonSocial"]) or _texto(cli["nombre"])}
-    if dni:
-        return {"tipo_documento": "1", "numero_documento": dni,
-                "razon_social": _texto(cli["nombre"])}
-    return {}
+    return _bd().receptor(conn, factura_id) or {}
 
 
 def obtener_items(conn, factura_id):
@@ -698,26 +665,22 @@ def obtener_items(conn, factura_id):
     se calculan desde el precio con IGV incluido; si algún día empieza a llenarlas,
     se respetan las suyas.
     """
-    filas = _consultar(
-        conn,
-        'SELECT nombre, cantidad, "precioUnit", total, "codigoProducto", "decCantidad",'
-        '       valor, "igvVenta", precio'
-        '  FROM public."FacturaItem" WHERE "facturaId" = %s ORDER BY id',
-        (factura_id,),
-    )
+    filas = _bd().items(conn, factura_id)
     items = []
     for f in filas:
-        cantidad = f["decCantidad"] or f["cantidad"] or 1
-        precio_unit = f["precio"] if f["precio"] is not None else f["precioUnit"]
+        cantidad = f["dec_cantidad"] or f["cantidad"] or 1
+        precio_unit = f["precio"] if f["precio"] is not None else f["precio_unit"]
         valor_unit, valor_venta, igv_venta = _desglosar_igv(precio_unit, cantidad, f["total"])
         items.append({
-            "descripcion":     f["nombre"],
-            "codigo_producto": f["codigoProducto"],
-            "medida":          "ZZ",   # servicios: unidad de medida de SUNAT
+            "descripcion":     f["descripcion"],
+            "codigo_producto": f["codigo_producto"],
+            # ZZ = "servicio" en el catálogo 03 de SUNAT. Si el esquema del cliente
+            # trae su propia unidad de medida (un grifo factura galones), se respeta.
+            "medida":          f.get("medida") or "ZZ",
             "dec_cantidad":    cantidad,
-            "valor":           f["valor"]    if f["valor"]    is not None else valor_unit,
+            "valor":           f["valor"]     if f["valor"]     is not None else valor_unit,
             "valor_venta":     valor_venta,
-            "igv_venta":       f["igvVenta"] if f["igvVenta"] is not None else igv_venta,
+            "igv_venta":       f["igv_venta"] if f["igv_venta"] is not None else igv_venta,
             "precio":          precio_unit,
         })
     return items
@@ -755,19 +718,10 @@ def obtener_comprobantes_pendientes(conn):
     # aplicación nunca le asignó número igual no se puede emitir, pero descartarla en
     # el SQL la hacía desaparecer sin una sola línea en el log. Pasa a la validación,
     # que la reporta identificándola por su id.
-    filas = _consultar(
-        conn,
-        'SELECT id, "tipoComprobante", tipo::text AS tipo_enum,'
-        '       "numeracionComprobante", "fechaEmision", "tipoMoneda", "tipoNota",'
-        '       "tipoDocumentoAfectado", "numeracionDocumentoAfectado",'
-        '       "motivoDocumentoAfectado", gravadas, igv, total, "montoLetras"'
-        '  FROM public."Factura"'
-        ' WHERE enviado IS NOT TRUE'
-        ' ORDER BY "fechaEmision" ASC NULLS LAST',
-    )
+    filas = _bd().pendientes(conn)
     pendientes = []
     for f in filas:
-        tipo_comp = _tipo_sunat(f["tipoComprobante"] or f["tipo_enum"])
+        tipo_comp = _tipo_sunat(f["tipo_comprobante"] or f["tipo_enum"])
         if tipo_comp == "03":
             continue
         gravadas, igv = f["gravadas"], f["igv"]
@@ -777,17 +731,17 @@ def obtener_comprobantes_pendientes(conn):
             "id":                             f["id"],
             "factura_id":                     f["id"],
             "tipo_comprobante":               tipo_comp,
-            "numeracion_comprobante":         f["numeracionComprobante"],
-            "fecha_emision":                  f["fechaEmision"],
-            "tipo_moneda":                    f["tipoMoneda"],
-            "tipo_nota":                      f["tipoNota"],
-            "tipo_documento_afectado":        _tipo_sunat(f["tipoDocumentoAfectado"]),
-            "numeracion_documento_afectado":  f["numeracionDocumentoAfectado"],
-            "motivo_documento_afectado":      f["motivoDocumentoAfectado"],
+            "numeracion_comprobante":         f["numeracion_comprobante"],
+            "fecha_emision":                  f["fecha_emision"],
+            "tipo_moneda":                    f["tipo_moneda"],
+            "tipo_nota":                      f["tipo_nota"],
+            "tipo_documento_afectado":        _tipo_sunat(f["tipo_documento_afectado"]),
+            "numeracion_documento_afectado":  f["numeracion_documento_afectado"],
+            "motivo_documento_afectado":      f["motivo_documento_afectado"],
             "gravadas":                       gravadas,
             "igv":                            igv,
             "total":                          f["total"],
-            "monto_letras": _texto(f["montoLetras"]) or numero_a_letras(f["total"], f["tipoMoneda"]),
+            "monto_letras": _texto(f["monto_letras"]) or numero_a_letras(f["total"], f["tipo_moneda"]),
         })
     return pendientes
 
@@ -799,35 +753,27 @@ def obtener_boletas_para_resumen(conn) -> list:
     "cerraron" su día una vez que termina, y mandar un resumen a medio día se presta
     a que lleguen más boletas después y queden fuera.
     """
-    filas = _consultar(
-        conn,
-        'SELECT id, "tipoComprobante", tipo::text AS tipo_enum,'
-        '       "numeracionComprobante", "fechaEmision",'
-        '       gravadas, igv, total, "montoLetras"'
-        '  FROM public."Factura"'
-        ' WHERE enviado IS NOT TRUE'
-        ' ORDER BY "fechaEmision" ASC NULLS LAST',
-    )
+    filas = _bd().pendientes(conn)
     hoy = datetime.now().date()
     candidatas = []
     for f in filas:
-        if _tipo_sunat(f["tipoComprobante"] or f["tipo_enum"]) != "03":
+        if _tipo_sunat(f["tipo_comprobante"] or f["tipo_enum"]) != "03":
             continue
         faltantes = _validar_campos_obligatorios({
-            "numeracion_comprobante": f["numeracionComprobante"],
-            "fecha_emision":          f["fechaEmision"],
+            "numeracion_comprobante": f["numeracion_comprobante"],
+            "fecha_emision":          f["fecha_emision"],
             "total":                  f["total"],
         })
         if faltantes:
             _avisar_incompleto(
                 f["id"],
                 "Boleta %s sin datos obligatorios (%s); no entra al resumen hasta completarlos.",
-                f["numeracionComprobante"] or f["id"], ", ".join(faltantes),
+                f["numeracion_comprobante"] or f["id"], ", ".join(faltantes),
             )
             continue
         # En hora local, que es la que define a qué día pertenece la boleta: en UTC
         # una boleta de las 20:00 figuraría como del día siguiente y nunca entraría.
-        if fecha_local(f["fechaEmision"]).date() >= hoy:
+        if fecha_local(f["fecha_emision"]).date() >= hoy:
             continue
         gravadas, igv = f["gravadas"], f["igv"]
         if gravadas is None or igv is None:
@@ -835,12 +781,12 @@ def obtener_boletas_para_resumen(conn) -> list:
         candidatas.append({
             "id":                     f["id"],
             "factura_id":             f["id"],
-            "numeracion_comprobante": f["numeracionComprobante"],
-            "fecha_emision":          f["fechaEmision"],
+            "numeracion_comprobante": f["numeracion_comprobante"],
+            "fecha_emision":          f["fecha_emision"],
             "gravadas":               gravadas,
             "igv":                    igv,
             "total":                  f["total"],
-            "monto_letras": _texto(f["montoLetras"]) or numero_a_letras(f["total"], "PEN"),
+            "monto_letras": _texto(f["monto_letras"]) or numero_a_letras(f["total"], "PEN"),
         })
     return candidatas
 
@@ -2027,7 +1973,6 @@ def resetear_rechazados(conn, ruc_emisor: str):
         ).fetchall()
         if not rows:
             return
-        cur = conn.cursor()
         reintentados, agotados = [], []
         for num_docu, tip_docu, des_obse in rows:
             # Se consulta antes de sumar: al agotarse, el documento se queda en '10'
@@ -2039,17 +1984,16 @@ def resetear_rechazados(conn, ruc_emisor: str):
                 agotados.append((tip_docu, num_docu))
                 continue
             intentos = _contar_reintento(num_docu, tip_docu, _texto(des_obse))
-            cur.execute(
-                'UPDATE public."Factura" SET enviado=%s WHERE "numeracionComprobante"=%s',
-                (ENVIADO_PENDIENTE, num_docu),
-            )
+            # Vuelve a la cola sin tocar errors: el motivo del rechazo tiene que
+            # seguir a la vista mientras se reintenta.
+            _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
+                                 limpiar_error=False)
             sfs.execute(
                 f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
                 f"AND IND_SITU IN ({marcas})",
                 (ruc_emisor, tip_docu, num_docu, *_ESTADOS_ERROR),
             )
             reintentados.append((tip_docu, num_docu, intentos))
-    conn.commit()
 
     if reintentados:
         logger.info(
@@ -2201,11 +2145,7 @@ def _anotar_observaciones_de_lineas(conn, numeracion_rc: str, boletas: list, par
             detalle += f" — código {cod}"
         if desc:
             detalle += f": {desc}"
-        _actualizar(
-            conn,
-            'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante"=%s',
-            (detalle[:_MAX_ERRORS_SQL], num),
-        )
+        _escribir_bd(_bd().guardar_error, conn, num, detalle[:_MAX_ERRORS_SQL])
     logger.warning(
         "SUNAT aceptó el resumen %s pero observó %d boleta(s): %s. Quedan emitidas, "
         "con el motivo guardado para revisión.",
@@ -2235,12 +2175,7 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
                 "en resumenes.json; quedan en enviado=0.", numeracion,
             )
             return False
-        filas = _actualizar(
-            conn,
-            'UPDATE public."Factura" SET enviado=%s, errors=NULL '
-            'WHERE "numeracionComprobante" = ANY(%s)',
-            (ENVIADO_ACEPTADO, boletas),
-        )
+        filas = _escribir_bd(_bd().marcar_enviados, conn, boletas)
         if filas > 0:
             _limpiar_reintento(numeracion)
             _anotar_observaciones_de_lineas(conn, numeracion, boletas, parsed)
@@ -2258,11 +2193,7 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
 
     # errors se limpia junto con la aceptación: si el comprobante había sido rechazado
     # antes, el motivo viejo ya no aplica.
-    filas = _actualizar(
-        conn,
-        'UPDATE public."Factura" SET enviado=%s, errors=NULL WHERE "numeracionComprobante"=%s',
-        (ENVIADO_ACEPTADO, numeracion),
-    )
+    filas = _escribir_bd(_bd().marcar_enviado, conn, numeracion)
     if filas > 0:
         _limpiar_reintento(numeracion)
         return True
@@ -2295,22 +2226,16 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
         boletas = _boletas_de_resumen(numeracion)
         if not boletas:
             return False
-        filas = _actualizar(
-            conn,
-            'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante" = ANY(%s)',
-            (detalle[:_MAX_ERRORS_SQL], boletas),
-        )
+        filas = _escribir_bd(_bd().guardar_error_varios, conn, boletas,
+                             detalle[:_MAX_ERRORS_SQL])
         # Aunque haya sido rechazado, el ticket ya se consumio: dejarlo abierto
         # haria que se lo siguiera consultando en vano en cada ciclo. El motivo
         # del rechazo queda en Factura.errors, que es donde se consulta.
         _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
         return filas > 0
 
-    filas = _actualizar(
-        conn,
-        'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante"=%s',
-        (detalle[:_MAX_ERRORS_SQL], numeracion),
-    )
+    filas = _escribir_bd(_bd().guardar_error, conn, numeracion,
+                         detalle[:_MAX_ERRORS_SQL])
     return filas > 0
 
 
