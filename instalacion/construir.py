@@ -37,10 +37,20 @@ def main():
         "--workpath", os.path.join(AQUI, "_build"),
         "--specpath", os.path.join(AQUI, "_build"),
         "--paths", AQUI,
+        # La raiz del proyecto, para que entre el paquete repositorio/ del daemon:
+        # el instalador prueba la conexion con el mismo codigo que despues conecta
+        # de verdad, asi no puede decir que funciona y que al daemon le falle.
+        "--paths", os.path.dirname(AQUI),
         # PyInstaller no los ve porque se importan por nombre dentro del menu.
         "--hidden-import", "sistema",
         "--hidden-import", "contribuyente",
         "--hidden-import", "chequeos",
+        "--hidden-import", "perfil",
+        # Los adaptadores se eligen en tiempo de ejecucion segun DATABASE_URL, asi
+        # que hay que nombrarlos: si falta uno, ese motor no se puede ni probar.
+        "--hidden-import", "repositorio",
+        "--hidden-import", "repositorio.postgres",
+        "--hidden-import", "repositorio.sqlserver",
         "--noconfirm",
         os.path.join(AQUI, "instalador.py"),
     ]

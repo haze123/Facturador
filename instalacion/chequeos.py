@@ -43,6 +43,21 @@ def datos_sfs(ruta_bd):
         return {}
 
 
+def _motor_de(url):
+    """El motor segun el esquema de la URL, sin depender del paquete del daemon."""
+    esquema = (url or "").split("://", 1)[0].lower()
+    if esquema.startswith("postgres"):
+        return "PostgreSQL"
+    if esquema in ("sqlserver", "mssql"):
+        return "SQL Server"
+    return "desconocido"
+
+
+def _driver_de(url):
+    """El modulo de Python que hace falta para ese motor."""
+    return "pyodbc" if _motor_de(url) == "SQL Server" else "psycopg2"
+
+
 def _leer_env(raiz):
     ruta = os.path.join(raiz, ".env")
     if not os.path.exists(ruta):
@@ -76,6 +91,12 @@ def verificar(raiz):
     print(f"\n{C.NEGRITA}  VERIFICACION{C.FIN}")
     nota(f"  {datetime.now():%Y-%m-%d %H:%M:%S}")
 
+    # El .env se lee antes de la seccion 1 porque de el sale que motor de base usa
+    # esta instalacion, y con eso, cual es el driver que hace falta: psycopg2 para
+    # PostgreSQL, pyodbc para SQL Server. Exigir los dos marcaria como falla algo
+    # que a este cliente no le hace ninguna falta.
+    conf = _leer_env(raiz)
+
     # --- 1. Prerrequisitos -------------------------------------------------
     import sistema
     titulo("1. Prerrequisitos")
@@ -85,21 +106,25 @@ def verificar(raiz):
         ok("PM2")
     else:
         _falla("PM2 no esta instalado")
-    for paquete in ("psycopg2", "dotenv", "watchdog"):
+    paquetes = ["dotenv", "watchdog", _driver_de((conf or {}).get("DATABASE_URL", ""))]
+    for paquete in paquetes:
         codigo, _ = sistema.correr(["python", "-c", f"import {paquete}"], timeout=120)
         (ok if codigo == 0 else _falla)(f"modulo de Python '{paquete}'")
 
     # --- 2. Configuracion del daemon ---------------------------------------
     titulo("2. Configuracion del daemon (.env)")
-    conf = _leer_env(raiz)
     if conf is None:
         _falla("no existe el archivo .env")
         conf = {}
     else:
         for clave in ("DATABASE_URL", "EMISOR_RUC"):
             if conf.get(clave):
-                # DATABASE_URL nunca se imprime: lleva la contrasena.
-                ok(f"{clave} definida" if clave == "DATABASE_URL" else f"{clave} = {conf[clave]}")
+                if clave == "DATABASE_URL":
+                    # Nunca se imprime entera porque lleva la contrasena; el motor
+                    # si, que es el dato util para entender el resto del informe.
+                    ok(f"DATABASE_URL definida (motor: {_motor_de(conf[clave])})")
+                else:
+                    ok(f"{clave} = {conf[clave]}")
             else:
                 _falla(f"falta {clave} en el .env")
         # Sin credenciales SOL no se cierra ningun resumen diario: su CDR llega

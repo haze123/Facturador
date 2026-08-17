@@ -133,20 +133,84 @@ def revisar_certificado(ruta, clave, ruc):
     return True, f"vigente hasta {vence:%Y-%m-%d}", vence
 
 
-def probar_base(url):
-    """(ok, mensaje) conectando con la misma logica que usa el daemon."""
-    try:
-        import psycopg2
-    except ImportError:
-        return False, "falta psycopg2 (correr primero la instalacion del entorno)"
+def url_sin_clave(url):
+    """La URL con la contrasena tapada, para poder mostrarla en pantalla."""
+    import re
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", url or "") or "(sin configurar)"
+
+
+def armar_url(motor, servidor, puerto, base, usuario="", clave="",
+              esquema="public", windows=False):
+    """
+    La DATABASE_URL que va al .env, armada a partir de los datos sueltos.
+
+    La clave se codifica: una contrasena con '@' o '/' partiria la URL en el lugar
+    equivocado y el daemon terminaria conectando a otro servidor, o a ninguno.
+    """
+    credenciales = ""
+    if usuario and not windows:
+        credenciales = f"{urllib.parse.quote(usuario, safe='')}:" \
+                       f"{urllib.parse.quote(clave, safe='')}@"
+    destino = f"{servidor}:{puerto}/{base}"
+    if motor == "postgres":
+        return f"postgresql://{credenciales}{destino}?schema={esquema or 'public'}"
+    return f"sqlserver://{credenciales}{destino}" + ("?trusted=yes" if windows else "")
+
+
+def necesita_clave(url):
+    """
+    True si la URL trae usuario pero no contrasena.
+
+    Es el caso normal de la que viene en el archivo del cliente: se guarda sin clave
+    a proposito. Con autenticacion de Windows no hay usuario y no falta nada.
+    """
+    p = urllib.parse.urlsplit(url or "")
+    return bool(p.username) and not p.password
+
+
+def con_clave(url, clave):
+    """La misma URL con la contrasena puesta, codificada."""
     p = urllib.parse.urlsplit(url)
-    consulta = urllib.parse.parse_qs(p.query)
-    esquema = (consulta.get("schema") or ["public"])[0]
-    limpia = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+    if not p.username or p.password:
+        return url
+    credenciales = (f"{urllib.parse.quote(p.username, safe='')}:"
+                    f"{urllib.parse.quote(clave, safe='')}")
+    destino = p.hostname or ""
+    if p.port:
+        destino += f":{p.port}"
+    return urllib.parse.urlunsplit(
+        (p.scheme, f"{credenciales}@{destino}", p.path, p.query, p.fragment))
+
+
+def usuario_de(url):
+    """El usuario de la URL, para poder nombrarlo al pedir su clave."""
+    return urllib.parse.unquote(urllib.parse.urlsplit(url or "").username or "")
+
+
+def probar_base(url):
+    """
+    (ok, mensaje) conectando con el MISMO codigo que usa el daemon.
+
+    Antes esto duplicaba la conexion de psycopg2, asi que solo sabia de PostgreSQL y
+    podia quedar desincronizado del daemon sin que nadie lo notara. Ahora usa el
+    adaptador que corresponda al motor: si el instalador dice que conecta, el daemon
+    conecta.
+    """
     try:
-        con = psycopg2.connect(limpia, connect_timeout=10, options=f"-c search_path={esquema}")
+        import repositorio
+    except ImportError:
+        return False, "no se encontro el paquete repositorio/ del daemon"
+    try:
+        adaptador = repositorio.elegir(url)
+    except RuntimeError as e:
+        return False, str(e)
+    except ImportError as e:
+        # Falta el driver del motor elegido (psycopg2 o pyodbc).
+        return False, f"falta el driver de ese motor: {e}"
+    try:
+        con = adaptador.conectar(url, 10)
         con.close()
-        return True, "conexion verificada"
+        return True, f"conexion verificada ({repositorio.motor_de(url)})"
     except Exception as e:
         return False, str(e).strip().splitlines()[0]
 
@@ -201,11 +265,8 @@ def esperar_sfs(base_url, segundos=90, avisar=print):
     return False
 
 
-def cargar_en_sfs(base_url, datos, avisar=print):
-    """
-    Manda los datos a los tres endpoints del SFS. Devuelve (ok, mensaje_error).
-    Se corta en el primero que falle para no dejar una configuracion a medias.
-    """
+def cargar_emisor(base_url, datos, avisar=print):
+    """RUC, razon social y credenciales SOL. Necesita la clave SOL."""
     # cmbFuncionamiento='02' y temporizadores vacios: el SFS NO debe correr sus
     # propios jobs de generar/enviar, porque harian por su cuenta lo mismo que el
     # daemon hace por REST y competirian por los mismos documentos.
@@ -226,7 +287,11 @@ def cargar_en_sfs(base_url, datos, avisar=print):
     if r.get("validacion") != "EXITO":
         return False, f"el SFS rechazo los datos del emisor: {_motivo(r)}"
     avisar("    emisor y credenciales SOL cargados (el SFS encripta las claves)")
+    return True, ""
 
+
+def cargar_direccion(base_url, datos, avisar=print):
+    """Nombre comercial y direccion fiscal. No lleva ninguna clave."""
     r = _post_sfs(base_url, "GrabarOtrosParametros.htm", {
         "txtNombreComercial": datos["comercial"],
         "txtUbigeo": datos["ubigeo"],
@@ -239,11 +304,15 @@ def cargar_en_sfs(base_url, datos, avisar=print):
     if r.get("validacion") != "EXITO":
         return False, f"el SFS rechazo la direccion: {_motivo(r)}"
     avisar("    direccion fiscal cargada")
+    return True, ""
 
+
+def cargar_certificado(base_url, datos, avisar=print):
+    """Importa el .p12. Necesita la contrasena del certificado."""
     # El SFS NO usa la ruta que se le pasa: arma la suya pegando su carpeta CERT
     # con lo que reciba en 'nombreCertificado' (verificado en el bytecode de
     # importarCertificado). Mandarle una ruta completa produce algo como
-    # "...\CERT\C:\otra\ruta\cert.p12", que no existe, y el SFS solo responde
+    # "...CERT + C:/otra/ruta/cert.p12", que no existe, y el SFS solo responde
     # "el certificado no fue creado" sin decir que el problema es la ruta.
     # Asi que el archivo se copia a CERT y se le manda unicamente el nombre.
     nombre = _copiar_a_cert(datos["ruta_sfs"], datos["ruta_certificado"])
@@ -254,6 +323,21 @@ def cargar_en_sfs(base_url, datos, avisar=print):
     if r.get("validacion") != "EXITO":
         return False, f"el SFS rechazo el certificado: {_motivo(r)}"
     avisar(f"    certificado importado ({nombre})")
+    return True, ""
+
+
+def cargar_en_sfs(base_url, datos, avisar=print):
+    """
+    Los tres endpoints, en orden. Devuelve (ok, mensaje_error).
+
+    Se corta en el primero que falle para no dejar una configuracion a medias. Son
+    independientes entre si, y por eso una reconfiguracion puede llamar solo al que
+    corresponde en vez de rehacer todo (ver perfil.py).
+    """
+    for cargar in (cargar_emisor, cargar_direccion, cargar_certificado):
+        listo, error = cargar(base_url, datos, avisar)
+        if not listo:
+            return False, error
     return True, ""
 
 
@@ -370,6 +454,47 @@ module.exports = {
     with open(destino, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(contenido)
     return destino
+
+
+def actualizar_env(raiz, cambios):
+    """
+    Cambia solo las claves indicadas del .env, dejando el resto tal cual.
+
+    Hace falta porque escribir_env() rehace el archivo entero: usarlo para cambiar
+    un solo dato borraria SOL_CLAVE —que no se puede recuperar de ningun lado— sin
+    que nadie lo note hasta que ningun resumen diario vuelva a cerrarse.
+
+    Devuelve (ruta_respaldo, claves_agregadas).
+    """
+    destino = os.path.join(raiz, ".env")
+    if not os.path.exists(destino):
+        return None, []
+
+    with open(destino, encoding="utf-8-sig", errors="replace") as fh:
+        lineas = fh.read().splitlines()
+
+    pendientes = dict(cambios)
+    salida = []
+    for linea in lineas:
+        limpia = linea.strip()
+        if limpia and not limpia.startswith("#") and "=" in limpia:
+            clave = limpia.split("=", 1)[0].strip()
+            if clave in pendientes:
+                salida.append(f"{clave}={pendientes.pop(clave)}")
+                continue
+        salida.append(linea)
+
+    # Lo que no estaba en el archivo se agrega al final, para no perderlo.
+    agregadas = list(pendientes)
+    for clave, valor in pendientes.items():
+        salida.append(f"{clave}={valor}")
+
+    respaldo = f"{destino}.bak-{datetime.now():%Y%m%d%H%M%S}"
+    os.replace(destino, respaldo)
+    with open(destino, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(salida) + "\n")
+    _restringir_permisos(destino)
+    return respaldo, agregadas
 
 
 def escribir_env(raiz, datos, ruta_sfs):

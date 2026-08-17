@@ -4,10 +4,14 @@ Instalador del Facturador SUNAT.
 Se compila a un unico .exe con PyInstaller (ver construir.py), asi que corre en
 una PC donde todavia no hay Python: el interprete viaja adentro del ejecutable.
 
-Tres operaciones, las mismas de siempre pero en un solo programa:
+Del 1 al 4, en el orden en que se hacen al instalar por primera vez:
   1. Instalar el entorno   (prerrequisitos, PM2, descarga del SFS)
   2. Configurar un cliente (datos del contribuyente, .env, procesos)
   3. Verificar             (diagnostico de una instalacion existente)
+  4. Pasar a produccion    (cambia el ambiente del SFS y limpia las pruebas)
+
+Y aparte, para cuando la instalacion ya existe:
+  5. Actualizar desde el archivo del cliente (aplica solo lo que cambio)
 """
 import os
 import sys
@@ -64,6 +68,76 @@ def preguntar_clave(etiqueta):
 
 def confirmar(pregunta):
     return input(f"  {pregunta} (si/no): ").strip().lower() in ("si", "s", "sí")
+
+
+def elegir_opcion(etiqueta, opciones, por_defecto="1"):
+    """Menu corto de una sola tecla. Devuelve la clave elegida."""
+    for clave, texto in opciones:
+        print(f"    {clave}  {texto}")
+    while True:
+        r = input(f"  {etiqueta} [{por_defecto}]: ").strip() or por_defecto
+        if r in dict(opciones):
+            return r
+        print(f"    {C.AMAR}(elegir una de las opciones){C.FIN}")
+
+
+def pedir_base_de_datos():
+    """
+    Los datos de conexion segun el motor. Devuelve la DATABASE_URL, o "" si se cancela.
+
+    Se pregunta por partes porque nadie recuerda la sintaxis de la URL de memoria, y
+    una mal escrita falla con un mensaje del driver que no dice cual es el pedazo
+    equivocado.
+
+    Pegarla entera se ofrece SOLO para PostgreSQL, y a proposito: la URL que el
+    cliente ya tiene armada es la de Prisma, que es de PostgreSQL. Un cliente de SQL
+    Server no tiene ninguna con este formato —la suya seria una cadena ODBC o de
+    .NET, que no sirve acá—, asi que ofrecersela seria ofrecerle algo que no existe.
+    """
+    motor = elegir_opcion("Motor", [
+        ("1", "PostgreSQL"),
+        ("2", "SQL Server"),
+    ])
+
+    pegar = motor == "1" and elegir_opcion("Como cargar la conexion", [
+        ("1", "Pegar la DATABASE_URL completa (la que ya usa la aplicacion)"),
+        ("2", "Escribir servidor, puerto, base, usuario y clave por separado"),
+    ]) == "1"
+
+    while True:
+        if pegar:
+            url = preguntar("DATABASE_URL", "", obligatorio=True)
+        elif motor == "1":
+            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
+            puerto   = preguntar("Puerto", "5432")
+            base     = preguntar("Base de datos", "postgres", obligatorio=True)
+            usuario  = preguntar("Usuario", "", obligatorio=True)
+            clave    = preguntar_clave("Clave (no se ve al escribir)")
+            esquema  = preguntar("Schema", "public")
+            url = contribuyente.armar_url("postgres", servidor, puerto, base,
+                                          usuario, clave, esquema=esquema)
+        else:
+            servidor = preguntar("Servidor (host o IP)", "localhost", obligatorio=True)
+            puerto   = preguntar("Puerto", "1433")
+            base     = preguntar("Base de datos", "", obligatorio=True)
+            # Con autenticacion de Windows el daemon entra con el usuario que corre
+            # el proceso; sirve cuando el SQL Server esta en la misma PC.
+            windows  = confirmar("Usar autenticacion de Windows?")
+            usuario = clave = ""
+            if not windows:
+                usuario = preguntar("Usuario de SQL Server", "sa", obligatorio=True)
+                clave   = preguntar_clave("Clave (no se ve al escribir)")
+            url = contribuyente.armar_url("sqlserver", servidor, puerto, base,
+                                          usuario, clave, windows=windows)
+
+        nota(f"         {contribuyente.url_sin_clave(url)}")
+        listo, mensaje = contribuyente.probar_base(url)
+        if listo:
+            ok(mensaje)
+            return url
+        error(f"no se pudo conectar: {mensaje}")
+        if not confirmar("Volver a intentar?"):
+            return ""
 
 
 def pausa():
@@ -218,15 +292,9 @@ def configurar_cliente():
     (ok if valido else aviso)(f"certificado: {mensaje}")
 
     titulo("4. Base de datos de la aplicacion")
-    while True:
-        db_url = preguntar("DATABASE_URL", "", obligatorio=True)
-        listo, mensaje = contribuyente.probar_base(db_url)
-        if listo:
-            ok(mensaje)
-            break
-        error(f"no se pudo conectar: {mensaje}")
-        if not confirmar("Volver a intentar?"):
-            return False
+    db_url = pedir_base_de_datos()
+    if not db_url:
+        return False
 
     datos = {
         "ruc": ruc, "razon": razon, "comercial": comercial,
@@ -284,6 +352,25 @@ def configurar_cliente():
         ok(".env escrito")
         aviso("no se pudo restringir su acceso; lleva claves en texto plano")
 
+    # El archivo del cliente se genera aca y no despues: en este punto estan todos
+    # los datos recien tipeados. Sin esto habria que volver a juntarlos a mano la
+    # primera vez que haga falta actualizar algo (opcion 5), o al reinstalar tras un
+    # formateo. No lleva ninguna clave.
+    import perfil
+    ruta_perfil = perfil.escribir(os.path.join(RAIZ, "cliente.conf"), {
+        "ruc": datos["ruc"], "razon_social": datos["razon"],
+        "nombre_comercial": datos["comercial"], "usuario_sol": datos["usuario_sol"],
+        "ubigeo": datos["ubigeo"], "direccion": datos["direccion"],
+        "departamento": datos["departamento"], "provincia": datos["provincia"],
+        "distrito": datos["distrito"], "urbanizacion": datos.get("urbanizacion", ""),
+        "certificado": datos["ruta_certificado"],
+        "base_datos": perfil.url_para_archivo(datos["database_url"]),
+        "ruta_sfs": ruta_sfs,
+    })
+    ok(f"datos del cliente guardados en {os.path.basename(ruta_perfil)}")
+    nota("         Sirve para actualizar despues (opcion 5) sin volver a cargar todo.")
+    nota("         No lleva claves: conviene guardar una copia fuera de esta PC.")
+
     sistema.correr(["pm2", "start", config])
     sistema.correr(["pm2", "save"])
     codigo, _ = sistema.correr(["pm2-startup", "install"], timeout=120)
@@ -324,12 +411,202 @@ def pasar_a_produccion():
 
 # --- Menu -------------------------------------------------------------------
 
+def actualizar_desde_archivo():
+    """
+    Lee el archivo del cliente, muestra que cambia y aplica solo eso.
+
+    Evita el camino de "reconfigurar todo" cuando lo unico que paso es que vencio el
+    certificado o cambiaron un dato: cada endpoint del SFS es independiente, asi que
+    se llama unicamente al que corresponde, y se piden solo las claves que ese
+    endpoint necesita.
+    """
+    import chequeos
+    import perfil
+
+    ruta_sfs = preguntar("Ruta del SFS", sistema.RUTA_SFS_POR_DEFECTO)
+    ruta_bd = os.path.join(ruta_sfs, "bd", "BDFacturador.db")
+    previo = chequeos.datos_sfs(ruta_bd)
+    if not previo.get("NUMRUC"):
+        error("esta PC todavia no tiene un contribuyente configurado")
+        nota("         Usar primero la opcion 2.")
+        return False
+
+    ruta_archivo = preguntar("Archivo del cliente", os.path.join(RAIZ, "cliente.conf"))
+    if not os.path.exists(ruta_archivo):
+        aviso(f"no existe {ruta_archivo}")
+        if not confirmar("Crearlo con los datos que ya tiene esta PC?"):
+            return False
+        env = chequeos._leer_env(RAIZ) or {}
+        perfil.escribir(ruta_archivo,
+                        perfil.desde_sfs(previo, ruta_sfs, env.get("DATABASE_URL", "")))
+        ok(f"creado {ruta_archivo}")
+        nota("         Editarlo con el Bloc de notas y volver a esta opcion.")
+        return True
+
+    try:
+        datos = perfil.leer(ruta_archivo)
+    except ValueError as e:
+        error(f"no se pudo leer el archivo: {e}")
+        return False
+
+    problemas = perfil.validar(datos, contribuyente.validar_ruc)
+    if problemas:
+        error("el archivo tiene problemas:")
+        for p in problemas:
+            nota(f"         - {p}")
+        return False
+    ok("archivo valido")
+
+    # El archivo tiene que ser de ESTE contribuyente. Teniendo uno por cliente, abrir
+    # el equivocado es cuestion de tiempo, y aplicarlo reconfiguraria la PC con los
+    # datos de otro sin limpiar nada: se notaria recien cuando SUNAT rechazara los
+    # comprobantes por no coincidir el certificado.
+    ajeno = perfil.verificar_identidad(datos, previo)
+    if ajeno:
+        error(ajeno)
+        nota("         Un RUC distinto es otro contribuyente. Si esta PC pasa a otro")
+        nota("         cliente, corresponde la opcion 2: ademas de cargar los datos")
+        nota("         nuevos, limpia el historial y el certificado del anterior.")
+        return False
+    ok(f"el archivo es del contribuyente instalado ({datos['ruc']})")
+
+    env = chequeos._leer_env(RAIZ) or {}
+    cambios = perfil.comparar(datos, previo, ruta_sfs, env.get("DATABASE_URL", ""))
+    if cambios:
+        titulo("Cambios a aplicar")
+        for etiqueta, actual, nuevo, _ in cambios:
+            print(f"    {etiqueta:20} {actual or '(vacio)'}")
+            print(f"    {'':20} {C.CYAN}-> {nuevo}{C.FIN}")
+
+    else:
+        ok("el archivo coincide con lo instalado: ningun campo cambio")
+
+    # Las claves se preguntan aparte y siempre, porque son lo unico que la
+    # comparacion NO puede detectar: no estan en el archivo y el SFS las guarda
+    # cifradas, asi que no hay contra que compararlas. Sin este paso, un cliente que
+    # solo cambio su clave SOL no tendria por donde actualizarla.
+    titulo("Claves")
+    nota("         No se pueden comparar: el SFS las guarda cifradas y el archivo no")
+    nota("         las lleva. Si alguna cambio, hay que decirlo aca.")
+    eleccion = elegir_opcion("Actualizar alguna clave", [
+        ("1", "Ninguna"),
+        ("2", "La clave SOL"),
+        ("3", "La contrasena del certificado"),
+        ("4", "Las dos"),
+    ])
+
+    afectados = {endpoint for _, _, _, endpoint in cambios}
+    if eleccion in ("2", "4"):
+        afectados.add("emisor")
+    if eleccion in ("3", "4"):
+        afectados.add("certificado")
+
+    if not afectados:
+        ok("no hay nada que aplicar")
+        return True
+
+    print()
+    if not confirmar("Aplicar?"):
+        return False
+
+    base_url = "http://localhost:9000"
+    datos_sfs = {
+        "ruc": datos["ruc"], "razon": datos["razon_social"],
+        "comercial": datos.get("nombre_comercial") or datos["razon_social"],
+        "usuario_sol": datos["usuario_sol"], "ubigeo": datos["ubigeo"],
+        "direccion": datos["direccion"], "departamento": datos["departamento"],
+        "provincia": datos["provincia"], "distrito": datos["distrito"],
+        "urbanizacion": datos.get("urbanizacion", ""),
+        "ruta_sfs": datos.get("ruta_sfs") or ruta_sfs,
+        "ruta_certificado": datos["certificado"],
+    }
+
+    # Cada clave se pide solo si su endpoint esta entre los afectados: porque algun
+    # campo suyo cambio, o porque se pidio actualizar esa clave.
+    if "emisor" in afectados:
+        titulo("Clave SOL")
+        nota("         El endpoint del emisor la lleva siempre, y el SFS no la devuelve")
+        nota("         nunca: aunque no haya cambiado, hay que volver a escribirla.")
+        datos_sfs["clave_sol"] = preguntar_clave("Clave SOL (no se ve al escribir)")
+        if not datos_sfs["clave_sol"]:
+            error("sin la clave SOL no se pueden grabar los datos del emisor")
+            return False
+
+    if "certificado" in afectados:
+        titulo("Certificado")
+        datos_sfs["clave_certificado"] = preguntar_clave(
+            "Contrasena del certificado (no se ve al escribir)")
+        valido, mensaje, _ = contribuyente.revisar_certificado(
+            datos["certificado"], datos_sfs["clave_certificado"], datos["ruc"])
+        if valido is False:
+            error(f"certificado: {mensaje}")
+            return False
+        (ok if valido else aviso)(f"certificado: {mensaje}")
+
+    if "base" in afectados:
+        titulo("Base de datos")
+        # Se usa la conexion del archivo —para eso esta— y solo se pide lo unico que
+        # el archivo no puede llevar: la contrasena. Volver a preguntar servidor,
+        # puerto y base seria pedir de nuevo lo que ya esta escrito ahi.
+        db_url = datos["base_datos"]
+        if contribuyente.necesita_clave(db_url):
+            usuario = contribuyente.usuario_de(db_url)
+            nota("         El archivo trae la conexion sin la clave, como corresponde.")
+            db_url = contribuyente.con_clave(
+                db_url, preguntar_clave(f"Clave de '{usuario}' (no se ve al escribir)"))
+        nota(f"         {contribuyente.url_sin_clave(db_url)}")
+
+        listo, mensaje = contribuyente.probar_base(db_url)
+        if listo:
+            ok(mensaje)
+        else:
+            error(f"no se pudo conectar: {mensaje}")
+            if not confirmar("Cargar la conexion a mano?"):
+                return False
+            db_url = pedir_base_de_datos()
+            if not db_url:
+                return False
+        # Solo la linea de DATABASE_URL: rehacer el .env entero borraria SOL_CLAVE,
+        # que no se puede recuperar de ningun lado.
+        respaldo, _ = contribuyente.actualizar_env(RAIZ, {"DATABASE_URL": db_url})
+        ok("conexion actualizada en el .env")
+        if respaldo:
+            nota(f"         respaldo del anterior en {os.path.basename(respaldo)}")
+
+    titulo("Aplicando en el SFS")
+    if not contribuyente.esperar_sfs(base_url, segundos=5):
+        error("el SFS no responde; levantarlo con 'pm2 start sfs' y reintentar")
+        return False
+
+    for nombre, cargar in (("emisor", contribuyente.cargar_emisor),
+                           ("direccion", contribuyente.cargar_direccion),
+                           ("certificado", contribuyente.cargar_certificado)):
+        if nombre not in afectados:
+            continue
+        listo, mensaje = cargar(base_url, datos_sfs, paso)
+        if not listo:
+            error(mensaje)
+            return False
+
+    ok("actualizado")
+    nota("         Reiniciar el daemon para que tome los cambios: pm2 restart facturador")
+    return True
+
+
+# Del 1 al 4 en el orden en que se hacen al instalar por primera vez; despues, con
+# una linea en blanco de por medio, lo que se usa cuando la instalacion ya existe.
+# Con "actualizar" metido en el medio, quien venia de hacer 1, 2 y 3 leia el 4 como
+# el paso siguiente, cuando el que continuaba la secuencia era el de mas abajo.
 OPCIONES = (
     ("1", "Instalar el entorno (prerrequisitos, PM2, SFS)", instalar_entorno),
     ("2", "Configurar un cliente", configurar_cliente),
     ("3", "Verificar la instalacion", None),      # se resuelve al importar chequeos
     ("4", "Pasar a produccion", pasar_a_produccion),
+    ("5", "Actualizar desde el archivo del cliente", actualizar_desde_archivo),
 )
+
+# Antes de que opcion se corta la secuencia de instalacion.
+_SEPARADOR = "5"
 
 
 def main():
@@ -347,8 +624,10 @@ def main():
         print(f"{C.GRIS}  Proyecto en: {RAIZ}{C.FIN}")
         print(f"{C.NEGRITA}{'=' * 58}{C.FIN}\n")
         for codigo, (texto, _) in acciones.items():
+            if codigo == _SEPARADOR:
+                print()
             print(f"   {C.CYAN}{codigo}{C.FIN}  {texto}")
-        print(f"   {C.CYAN}0{C.FIN}  Salir\n")
+        print(f"\n   {C.CYAN}0{C.FIN}  Salir\n")
 
         eleccion = input("  Opcion: ").strip()
         if eleccion == "0":
