@@ -128,6 +128,8 @@ Lo que cambia de un cliente a otro vive ahí adentro y en ningún otro lado: nom
 
 Para un cliente con su propio esquema se copia el adaptador más parecido y se le cambian las consultas. **No hay un mapeador genérico configurable, y es deliberado**: cinco archivos de sesenta líneas con su SQL a la vista se depuran leyéndolos; un mapeo indirecto hay que descifrarlo justo cuando algo está fallando.
 
+**Qué tiene que entregar la base para que el facturador funcione está en [`repositorio/README.md`](repositorio/README.md)**: las diez operaciones, las catorce claves de cada comprobante, cuáles son obligatorias y qué se calcula cuando faltan. Es el documento que se le pasa a un cliente cuyo sistema no es el nuestro.
+
 ## Instalación
 
 **En la PC de un cliente** no hace falta nada de este README: lo hace todo el instalador —prerrequisitos, SFS, datos del contribuyente, certificado y procesos—. Se distribuye como `FacturadorSetup.zip` en las releases del repositorio; se descomprime y se ejecuta el `.exe` de adentro.
