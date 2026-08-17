@@ -54,7 +54,7 @@ Cambiar de motor tambien entra por acá: se edita `base_datos` en el archivo y l
 Dos detalles que costaron pensar:
 
 - **El certificado se compara por contenido, no por nombre.** Uno renovado suele llamarse igual que el que vence; mirar el nombre diría "sin cambios" justo el día que hay que reemplazarlo.
-- **Cambiar el RUC no es un campo más.** Es otro contribuyente: el certificado está atado a él y el historial emitido pertenece al anterior. La opción 5 frena y pide confirmación explícita, y sugiere la opción 2, que sí limpia lo anterior.
+- **Cambiar el RUC no es un campo más.** Es otro contribuyente: el certificado está atado a él y el historial emitido pertenece al anterior. La opción 5 frena y pide confirmación explícita, y sugiere la opción 2, que sí limpia lo anterior. Además **arrastra el certificado aunque el archivo `.p12` no haya cambiado**: lo valida contra el RUC nuevo, que es lo que atrapa el caso de cambiar el RUC y olvidarse de actualizar esa línea — sin eso se emitiría con el certificado del contribuyente anterior y SUNAT rechazaría todo.
 
 ## La base de datos de cada cliente
 

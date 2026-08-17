@@ -479,6 +479,15 @@ def actualizar_desde_archivo():
     if eleccion in ("3", "4"):
         afectados.add("certificado")
 
+    # Un certificado esta emitido a nombre de un RUC. Si el RUC cambia, el que
+    # estaba instalado ya no sirve, asi que se fuerza el paso del certificado:
+    # revisar_certificado() comprueba que el titular sea el RUC nuevo y frena si
+    # se olvidaron de actualizar esa linea del archivo. Sin esto se aplicaria el
+    # RUC nuevo con el certificado del contribuyente anterior, y SUNAT rechazaria
+    # todo lo que se emitiera.
+    if any(e == "RUC" for e, _, _, _ in cambios):
+        afectados.add("certificado")
+
     if not afectados:
         ok("no hay nada que aplicar")
         return True
