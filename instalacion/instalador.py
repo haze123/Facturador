@@ -86,10 +86,13 @@ def pedir_base_de_datos():
     dice cual es el pedazo equivocado. Igual se deja pegarla completa: el que ya la
     tiene —la misma que usa la aplicacion— no tiene por que desarmarla.
     """
-    motor = elegir_opcion("Motor", [
-        ("1", "PostgreSQL"),
-        ("2", "SQL Server"),
-        ("3", "Pegar la DATABASE_URL completa"),
+    # La pregunta es "como se ingresa la conexion", no "que motor": las dos primeras
+    # opciones son motores y la tercera un modo de ingreso, asi que rotularla "Motor"
+    # ponia tres cosas distintas bajo el mismo nombre.
+    motor = elegir_opcion("Como cargar la conexion", [
+        ("1", "PostgreSQL - pedir los datos uno por uno"),
+        ("2", "SQL Server - pedir los datos uno por uno"),
+        ("3", "Pegar la DATABASE_URL ya armada (la misma que usa la aplicacion)"),
     ])
 
     while True:
