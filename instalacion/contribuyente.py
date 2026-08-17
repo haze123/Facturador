@@ -8,7 +8,6 @@ romperia con cualquier actualizacion suya.
 import json
 import os
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
