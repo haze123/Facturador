@@ -227,10 +227,13 @@ def descargar_sfs(ruta_destino, version=VERSION_SFS, avisar=print):
 
     avisar("    descomprimiendo...")
     try:
-        padre = os.path.dirname(ruta_destino.rstrip("\\/")) or "C:\\"
-        os.makedirs(padre, exist_ok=True)
+        # El ZIP de SUNAT no trae carpeta contenedora: en su raiz estan directamente
+        # facturadorApp-x.y.jar, prod.yaml, bd/ y sunat_archivos/. Descomprimir en el
+        # padre --esperando que el ZIP creara esa carpeta-- volcaba todo eso suelto en
+        # la raiz del disco, y el jar nunca aparecia donde se lo buscaba despues.
+        os.makedirs(ruta_destino, exist_ok=True)
         with zipfile.ZipFile(zip_tmp) as z:
-            z.extractall(padre)
+            z.extractall(ruta_destino)
     except Exception as e:
         return False, f"no se pudo descomprimir: {e}"
     finally:
