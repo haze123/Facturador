@@ -153,10 +153,11 @@ _lock_resumenes = threading.Lock()
 # Cuántos bloqueados se detallan en el log antes de resumir; son estables entre
 # ciclos y volcarlos todos cada 60s ahoga el resto del log.
 _MAX_BLOQUEADOS_LOG = 10
-# Tipos que el daemon envía hoy: factura, boleta, nota de crédito, nota de débito y
-# resumen diario de boletas. RA (comunicación de baja) queda fuera a propósito: por
-# ahora no se emite desde acá.
-_TIPOS_SFS = {"01", "03", "07", "08", "RC"}
+# Tipos que el daemon le entrega al SFS: boleta y resumen diario de boletas. Las
+# facturas y las notas (01, 07, 08) quedan fuera a propósito —se emiten por otra vía,
+# no desde acá— y el ciclo las reporta como "fuera de alcance" sin tocarlas. RA
+# (comunicación de baja) nunca se emitió desde el daemon.
+_TIPOS_SFS = {"03", "RC"}
 
 # Constantes.CONSTANTE_TIPO_DOCUMENTO_RBOLETAS: el SFS trata el resumen diario como
 # un tipo de documento más, con los mismos dos endpoints REST que todo lo demás
