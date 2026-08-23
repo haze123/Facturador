@@ -143,7 +143,9 @@ MAX_REINTENTOS_RECHAZO = int(os.getenv("MAX_REINTENTOS_RECHAZO", "3"))
 # 200 porque es el lote que recomienda el proveedor: un resumen mas chico se firma
 # y se acepta mas rapido, y si SUNAT lo observa hay menos boletas que rehacer. Lo
 # que sobra no se pierde, va en el resumen del ciclo siguiente.
-MAX_BOLETAS_RESUMEN = min(int(os.getenv("MAX_BOLETAS_RESUMEN", "200")), 500)
+# El max(1, ...) no es paranoia: con un 0 en el .env el resumen salia vacio, y con
+# un negativo descartaba boletas en silencio.
+MAX_BOLETAS_RESUMEN = max(1, min(int(os.getenv("MAX_BOLETAS_RESUMEN", "200")), 500))
 
 # El contador vive en disco: en memoria, un reinicio de PM2 —que reinicia solo— haría
 # arrancar la cuenta de cero y el bucle volvería a ser infinito.
