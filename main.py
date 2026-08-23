@@ -139,6 +139,13 @@ _ESTADOS_CERRADOS = ("03", "04")
 # resultado no cambia: sin tope, el daemon reenvía cada ciclo indefinidamente. Al
 # agotarse se reporta como bloqueado y espera corrección manual.
 MAX_REINTENTOS_RECHAZO = int(os.getenv("MAX_REINTENTOS_RECHAZO", "3"))
+# SUNAT rechaza un resumen diario con mas de 500 boletas. El tope por defecto es
+# 200 porque es el lote que recomienda el proveedor: un resumen mas chico se firma
+# y se acepta mas rapido, y si SUNAT lo observa hay menos boletas que rehacer. Lo
+# que sobra no se pierde, va en el resumen del ciclo siguiente.
+# El max(1, ...) no es paranoia: con un 0 en el .env el resumen salia vacio, y con
+# un negativo descartaba boletas en silencio.
+MAX_BOLETAS_RESUMEN = max(1, min(int(os.getenv("MAX_BOLETAS_RESUMEN", "200")), 500))
 
 # El contador vive en disco: en memoria, un reinicio de PM2 —que reinicia solo— haría
 # arrancar la cuenta de cero y el bucle volvería a ser infinito.
@@ -1043,6 +1050,20 @@ def generar_resumen_diario(conn, ruc_emisor: str):
     if not boletas:
         return None
 
+    # Un resumen declara UNA sola fecha de referencia (<cbc:ReferenceDate> en
+    # ConvertirRBoletasXML.ftl del SFS), asi que no puede mezclar dias: se toma el
+    # mas antiguo pendiente y los demas esperan al proximo ciclo.
+    boletas.sort(key=lambda b: (fecha_local(b["fecha_emision"]).date(),
+                               b["numeracion_comprobante"]))
+    dia = fecha_local(boletas[0]["fecha_emision"]).date()
+    del_dia = [b for b in boletas if fecha_local(b["fecha_emision"]).date() == dia]
+    boletas, restantes = del_dia[:MAX_BOLETAS_RESUMEN], len(del_dia) - MAX_BOLETAS_RESUMEN
+    if restantes > 0:
+        logger.info(
+            "%s tiene %d boleta(s) pendientes; entran %d en este resumen y %d en el siguiente.",
+            dia, len(del_dia), len(boletas), restantes,
+        )
+
     hoy = datetime.now()
     fecha_resumen = hoy.strftime("%Y-%m-%d")
     numeracion_rc = _siguiente_numeracion_rc(hoy.strftime("%Y%m%d"))
@@ -1061,9 +1082,14 @@ def generar_resumen_diario(conn, ruc_emisor: str):
 
     numeraciones = [b["numeracion_comprobante"] for b in boletas]
     _registrar_resumen(numeracion_rc, numeraciones)
+    # Con un tope de 200 la lista entera hacia una linea de log de miles de
+    # caracteres por resumen. El detalle completo vive en resumenes.json.
+    muestra = ", ".join(numeraciones[:_MAX_BLOQUEADOS_LOG])
+    if len(numeraciones) > _MAX_BLOQUEADOS_LOG:
+        muestra += f" ... y {len(numeraciones) - _MAX_BLOQUEADOS_LOG} mas"
     logger.info(
         "Resumen diario %s generado con %d boleta(s): %s",
-        numeracion_rc, len(numeraciones), ", ".join(numeraciones),
+        numeracion_rc, len(numeraciones), muestra,
     )
     return {"num_ruc": ruc_emisor, "tip_docu": _TIPO_RC, "num_docu": numeracion_rc}
 
