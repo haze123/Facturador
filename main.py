@@ -1169,16 +1169,23 @@ def sincronizar_bandeja_sfs() -> bool:
     Fuerza al SFS a releer la carpeta DATA y registrar en su bandeja lo que haya
     nuevo. Devuelve True si respondió.
 
-    Hace falta porque el SFS solo escanea DATA cuando se le carga la pantalla
-    (cargarArchivosContribuyente cuelga de CargarPantalla.htm) o desde un job
-    programado que exige el temporizador prendido. Ni GenerarComprobante.htm ni
-    enviarXML.htm lo hacen: operan sobre lo que ya está en la bandeja.
+    Hace falta porque el SFS solo escanea DATA cuando la pantalla de su bandeja
+    hace su refresco periódico (cargarArchivosContribuyente cuelga de
+    ActualizarPantalla.htm, NO de CargarPantalla.htm —la carga inicial de la
+    pantalla— pese a lo que sugiere el nombre) o desde un job programado que
+    exige el temporizador prendido. Ni GenerarComprobante.htm ni enviarXML.htm
+    lo hacen: operan sobre lo que ya está en la bandeja.
 
-    Sin esta llamada, el daemon dependía de que alguien tuviera abierta la bandeja
-    en el navegador —ahí la página refresca sola y de paso dispara el escaneo—, y
-    con la ventana cerrada los archivos se quedaban en DATA sin que nadie los mire.
+    Confirmado en la práctica: con CargarPantalla.htm el daemon llamaba a este
+    endpoint cada ciclo sin ningún efecto —cero cargarArchivosContribuyente en
+    el log del SFS durante 46 minutos seguidos— y el escaneo solo corría cuando
+    alguien tenía la bandeja abierta en el navegador, porque es esa página la
+    que dispara ActualizarPantalla.htm en su refresco automático. Sin este
+    endpoint (el correcto) el daemon dependía de esa pestaña, y si quedaba en
+    segundo plano el navegador le frenaba el temporizador y los documentos se
+    quedaban sin procesar hasta que alguien volvía a tocar la PC.
     """
-    r = _sfs_post("api/CargarPantalla.htm", {})
+    r = _sfs_post("api/ActualizarPantalla.htm", {})
     if r is None:
         return False
     if r.get("validacion") != "EXITO":
