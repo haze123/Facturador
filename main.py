@@ -409,7 +409,14 @@ def _base_e_igv(total):
 
 def _desglosar_igv(precio_unitario, cantidad, total_linea):
     """(valor unitario sin IGV, valor de venta de la línea, IGV de la línea)."""
-    total = total_linea if total_linea is not None else (precio_unitario or 0) * (cantidad or 1)
+    # Los dos factores pasan por formatear_decimal, como ya hacia la linea de abajo:
+    # en SQL Server 'cantidad' es nvarchar, y multiplicar texto por un float reventaba
+    # el ciclo entero con TypeError cuando la linea no traia total.
+    if total_linea is not None:
+        total = total_linea
+    else:
+        total = float(formatear_decimal(precio_unitario, 6)
+                      * (formatear_decimal(cantidad, 6) or Decimal("1")))
     valor_venta, igv = _base_e_igv(total)
     cant = formatear_decimal(cantidad) or Decimal("1")
     unitario = (Decimal(str(valor_venta)) / cant) if cant else Decimal("0")
