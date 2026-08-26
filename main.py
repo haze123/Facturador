@@ -786,6 +786,17 @@ def obtener_boletas_para_resumen(conn) -> list:
                 f["numeracion_comprobante"] or f["id"], ", ".join(faltantes),
             )
             continue
+        # Una boleta que un resumen ya excluyó MAX_REINTENTOS_RECHAZO veces por venir
+        # con código de línea no se vuelve a proponer sola: seguiría chocando con el
+        # mismo dato observado. Ver _procesar_lineas_de_resumen().
+        if _reintentos_de(f["numeracion_comprobante"]) >= MAX_REINTENTOS_RECHAZO:
+            _avisar_incompleto(
+                f["id"],
+                "Boleta %s agotó los reenvíos dentro de un resumen; no se reincluye "
+                "hasta que se corrija el dato observado.",
+                f["numeracion_comprobante"] or f["id"],
+            )
+            continue
         # En hora local, que es la que define a qué día pertenece la boleta: en UTC
         # una boleta de las 20:00 figuraría como del día siguiente y nunca entraría.
         if fecha_local(f["fecha_emision"]).date() >= hoy:
@@ -2149,42 +2160,81 @@ def parsear_xml_cdr(fuente) -> dict:
     return res
 
 
-def _anotar_observaciones_de_lineas(conn, numeracion_rc: str, boletas: list, parsed: dict):
+def _procesar_lineas_de_resumen(conn, numeracion_rc: str, boletas: list, parsed: dict) -> tuple:
     """
-    Guarda en cada boleta la observación que SUNAT le haya puesto dentro de un
-    resumen aceptado.
+    Separa las boletas de un resumen ACEPTADO en limpias/excluidas según el código
+    de su propia línea de respuesta. Devuelve (limpias, excluidas).
 
-    SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una
-    viene en su propio <cac:DocumentResponse>. Sin esto, esas boletas quedaban en
-    enviado=true sin rastro del reparo, y nadie se enteraba de que salieron con
-    observaciones.
+    Mismo criterio que ya usa parsear_xml_cdr() para el documento entero —"El
+    ResponseCode manda: SUNAT solo devuelve 0 cuando acepta"—, aplicado ahora por
+    línea: un código de solo ceros es la aceptación limpia; cualquier otro código,
+    aunque el CDR lo etiquete como "observación", significa que SUNAT no registró
+    esa boleta puntual, aunque sí haya aceptado el resumen que la contenía.
+    Marcarla enviado=1 junto con las demás sería declararla aceptada cuando no lo
+    está.
 
-    La boleta NO se marca como no enviada: el resumen fue aceptado y ella entró en
-    él. La observación queda en Factura.errors para que alguien la mire; corregirla
-    —si hace falta— es una decisión que el daemon no puede tomar solo.
+    Las excluidas no se pierden: quedan en enviado=0 con el motivo guardado, y
+    vuelven a proponerse en un resumen futuro (obtener_boletas_para_resumen) hasta
+    agotar MAX_REINTENTOS_RECHAZO.
     """
     incluidas = set(boletas)
-    observadas = [
-        (num, cod, desc) for num, cod, desc in parsed.get("lineas", [])
+    codigos = {
+        num: (cod, desc) for num, cod, desc in parsed.get("lineas", [])
         # La respuesta del resumen entero no es una observación de línea, y un
         # código de solo ceros es la aceptación limpia.
         if num in incluidas and (cod or "").strip("0") != ""
-    ]
-    if not observadas:
-        return
+    }
+    if not codigos:
+        return boletas, []
 
-    for num, cod, desc in observadas:
-        detalle = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Observada en el resumen {numeracion_rc}"
+    excluidas = [b for b in boletas if b in codigos]
+    limpias = [b for b in boletas if b not in codigos]
+
+    agotadas = []
+    for num in excluidas:
+        cod, desc = codigos[num]
+        intentos = _contar_reintento(num, "03", desc or f"código {cod}")
+        detalle = (
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Excluida del resumen {numeracion_rc} "
+            f"(intento {intentos}/{MAX_REINTENTOS_RECHAZO})"
+        )
         if cod:
             detalle += f" — código {cod}"
         if desc:
             detalle += f": {desc}"
         _escribir_bd(_bd().guardar_error, conn, num, detalle[:_MAX_ERRORS_SQL])
+        if intentos >= MAX_REINTENTOS_RECHAZO:
+            agotadas.append(num)
+
     logger.warning(
-        "SUNAT aceptó el resumen %s pero observó %d boleta(s): %s. Quedan emitidas, "
-        "con el motivo guardado para revisión.",
-        numeracion_rc, len(observadas), ", ".join(n for n, _, _ in observadas),
+        "Resumen %s aceptado, pero SUNAT devolvió código en %d boleta(s); no se "
+        "marcan enviado=1 y quedan pendientes para un resumen futuro: %s",
+        numeracion_rc, len(excluidas), ", ".join(excluidas),
     )
+    if agotadas:
+        logger.error(
+            "%d boleta(s) agotaron los %d reenvíos dentro de un resumen y NO se "
+            "reincluirán hasta que se corrija el dato observado: %s",
+            len(agotadas), MAX_REINTENTOS_RECHAZO, ", ".join(agotadas),
+        )
+    return limpias, excluidas
+
+
+def _limpiar_reintentos(numeraciones: list):
+    """
+    Igual que _limpiar_reintento() pero en lote: una sola lectura/escritura de
+    reintentos.json para todo un resumen, en vez de una por boleta.
+    """
+    if not numeraciones:
+        return
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        tocado = False
+        for num in numeraciones:
+            if datos.pop(num, None) is not None:
+                tocado = True
+        if tocado:
+            _guardar_reintentos(datos)
 
 
 def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
@@ -2209,21 +2259,31 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
                 "en resumenes.json; quedan en enviado=0.", numeracion,
             )
             return False
-        filas = _escribir_bd(_bd().marcar_enviados, conn, boletas)
-        if filas > 0:
-            _limpiar_reintento(numeracion)
-            _anotar_observaciones_de_lineas(conn, numeracion, boletas, parsed)
-            # Recién ahora el resumen esta terminado de verdad: sus boletas ya
-            # quedaron cerradas. Marcarlo antes liberaba las boletas mientras
-            # todavia figuraban pendientes, y se generaba otro resumen con ellas.
-            _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
-            logger.info("Resumen %s aceptado: %d boleta(s) marcadas enviado=1.", numeracion, filas)
-            return True
-        logger.error(
-            "CDR aceptado del resumen %s pero ninguna de sus boletas coincide en la "
-            "BD; quedan en enviado=0.", numeracion,
+
+        # Separa las que SUNAT registró de verdad (limpias) de las que su propia
+        # línea vino con código — esas NO se marcan enviado=1 aunque el resumen
+        # entero se haya aceptado. Ver _procesar_lineas_de_resumen().
+        limpias, excluidas = _procesar_lineas_de_resumen(conn, numeracion, boletas, parsed)
+        filas = _escribir_bd(_bd().marcar_enviados, conn, limpias) if limpias else 0
+        if limpias and filas == 0:
+            logger.error(
+                "CDR aceptado del resumen %s pero ninguna de sus boletas coincide en la "
+                "BD; quedan en enviado=0.", numeracion,
+            )
+            return False
+
+        _limpiar_reintento(numeracion)
+        _limpiar_reintentos(limpias)
+        # Recién ahora el resumen esta terminado de verdad: sus boletas limpias ya
+        # quedaron cerradas. Marcarlo antes liberaba las boletas mientras todavia
+        # figuraban pendientes, y se generaba otro resumen con ellas.
+        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
+        logger.info(
+            "Resumen %s aceptado: %d boleta(s) marcadas enviado=1%s.",
+            numeracion, filas,
+            f"; {len(excluidas)} quedan pendientes por código de línea" if excluidas else "",
         )
-        return False
+        return True
 
     # errors se limpia junto con la aceptación: si el comprobante había sido rechazado
     # antes, el motivo viejo ya no aplica.
