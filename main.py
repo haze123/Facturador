@@ -139,6 +139,19 @@ _ESTADOS_CERRADOS = ("03", "04")
 # resultado no cambia: sin tope, el daemon reenvía cada ciclo indefinidamente. Al
 # agotarse se reporta como bloqueado y espera corrección manual.
 MAX_REINTENTOS_RECHAZO = int(os.getenv("MAX_REINTENTOS_RECHAZO", "3"))
+
+# Motivo (catalogo 09/10) que se le pone a una nota cuya aplicacion no lo guarda.
+# Vacio por defecto: sin esto, el daemon NO inventa un motivo y la nota queda sin
+# emitir, que es lo correcto cuando el sistema de origen sabe distinguir entre una
+# anulacion, un descuento y un ajuste de valor.
+#
+# Se configura solo donde la aplicacion no puede generar esa diferencia. El caso que
+# lo motivo: una pantalla de nota de credito que copia el total y los items del
+# comprobante original sin permitir montos parciales, asi que toda nota que puede
+# crear es una anulacion completa —"01"— y no hay ambiguedad que resolver. Poner un
+# motivo por defecto donde SI se pueden emitir notas parciales es declararle a SUNAT
+# algo distinto de lo que paso.
+MOTIVO_NOTA_POR_DEFECTO = os.getenv("MOTIVO_NOTA_POR_DEFECTO", "").strip()
 # SUNAT rechaza un resumen diario con mas de 500 boletas. El tope por defecto es
 # 200 porque es el lote que recomienda el proveedor: un resumen mas chico se firma
 # y se acepta mas rapido, y si SUNAT lo observa hay menos boletas que rehacer. Lo
@@ -829,13 +842,39 @@ def _nombre_base(ruc: str, tipo: str, num: str) -> str:
 def _referencia_nota(comp: dict, tipo_comp: str, num_comp: str):
     """
     (codMotivo, desMotivo, tipDocAfectado, numDocAfectado) para una nota, o None si
-    falta algo. El código de motivo NO se deduce ni se rellena por defecto: es un dato
-    tributario y una nota con el motivo equivocado es una declaración incorrecta ante
-    SUNAT. Sin él la nota no se emite y queda reportada para que la completen.
+    falta algo. El código de motivo NO se deduce: es un dato tributario y una nota con
+    el motivo equivocado es una declaración incorrecta ante SUNAT. Sin él la nota no se
+    emite y queda reportada para que la completen.
+
+    La única forma de rellenarlo es que alguien lo declare explícitamente en
+    MOTIVO_NOTA_POR_DEFECTO, y eso solo tiene sentido donde la aplicación de origen no
+    puede generar más de un tipo de nota (ver el comentario de esa constante).
     """
     cod_motivo   = _codigo(comp.get("tipo_nota"))
     tip_afectado = _codigo(comp.get("tipo_documento_afectado"))
     num_afectado = _campo_pipe(comp.get("numeracion_documento_afectado"))
+
+    if not cod_motivo and MOTIVO_NOTA_POR_DEFECTO:
+        candidato = _codigo(MOTIVO_NOTA_POR_DEFECTO)
+        catalogo = _MOTIVOS_NOTA.get(tipo_comp, {})
+        if candidato in catalogo:
+            cod_motivo = candidato
+            # A nivel INFO y no WARNING: acá el motivo por defecto es la configuración
+            # esperada, no una anomalía. Pero se registra en cada nota, porque queda
+            # declarado ante SUNAT y tiene que poder rastrearse cuál salió así.
+            logger.info(
+                "Nota %s-%s sin tipo_nota; se usa el motivo por defecto %s (%s).",
+                tipo_comp, num_comp, cod_motivo, catalogo[candidato],
+            )
+        else:
+            # Un error de tipeo en el .env no puede convertirse en una declaración
+            # con un motivo que no existe: se ignora y la nota queda sin emitir, que
+            # es el comportamiento de siempre cuando falta el dato.
+            logger.error(
+                "MOTIVO_NOTA_POR_DEFECTO=%r no es un motivo válido para el tipo %s "
+                "(catálogo: %s); se ignora y la nota no se emite.",
+                MOTIVO_NOTA_POR_DEFECTO, tipo_comp, ", ".join(sorted(catalogo)) or "ninguno",
+            )
 
     faltantes = [
         nombre for nombre, valor in (
