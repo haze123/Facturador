@@ -115,18 +115,24 @@ _NOMBRE_SITU = {
     "12": "CDR descargado con observaciones",
 }
 
-# Estados SFS que se reintentan. Solo el '10' (rechazado): un rechazo deja el
-# comprobante sin emitir, así que corresponde volver a intentarlo. El '05' NO va
-# acá aunque antes estuviera — es ENVIADO_ANULADO, no un error, y reintentarlo
-# significaba reenviar a SUNAT un documento que se había anulado.
-_ESTADOS_ERROR = ("10",)
+# Estados SFS que se reintentan. El '10' (rechazado) deja el comprobante sin emitir,
+# así que corresponde volver a intentarlo. El '06' ('con errores') se suma porque el
+# SFS lo usa para dos cosas distintas: un dato mal armado —que reintentar no arregla—
+# y cualquier falla de comunicación con SUNAT ("Hubo un problema al invocar servicio
+# SUNAT: Could not send Message."), que sí se resuelve sola cuando vuelve la conexión.
+# Sin reintentarlo, un corte de red dejaba comprobantes trabados en DOCUMENTO hasta
+# que alguien borraba esas filas a mano. Para el '06' de dato el desenlace no cambia:
+# agota los reintentos y termina reportado como bloqueado, igual que antes.
+# El '05' NO va acá aunque antes estuviera — es ENVIADO_ANULADO, no un error, y
+# reintentarlo significaba reenviar a SUNAT un documento que se había anulado.
+_ESTADOS_ERROR = ("06", "10")
 # Estados SFS terminales que el daemon NO puede resolver solo: o el SFS generó el XML
 # pero no lo envió (boleta de más de 5 días que exige resumen diario, rechazo de
 # validación), o el documento quedó anulado. Reintentar no sirve —el resultado sería
 # el mismo—, así que se reportan en cada ciclo para que alguien los atienda a mano.
-# El '10' entra en la lista porque resetear_rechazados() corre ANTES del reporte y
-# borra los rechazos que todavía tienen reintentos disponibles: si un '10' sigue en
-# la tabla al momento de reportar, es porque agotó el tope.
+# El '06' y el '10' entran en la lista porque resetear_rechazados() corre ANTES del
+# reporte y borra los que todavía tienen reintentos disponibles: si uno de esos dos
+# sigue en la tabla al momento de reportar, es porque agotó el tope.
 _ESTADOS_BLOQUEADO = ("05", "06", "10")
 # Estados en los que el SFS ya cerró el documento con SUNAT: sus archivos de DATA
 # no se vuelven a necesitar y hay que borrarlos. Son 5 por comprobante, así que a
