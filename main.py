@@ -166,6 +166,13 @@ MOTIVO_NOTA_POR_DEFECTO = os.getenv("MOTIVO_NOTA_POR_DEFECTO", "").strip()
 # un negativo descartaba boletas en silencio.
 MAX_BOLETAS_RESUMEN = max(1, min(int(os.getenv("MAX_BOLETAS_RESUMEN", "200")), 500))
 
+# Techo del backoff con el que se reintenta un comprobante trabado por un corte de
+# red. No gasta presupuesto de reintentos (ver _es_falla_de_red), así que necesita
+# espaciarse solo: sin esto, un corte de dos horas son 120 reenvíos inútiles. Se
+# aplana en 15 minutos para que el comprobante salga pronto cuando el servicio
+# vuelva, sin quedar esperando media hora de más.
+_ESPERA_MAX_RED_MIN = int(os.getenv("ESPERA_MAX_RED_MIN", "15"))
+
 # El contador vive en disco: en memoria, un reinicio de PM2 —que reinicia solo— haría
 # arrancar la cuenta de cero y el bucle volvería a ser infinito.
 _REINTENTOS_PATH = os.path.join(_BASE, "reintentos.json")
@@ -2057,6 +2064,87 @@ def _limpiar_reintento(numeracion: str):
             _guardar_reintentos(datos)
 
 
+# Frases que solo aparecen cuando el envío ni siquiera llegó a SUNAT. La lista es a
+# propósito corta y literal: ante la menor duda conviene gastar un reintento y que
+# el comprobante termine bloqueado —alguien lo mira— antes que reencolarlo para
+# siempre por un error que en realidad era de datos.
+#
+# El "Could not send Message" es el confirmado en produccion (corte del 2026-08-29):
+# el SFS no pudo ni abrir la conversación con SUNAT. Los demás son las variantes de
+# red que devuelve la misma capa.
+#
+# OJO con lo que NO va acá: el "0111 - No tiene el perfil para enviar comprobantes
+# electronicos" también aterriza en '06', pero es una respuesta de SUNAT, no una
+# falla de red. Tiene que gastar reintentos y terminar bloqueado, porque no se
+# arregla esperando.
+_SENALES_DE_RED = (
+    "could not send message",
+    "connection timed out",
+    "connect timed out",
+    "read timed out",
+    "connection refused",
+    "connection reset",
+    "unknownhostexception",
+    "sockettimeoutexception",
+    "socketexception",
+    "no route to host",
+    "network is unreachable",
+)
+
+
+def _es_falla_de_red(motivo: str) -> bool:
+    """
+    True si el motivo del '06' es inequívocamente de comunicación.
+
+    Separa las dos cosas que el SFS mete en el mismo estado: un dato mal armado
+    —que reintentar no arregla— y un corte de red, donde el comprobante nunca salió
+    y el mismo envío funciona apenas vuelve el servicio.
+    """
+    return any(s in _texto(motivo).lower() for s in _SENALES_DE_RED)
+
+
+def _espera_de(numeracion: str) -> float:
+    """Marca de tiempo (epoch) hasta la que este comprobante no se reintenta."""
+    with _lock_reintentos:
+        registro = _leer_reintentos().get(numeracion) or {}
+    try:
+        return float(registro.get("esperar_hasta", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _anotar_espera_de_red(numeracion: str, tipo: str, motivo: str) -> tuple:
+    """
+    Registra un intento fallido por red y devuelve (cortes, minutos de espera).
+
+    El contador va en 'cortes' y no en 'intentos' a propósito: 'intentos' es el
+    presupuesto que agota un comprobante y lo bloquea, y una falla de red no debe
+    gastarlo. Acá solo sirve para espaciar los reintentos.
+
+    La espera se guarda en disco y no en memoria por el mismo motivo que el
+    contador: PM2 reinicia el daemon solo, y un backoff en memoria volvería a cero
+    en cada reinicio, martillando a SUNAT durante un corte largo.
+    """
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        registro = datos.get(numeracion) or {}
+        cortes = int(registro.get("cortes", 0)) + 1
+        # 1, 2, 4, 8, 15, 15... minutos. Arranca cerca del ciclo normal para que un
+        # corte de segundos no demore el comprobante, y se aplana en 15 para no
+        # dejarlo esperando media hora cuando el servicio ya volvió.
+        minutos = min(2 ** (cortes - 1), _ESPERA_MAX_RED_MIN)
+        registro.update({
+            "tipo": tipo,
+            "cortes": cortes,
+            "ultimo": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "motivo": motivo or registro.get("motivo", ""),
+            "esperar_hasta": time.time() + minutos * 60,
+        })
+        datos[numeracion] = registro
+        _guardar_reintentos(datos)
+        return cortes, minutos
+
+
 def resetear_rechazados(conn, ruc_emisor: str):
     if not os.path.exists(SFS_BD_PATH):
         return
@@ -2070,8 +2158,44 @@ def resetear_rechazados(conn, ruc_emisor: str):
         ).fetchall()
         if not rows:
             return
-        reintentados, agotados = [], []
+        reintentados, agotados, esperando = [], [], []
         for num_docu, tip_docu, des_obse in rows:
+            # Un '06' de red es otra cosa que un rechazo: el comprobante nunca llegó a
+            # SUNAT, los datos están bien, y el mismo envío funciona apenas vuelve el
+            # servicio. Gastarle presupuesto de reintentos lo bloqueaba en menos de 5
+            # minutos frente a un corte de horas (produccion, 2026-08-29: 7 facturas
+            # bloqueadas por un corte de 2 h, todas aceptadas despues sin tocarles un
+            # dato). Se reencola sin tope, espaciado, y con una salvaguarda antes de
+            # reenviar.
+            if _es_falla_de_red(des_obse):
+                falta = _espera_de(num_docu) - time.time()
+                if falta > 0:
+                    esperando.append((tip_docu, num_docu, falta / 60))
+                    continue
+                # Un "no se pudo enviar" no distingue entre "nunca salió" y "salió y
+                # la respuesta se perdió". Reenviar el segundo caso duplica el
+                # comprobante ante SUNAT, y eso solo se deshace con una nota de
+                # crédito: se le pregunta a SUNAT antes de tocar nada. Un
+                # 'desconocido' NO habilita el reenvío (ver estado_en_sunat).
+                estado, cdr, mensaje = estado_en_sunat(ruc_emisor, tip_docu, num_docu)
+                if estado == "registrado":
+                    _guardar_cdr(ruc_emisor, tip_docu, num_docu, cdr, mensaje)
+                    continue
+                if estado != "no_registrado":
+                    cortes, minutos = _anotar_espera_de_red(num_docu, tip_docu, _texto(des_obse))
+                    esperando.append((tip_docu, num_docu, minutos))
+                    continue
+                cortes, minutos = _anotar_espera_de_red(num_docu, tip_docu, _texto(des_obse))
+                _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
+                                     limpiar_error=False)
+                sfs.execute(
+                    f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
+                    f"AND IND_SITU IN ({marcas})",
+                    (ruc_emisor, tip_docu, num_docu, *_ESTADOS_ERROR),
+                )
+                reintentados.append((tip_docu, num_docu, f"corte {cortes}"))
+                continue
+
             # Se consulta antes de sumar: al agotarse, el documento se queda en '10'
             # y esta rama corre en cada ciclo. Sumando siempre, el contador crecería
             # sin sentido y reescribiría el archivo cada 60 segundos para siempre.
@@ -2080,7 +2204,7 @@ def resetear_rechazados(conn, ruc_emisor: str):
                 # "en vuelo" —no se regenera— y el reporte de bloqueados lo levanta.
                 agotados.append((tip_docu, num_docu))
                 continue
-            intentos = _contar_reintento(num_docu, tip_docu, _texto(des_obse))
+            intentos = f"{_contar_reintento(num_docu, tip_docu, _texto(des_obse))}/{MAX_REINTENTOS_RECHAZO}"
             # Vuelve a la cola sin tocar errors: el motivo del rechazo tiene que
             # seguir a la vista mientras se reintenta.
             _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
@@ -2094,12 +2218,22 @@ def resetear_rechazados(conn, ruc_emisor: str):
 
     if reintentados:
         logger.info(
-            "%d comprobante(s) rechazados vuelven a la cola: %s",
+            "%d comprobante(s) vuelven a la cola: %s",
             len(reintentados),
-            ", ".join(f"{t}-{n} (intento {i}/{MAX_REINTENTOS_RECHAZO})" for t, n, i in reintentados),
+            ", ".join(f"{t}-{n} ({i})" for t, n, i in reintentados),
+        )
+    if esperando:
+        # A nivel INFO y con su propio texto: estos NO requieren que nadie haga nada,
+        # solo que vuelva el servicio. Mezclarlos con los bloqueados mandaba a buscar
+        # una corrección manual que no existía.
+        logger.info(
+            "%d comprobante(s) esperando que vuelva SUNAT; reintentan solos: %s",
+            len(esperando),
+            ", ".join(f"{t}-{n} (en {m:.0f} min)" for t, n, m in esperando),
         )
     if agotados:
-        # Reenviar de nuevo daría el mismo rechazo: los datos son idénticos.
+        # Reenviar de nuevo daría el mismo rechazo: los datos son idénticos. Solo
+        # llegan acá los que NO son falla de red — esos no gastan presupuesto.
         logger.error(
             "%d comprobante(s) agotaron los %d reenvíos permitidos y NO se reenviarán "
             "hasta que se corrija el dato observado: %s",
@@ -2568,7 +2702,10 @@ def ciclo_generacion():
                 # esperando CDR o trabado en un estado que el daemon no resuelve solo.
                 if (tip, num) in en_vuelo:
                     situ, obse = en_vuelo[(tip, num)]
-                    if situ in _ESTADOS_BLOQUEADO:
+                    # Un '06' de red no está trabado: lo reintenta resetear_rechazados()
+                    # solo, apenas vuelva el servicio. Reportarlo como BLOQUEADO mandaba
+                    # a buscar una corrección manual que no hacía falta.
+                    if situ in _ESTADOS_BLOQUEADO and not _es_falla_de_red(obse):
                         bloqueados.append((tip, num, situ, obse))
                     else:
                         omitidos += 1
