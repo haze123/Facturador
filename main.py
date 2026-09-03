@@ -1433,10 +1433,17 @@ def _guardar_cdr(ruc: str, tipo: str, numeracion: str, cdr: bytes, mensaje: str)
     """
     Deja el CDR recuperado en RPTA, con el mismo nombre que le pondría el SFS.
 
-    No hace falta nada más: el hilo CDR ya vigila esa carpeta, así que lo procesa,
-    marca enviado=1 y lo archiva igual que si hubiera llegado por el camino normal.
-    Se escribe con nombre temporal y se renombra para que watchdog no lo levante
-    a medio escribir.
+    De ahí lo levanta el hilo CDR y lo procesa como cualquier otro. El nombre
+    importa más de lo que parece: el XML de un CDR de consulta trae la numeración en
+    otro formato que la de un envío normal, así que es el nombre —armado desde el
+    NUM_DOCU canónico— el que permite reconciliarla (ver _reconciliar_numeracion).
+    Se escribe con nombre temporal y se renombra para que watchdog no lo levante a
+    medio escribir.
+
+    Lo que este camino NO deja resuelto, a diferencia del normal, es la fila en la
+    bandeja del SFS: sigue con el error de red que la trajo hasta acá. La cierra
+    _cerrar_documento_en_sfs() una vez que el comprobante quedó cerrado en la BD de
+    la aplicación, no antes.
     """
     os.makedirs(SFS_RPTA_DIR, exist_ok=True)
     destino = os.path.join(SFS_RPTA_DIR, f"R{ruc}-{tipo}-{numeracion}.zip")
@@ -2292,6 +2299,90 @@ def _respuestas_por_documento(root) -> list:
     return respuestas
 
 
+def _reconciliar_numeracion(del_xml: str | None, nombre_archivo: str) -> str | None:
+    """
+    Numeración canónica del comprobante, cuando el XML y el nombre del archivo no
+    coinciden.
+
+    SUNAT escribe el número distinto según por dónde llegue el CDR. El de sendBill
+    —el envío normal, que entrega el SFS— trae 'F003-009595'. El de getStatusCdr
+    —la consulta que hace estado_en_sunat()— trae '20605858601-01-F003-9571': con
+    prefijo de RUC y tipo, y el correlativo SIN los ceros a la izquierda. Los dos
+    son CDR legítimos y firmados; simplemente no usan el mismo formato.
+
+    De ahí que el XML sirva para el estado y los códigos, pero no para la identidad:
+    _extraer_numeracion() sacaba 'F003-9571' de ese segundo formato y no existe
+    ninguna fila así en Comprobantes, que la guarda como 'F003-009571'. El nombre
+    del archivo, en cambio, es canónico en los dos caminos: lo arma _guardar_cdr()
+    desde el NUM_DOCU del SFS, y el SFS lo arma desde su propia tabla.
+
+    No se rellena con ceros a un ancho fijo a propósito: los 6 dígitos son
+    convención de esta aplicación, no de SUNAT —que admite hasta 8—, y fijarlos acá
+    rompería con cualquier otro emisor. Se comparan los correlativos como enteros,
+    que es la única equivalencia que vale sin importar el relleno.
+    """
+    del_nombre = _extraer_numeracion(nombre_archivo)
+    if not del_nombre:
+        return del_xml
+    if not del_xml or del_xml == del_nombre:
+        return del_nombre
+
+    serie_xml, _, corr_xml = del_xml.partition("-")
+    serie_arch, _, corr_arch = del_nombre.partition("-")
+    # Los resúmenes (RC-YYYYMMDD-NNN) no entran acá: su correlativo no es un entero
+    # suelto, así que isdigit() falla y se respeta lo que dijo el XML.
+    if serie_xml == serie_arch and corr_xml.isdigit() and corr_arch.isdigit() \
+            and int(corr_xml) == int(corr_arch):
+        return del_nombre
+    return del_xml
+
+
+def _datos_del_nombre_cdr(nombre: str) -> tuple:
+    """
+    (ruc, tipo) a partir del nombre del CDR: 'R20605858601-01-F003-009571.zip'.
+
+    Hacen falta para cerrar la fila en la bandeja del SFS, que se identifica por
+    NUM_RUC + TIP_DOCU + NUM_DOCU. Devuelve (None, None) si el nombre no tiene esa
+    forma, y quien llama simplemente no cierra nada.
+    """
+    m = re.match(r"R(\d{11})-([A-Z0-9]{2})-", _texto(nombre))
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def _cerrar_documento_en_sfs(ruc: str, tipo: str, numeracion: str):
+    """
+    Da por enviado y aceptado un documento en la bandeja del SFS.
+
+    Solo hace falta cuando el CDR no llegó por el camino del SFS sino que lo bajó
+    el daemon de SUNAT (ver _guardar_cdr): en ese caso la fila queda como la dejó
+    el error de red, en IND_SITU='06' y con FEC_ENVI vacía. Sin esto pasaban dos
+    cosas, las dos vistas en producción el 2026-09-03: resetear_rechazados() volvía
+    a levantar la fila en el ciclo siguiente —consultaba a SUNAT otra vez, bajaba
+    el mismo CDR, y así cada 60 segundos durante casi cuatro horas—, y la bandeja
+    mostraba el comprobante como "Con Errores" pese a estar aceptado en SUNAT.
+
+    El WHERE filtra por los estados de error a propósito: si la fila ya está
+    cerrada, el UPDATE no afecta ninguna y el segundo pase del mismo CDR —watchdog
+    y barrido periódico pueden verlo dos veces— no revierte nada.
+    """
+    if not (ruc and tipo and numeracion) or not os.path.exists(SFS_BD_PATH):
+        return
+    marcas = _marcas(len(_ESTADOS_ERROR))
+    try:
+        with _sfs_bd(escritura=True) as sfs:
+            sfs.execute(
+                f"UPDATE DOCUMENTO SET IND_SITU='03', FEC_ENVI=?, DES_OBSE='-' "
+                f"WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? AND IND_SITU IN ({marcas})",
+                (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                 ruc, tipo, numeracion, *_ESTADOS_ERROR),
+            )
+    except sqlite3.Error:
+        logger.exception(
+            "No se pudo cerrar %s-%s en la bandeja del SFS; el comprobante quedó "
+            "bien cerrado en la BD igual.", tipo, numeracion,
+        )
+
+
 def parsear_xml_cdr(fuente) -> dict:
     res = {"numeracion": None, "codigo": None, "descripcion": None,
            "status": "PENDIENTE", "lineas": []}
@@ -2578,8 +2669,10 @@ def _barrer_rpta():
                         if not xml_names:
                             _mover(ruta, DIR_ERRORES); err += 1; continue
                         parsed = parsear_xml_cdr(z.read(xml_names[0]))
-                    if not parsed["numeracion"]:
-                        parsed["numeracion"] = _extraer_numeracion(nombre)
+                    # No alcanza con completar la numeración cuando falta: el CDR de
+                    # una consulta trae una que existe pero no casa con la BD, así que
+                    # hay que reconciliarla contra el nombre del archivo.
+                    parsed["numeracion"] = _reconciliar_numeracion(parsed["numeracion"], nombre)
                 else:
                     parsed = parsear_xml_cdr(ruta)
 
@@ -2589,6 +2682,13 @@ def _barrer_rpta():
                 if parsed["status"] in _CDR_ACEPTADOS:
                     if _actualizar_sql_cdr(conn, num, parsed):
                         ok += 1
+                        # Recién con el comprobante ya cerrado en la BD de la
+                        # aplicación se limpia la fila del SFS. Al revés —limpiarla
+                        # al depositar el CDR— se borraba el error visible aunque el
+                        # cierre fallara después, y el comprobante quedaba en
+                        # enviado=0 sin que nadie se enterara.
+                        ruc_cdr, tipo_cdr = _datos_del_nombre_cdr(nombre)
+                        _cerrar_documento_en_sfs(ruc_cdr, tipo_cdr, num)
                         _mover(ruta, DIR_PROCESADOS)
                     else:
                         # Aceptado por SUNAT pero no se pudo cerrar en la BD
