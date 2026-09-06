@@ -165,6 +165,16 @@ _ESTADOS_BLOQUEADO = ("05", "06", "10")
 # cada pasada.
 _ESTADOS_CERRADOS = ("03", "04")
 
+# Estados en los que un resumen sigue en juego: ya salio hacia SUNAT y todavia puede
+# resolverse. Lo usan las dos puntas del mismo flujo --la consulta por ticket
+# (_resumenes_con_ticket) y el cierre una vez procesado el CDR
+# (_cerrar_resumen_en_sfs)--, y viven de una sola constante justamente porque se
+# desincronizaron: al ampliar solo la consulta para rescatar los resumenes en '05',
+# el cierre siguio exigiendo '08'/'09', asi que un resumen rescatado se consultaba
+# para siempre y nunca podia cerrarse. Quedan afuera los cerrados, y tambien el '01'
+# y el '02': ahi el resumen todavia no salio, y darlo por aceptado seria mentir.
+_ESTADOS_RESUMEN_ABIERTO = ("05", "06", "08", "09", "10")
+
 # Cuántas veces se reenvía un comprobante que SUNAT rechazó. El reenvío manda
 # exactamente los mismos datos, así que si el rechazo es por un dato mal armado el
 # resultado no cambia: sin tope, el daemon reenvía cada ciclo indefinidamente. Al
@@ -1701,16 +1711,16 @@ def _resumenes_con_ticket(ruc_emisor: str) -> list:
     """
     if not os.path.exists(SFS_BD_PATH):
         return []
-    marcas = _marcas(len(_ESTADOS_CERRADOS))
+    marcas = _marcas(len(_ESTADOS_RESUMEN_ABIERTO))
     try:
         with _sfs_bd() as sfs:
             return [
                 (_texto(num), _texto(tk))
                 for num, tk in sfs.execute(
                     f"SELECT NUM_DOCU, NUM_TICKET FROM DOCUMENTO "
-                    f"WHERE NUM_RUC=? AND TIP_DOCU=? AND IND_SITU NOT IN ({marcas}) "
+                    f"WHERE NUM_RUC=? AND TIP_DOCU=? AND IND_SITU IN ({marcas}) "
                     f"AND NUM_TICKET IS NOT NULL AND NUM_TICKET <> ''",
-                    (ruc_emisor, _TIPO_RC, *_ESTADOS_CERRADOS),
+                    (ruc_emisor, _TIPO_RC, *_ESTADOS_RESUMEN_ABIERTO),
                 )
             ]
     except sqlite3.Error:
@@ -1732,15 +1742,23 @@ def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str):
     encuentra un CDR ya descargado: en la bandeja del SFS ese estado significa "ya
     no me ocupo de esto". El veredicto real de SUNAT no vive acá sino en el CDR, que
     es quien decide si las boletas quedan en enviado=true o con su motivo de rechazo.
+
+    El WHERE sale de _ESTADOS_RESUMEN_ABIERTO, la misma constante que decide a cuáles
+    consultarles el ticket. Antes exigía '08'/'09' escrito a mano y quedó atrás
+    cuando la consulta se amplió para rescatar los resúmenes en '05': el rescate
+    funcionaba, pero el cierre no encontraba la fila, el UPDATE afectaba cero filas y
+    el resumen se quedaba en '05' para siempre —reconsultándose y reportándose como
+    trabado aunque sus boletas ya estuvieran cerradas.
     """
     if not os.path.exists(SFS_BD_PATH):
         return
     try:
         with _sfs_bd(escritura=True) as sfs:
             sfs.execute(
-                "UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE='Aceptado (CDR procesado)' "
-                "WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? AND IND_SITU IN ('08','09')",
-                (ruc_emisor, _TIPO_RC, numeracion),
+                f"UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE='Aceptado (CDR procesado)' "
+                f"WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
+                f"AND IND_SITU IN ({_marcas(len(_ESTADOS_RESUMEN_ABIERTO))})",
+                (ruc_emisor, _TIPO_RC, numeracion, *_ESTADOS_RESUMEN_ABIERTO),
             )
     except sqlite3.Error:
         logger.exception("No se pudo cerrar el resumen %s en la bandeja del SFS.", numeracion)
@@ -1776,36 +1794,42 @@ def recuperar_cdr_resumenes(ruc_emisor: str):
                 ticket, numeracion, mensaje,
             )
             continue
-        if codigo is None:
-            veces = _contar_consulta_fallida(_TIPO_RC, numeracion, "sin codigo", mensaje)
+        # La racha se olvida solo ante una respuesta concluyente: el CDR recuperado o
+        # el "todavía lo estoy procesando". Antes se olvidaba apenas el código no
+        # fuera None, con lo que un fault con código —el 0100, por ejemplo, que es un
+        # transitorio documentado de SUNAT— reseteaba la cuenta en cada intento y
+        # jamás llegaba al tope: el resumen se reconsultaba para siempre sin que nadie
+        # se enterara, que es justo lo que MAX_CONSULTAS_FALLIDAS venía a evitar.
+        if codigo == _TICKET_EN_PROCESO:
+            _olvidar_consulta_fallida(_TIPO_RC, numeracion)
+            logger.info("SUNAT todavía procesa el resumen %s (ticket %s).", numeracion, ticket)
+            continue
+        if not (cdr and codigo in _TICKET_CON_CDR):
+            # Sin CDR no hay veredicto, venga o no con código: cuenta contra el tope.
+            veces = _contar_consulta_fallida(
+                _TIPO_RC, numeracion, _texto(codigo) or "sin codigo", mensaje)
             if veces >= MAX_CONSULTAS_FALLIDAS:
                 logger.error(
                     "El ticket %s del resumen %s lleva %d consultas sin respuesta útil "
-                    "(%s). REQUIERE REVISIÓN MANUAL: sus boletas siguen retenidas.",
-                    ticket, numeracion, veces, mensaje,
+                    "(%s: %s). REQUIERE REVISIÓN MANUAL: sus boletas siguen retenidas.",
+                    ticket, numeracion, veces, _texto(codigo) or "sin código", mensaje,
                 )
             else:
-                logger.info("Ticket %s de %s: sin respuesta útil (%s); se reintenta (%d/%d).",
-                            ticket, numeracion, mensaje, veces, MAX_CONSULTAS_FALLIDAS)
+                logger.info(
+                    "Ticket %s de %s: sin respuesta útil (%s: %s); se reintenta (%d/%d).",
+                    ticket, numeracion, _texto(codigo) or "sin código", mensaje,
+                    veces, MAX_CONSULTAS_FALLIDAS,
+                )
             continue
         _olvidar_consulta_fallida(_TIPO_RC, numeracion)
-        if codigo == _TICKET_EN_PROCESO:
-            logger.info("SUNAT todavía procesa el resumen %s (ticket %s).", numeracion, ticket)
-            continue
-        if cdr and codigo in _TICKET_CON_CDR:
-            # Vale tanto para el aceptado como para el rechazado: el parser del CDR
-            # decide cuál es, igual que con cualquier otro comprobante.
-            # El resumen NO se cierra acá: recién cuando el hilo CDR termine de
-            # procesarlo. Cerrarlo al bajarlo dejaba un hueco de segundos en el que
-            # el resumen ya figuraba cerrado —y por lo tanto sus boletas libres—
-            # pero todavía no estaban en enviado=true, así que el ciclo siguiente
-            # las tomaba y armaba otro resumen con las mismas.
-            _guardar_cdr(ruc_emisor, _TIPO_RC, numeracion, cdr, f"ticket {ticket}: {mensaje}")
-        else:
-            logger.warning(
-                "Ticket %s de %s devolvió el código %s sin CDR (%s); se reintenta.",
-                ticket, numeracion, codigo, mensaje,
-            )
+        # Vale tanto para el aceptado como para el rechazado: el parser del CDR
+        # decide cuál es, igual que con cualquier otro comprobante.
+        # El resumen NO se cierra acá: recién cuando el hilo CDR termine de
+        # procesarlo. Cerrarlo al bajarlo dejaba un hueco de segundos en el que
+        # el resumen ya figuraba cerrado —y por lo tanto sus boletas libres—
+        # pero todavía no estaban en enviado=true, así que el ciclo siguiente
+        # las tomaba y armaba otro resumen con las mismas.
+        _guardar_cdr(ruc_emisor, _TIPO_RC, numeracion, cdr, f"ticket {ticket}: {mensaje}")
 
 # ---------------------------------------------------------------------------
 # SFS BD SQLite — gestión de estados

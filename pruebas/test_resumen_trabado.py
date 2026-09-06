@@ -82,6 +82,12 @@ class Captura(logging.Handler):
         self.registros.append((record.levelno, record.getMessage()))
 
 
+# El logger del modulo escribe en el facturador.log real: sin esto, correr la suite
+# ensuciaba el log de produccion con numeraciones inventadas.
+m.logger.handlers = []
+m.logger.propagate = False
+
+
 def con_log(fn):
     """Corre fn capturando lo que loguea el daemon."""
     cap = Captura()
@@ -167,6 +173,88 @@ bd_sfs([(RC, "03", "TICKET-123", "-")])
 resumenes(["B003-000001"], hace_horas=12)
 check(con_log(lambda: m._reportar_resumenes_trabados(RUC)) == [],
       "un RC ya cerrado tampoco")
+
+# --- 6. un resumen rescatado desde '05' queda efectivamente cerrado -----------
+# El rescate y el cierre son las dos puntas del mismo flujo, y se habian
+# desincronizado: la consulta se amplio para levantar los '05' pero el cierre
+# seguia exigiendo '08'/'09', asi que el UPDATE no encontraba la fila. El resumen
+# se quedaba en '05' para siempre, reconsultandose y reportandose como trabado
+# aunque sus boletas ya estuvieran en enviado=1.
+print("\n[6] el resumen rescatado desde '05' se cierra")
+for origen in ("05", "08", "09"):
+    limpiar()
+    ruta = bd_sfs([(RC, origen, "TICKET-123", "lo que sea")])
+    m._cerrar_resumen_en_sfs(RUC, RC)
+    c = sqlite3.connect(ruta)
+    situ = c.execute("SELECT IND_SITU FROM DOCUMENTO WHERE NUM_DOCU=?", (RC,)).fetchone()[0]
+    c.close()
+    check(situ == "03", "desde '%s' queda cerrado en '03' (quedo en '%s')" % (origen, situ))
+
+# Cerrado el resumen, las dos consecuencias que se veian en produccion se apagan.
+limpiar()
+bd_sfs([(RC, "03", "TICKET-123", "Aceptado (CDR procesado)")])
+resumenes(["B003-%06d" % i for i in range(1, 1240)], hace_horas=12)
+check(m._resumenes_con_ticket(RUC) == [], "deja de reconsultarse su ticket")
+check(con_log(lambda: m._reportar_resumenes_trabados(RUC)) == [],
+      "deja de reportarse como trabado")
+
+# Un resumen que nunca salio no se puede dar por aceptado.
+for origen in ("01", "02"):
+    limpiar()
+    ruta = bd_sfs([(RC, origen, "", "Enviado al SFS, esperando CDR")])
+    m._cerrar_resumen_en_sfs(RUC, RC)
+    c = sqlite3.connect(ruta)
+    situ = c.execute("SELECT IND_SITU FROM DOCUMENTO WHERE NUM_DOCU=?", (RC,)).fetchone()[0]
+    c.close()
+    check(situ == origen, "un resumen en '%s' no se convierte en aceptado" % origen)
+
+# --- 7. un codigo sin CDR cuenta contra el tope, no lo resetea ----------------
+# El 0100 es un transitorio documentado de SUNAT. Antes reseteaba la racha en cada
+# intento --se olvidaba apenas el codigo no fuera None-- y por eso nunca escalaba.
+print("\n[7] un codigo sin CDR cuenta contra el tope")
+clave = "consulta:%s-%s" % (m._TIPO_RC, RC)
+
+
+def cuenta_actual():
+    if not os.path.exists(m._REINTENTOS_PATH):
+        return 0
+    return (json.load(open(m._REINTENTOS_PATH)).get(clave) or {}).get("consultas", 0)
+
+
+def consultar_n_veces(respuesta, veces):
+    limpiar()
+    bd_sfs([(RC, "05", "TICKET-123", "lo que sea")])
+    m.consultar_ticket_sunat = lambda ruc, ticket: respuesta
+    for _ in range(veces):
+        m._ultima_consulta.clear()
+        m.recuperar_cdr_resumenes(RUC)
+
+
+consultar_n_veces(("0100", "El sistema no puede responder su solicitud", None),
+                  m.MAX_CONSULTAS_FALLIDAS)
+check(cuenta_actual() == m.MAX_CONSULTAS_FALLIDAS,
+      "un fault 0100 acumula (%d)" % cuenta_actual())
+
+m._ultima_consulta.clear()
+registros = con_log(lambda: m.recuperar_cdr_resumenes(RUC))
+check(any(n >= logging.ERROR for n, _ in registros),
+      "pasado el tope escala a revision manual")
+
+consultar_n_veces((m._TICKET_EN_PROCESO, "En proceso", None), 12)
+check(cuenta_actual() == 0, "el 98 'en proceso' es concluyente: no acumula")
+
+# Cuando por fin llega el CDR, la racha si tiene que olvidarse.
+limpiar()
+bd_sfs([(RC, "05", "TICKET-123", "lo que sea")])
+m.consultar_ticket_sunat = lambda ruc, ticket: ("0100", "no responde", None)
+m.recuperar_cdr_resumenes(RUC)
+check(cuenta_actual() == 1, "arranca la racha")
+GUARDADOS.clear()
+m.consultar_ticket_sunat = lambda ruc, ticket: ("0", "aceptado", b"PK\x03\x04")
+m._ultima_consulta.clear()
+m.recuperar_cdr_resumenes(RUC)
+check(GUARDADOS == [RC], "el CDR se recupera igual")
+check(cuenta_actual() == 0, "y la racha se olvida al llegar el CDR")
 
 if FALLAS:
     print(str(FALLAS) + " FALLA(S)")
