@@ -91,6 +91,31 @@ SOL_CLAVE   = os.getenv("SOL_CLAVE", "").strip()
 # un mensaje genérico reutilizado—. Cualquier otro código se toma como incierto.
 _CODIGOS_NO_REGISTRADO = ("0127",)
 
+# Códigos con los que SUNAT dice que no pudo traer la constancia, no que el
+# comprobante no exista. Verificado contra el catálogo de códigos de SUNAT:
+#   0100  El sistema no puede responder su solicitud. Intente nuevamente
+#   0125  No se pudo obtener la constancia
+#   0126  El ticket no le pertenece al usuario
+# Son fallas del lado de SUNAT al recuperar el CDR, así que la consulta se repite más
+# tarde en vez de darla por perdida. Ojo con la distinción: que sean transitorios NO
+# habilita a reenviar el comprobante —sigue sin saberse si SUNAT lo tiene—, solo a
+# volver a preguntar. El único que autoriza el reenvío es el 0127, y vive aparte.
+#
+# El caso que lo motivó (2026-09-05): F003-006240 recibía 0125 en cada consulta y
+# quedaba en 'desconocido' para siempre, repitiendo un WARNING que nadie termina de
+# notar, mientras en SUNAT la factura estaba aceptada.
+_CODIGOS_CONSULTA_FALLIDA = ("0100", "0125", "0126")
+
+# Cuántas consultas seguidas pueden fallar antes de reportar el comprobante como
+# bloqueado. Sin este tope, un servicio caído por días no se distingue de uno que
+# tarda un minuto: los dos se ven igual en el log.
+MAX_CONSULTAS_FALLIDAS = int(os.getenv("MAX_CONSULTAS_FALLIDAS", "10"))
+
+# Cuánto puede quedarse un CDR en 0 bytes antes de darlo por abandonado. Tiene que
+# ser holgado frente a lo que tarda el SFS en escribir un ZIP —segundos— para no
+# apartar uno que todavía se está escribiendo.
+MINUTOS_CDR_VACIO = int(os.getenv("MINUTOS_CDR_VACIO", "10"))
+
 # Cuánto esperar antes de preguntarle a SUNAT por un comprobante que ya se envió y
 # sigue sin CDR. Por debajo de esto lo más probable es que el CDR solo esté demorando.
 CONSULTA_SUNAT_TRAS_MIN = int(os.getenv("CONSULTA_SUNAT_TRAS_MIN", "10"))
@@ -1406,6 +1431,41 @@ def consultar_estado_sunat(ruc: str, tipo: str, numeracion: str):
     return codigo or None, mensaje, cdr
 
 
+def _contar_consulta_fallida(tipo: str, numeracion: str, codigo: str, mensaje: str) -> int:
+    """
+    Suma una consulta sin respuesta útil y devuelve cuántas seguidas lleva.
+
+    Va en reintentos.json, bajo su propia clave, por el mismo motivo que el resto del
+    archivo: PM2 reinicia el daemon solo, y un contador en memoria volvería a cero en
+    cada reinicio —justo cuando mas importa saber que esto lleva horas—. La clave
+    incluye el tipo porque una consulta se hace por (tipo, numeracion), a diferencia
+    del contador de reenvios, que se lleva solo por numeracion.
+    """
+    clave = f"consulta:{tipo}-{numeracion}"
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        registro = datos.get(clave) or {}
+        veces = int(registro.get("consultas", 0)) + 1
+        datos[clave] = {
+            "tipo": tipo,
+            "consultas": veces,
+            "ultimo": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "codigo": codigo,
+            "motivo": mensaje or registro.get("motivo", ""),
+        }
+        _guardar_reintentos(datos)
+        return veces
+
+
+def _olvidar_consulta_fallida(tipo: str, numeracion: str):
+    """SUNAT respondió algo concluyente: la racha de consultas fallidas ya no importa."""
+    clave = f"consulta:{tipo}-{numeracion}"
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        if datos.pop(clave, None) is not None:
+            _guardar_reintentos(datos)
+
+
 def estado_en_sunat(ruc: str, tipo: str, numeracion: str) -> str:
     """
     'registrado' | 'no_registrado' | 'desconocido', más el CDR si SUNAT lo entrega.
@@ -1419,13 +1479,43 @@ def estado_en_sunat(ruc: str, tipo: str, numeracion: str) -> str:
     if codigo is None:
         return "desconocido", None, mensaje
     if cdr:
+        _olvidar_consulta_fallida(tipo, numeracion)
         return "registrado", cdr, mensaje
     if codigo in _CODIGOS_NO_REGISTRADO:
+        _olvidar_consulta_fallida(tipo, numeracion)
         return "no_registrado", None, mensaje
+
+    # Un código de consulta fallida no dice nada del comprobante: dice que SUNAT no
+    # pudo traer la constancia. Se vuelve a preguntar más tarde en vez de dar el
+    # comprobante por perdido, pero se lleva la cuenta: si el servicio no se
+    # recupera, alguien tiene que enterarse.
+    fallidas = _contar_consulta_fallida(tipo, numeracion, codigo, mensaje)
+    if codigo in _CODIGOS_CONSULTA_FALLIDA:
+        if fallidas >= MAX_CONSULTAS_FALLIDAS:
+            logger.error(
+                "%s-%s lleva %d consultas seguidas sin respuesta útil de SUNAT "
+                "(%s: %s). REQUIERE REVISIÓN MANUAL: verificar en el portal de SUNAT "
+                "si el comprobante está aceptado.",
+                tipo, numeracion, fallidas, codigo, mensaje,
+            )
+        else:
+            logger.info(
+                "SUNAT no pudo darnos la constancia de %s-%s (%s: %s); "
+                "se vuelve a consultar más tarde (%d/%d).",
+                tipo, numeracion, codigo, mensaje, fallidas, MAX_CONSULTAS_FALLIDAS,
+            )
+        return "desconocido", None, mensaje
+
     logger.warning(
         "SUNAT respondió por %s-%s un código que no sabemos interpretar (%s: %s); "
         "no se reenvía por las dudas.", tipo, numeracion, codigo, mensaje,
     )
+    if fallidas >= MAX_CONSULTAS_FALLIDAS:
+        logger.error(
+            "%s-%s lleva %d consultas seguidas con el código %s. REQUIERE REVISIÓN "
+            "MANUAL: el daemon no sabe interpretarlo y no va a resolverse solo.",
+            tipo, numeracion, fallidas, codigo,
+        )
     return "desconocido", None, mensaje
 
 
@@ -1680,8 +1770,24 @@ def _registrar_en_sfs_bd(ruc_emisor: str, docs: list):
 
 
 def _tiene_cdr(ruc: str, tip: str, num: str) -> bool:
+    """
+    True si el CDR de este comprobante ya está en disco.
+
+    Se exige que el archivo tenga contenido, no solo que exista: un ZIP que quedó en
+    0 bytes hacía que recuperar_cdr_pendientes() diera el CDR por recuperado y no
+    volviera a consultarle a SUNAT, mientras el barrido tampoco podía procesarlo. El
+    comprobante quedaba en enviado=0 sin ninguna via de salida (ver
+    _archivo_abandonado).
+    """
     nombre = f"R{ruc}-{tip}-{num}.zip"
-    return any(os.path.exists(os.path.join(d, nombre)) for d in (SFS_RPTA_DIR, DIR_PROCESADOS))
+    for d in (SFS_RPTA_DIR, DIR_PROCESADOS):
+        ruta = os.path.join(d, nombre)
+        try:
+            if os.path.getsize(ruta) > 0:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _eliminar_data_files(nom_arch: str):
@@ -2615,6 +2721,10 @@ def _archivo_estable(ruta: str, intentos: int = 5, espera: float = 0.5) -> bool:
     True cuando el tamaño del archivo dejó de cambiar. SUNAT/SFS deja el ZIP en RPTA
     mientras todavía lo escribe y watchdog avisa apenas se crea: abrirlo de inmediato
     daba BadZipFile —y lo mandaba a errores/— sobre un archivo que estaba sano.
+
+    Un archivo que se queda en 0 bytes nunca se da por estable, y eso es correcto: no
+    hay nada que abrir. Distinguir ese caso de uno que todavía crece es tarea de quien
+    llama (ver _archivo_abandonado), porque acá no se puede saber cuánto lleva así.
     """
     ultimo = -1
     for _ in range(intentos):
@@ -2627,6 +2737,33 @@ def _archivo_estable(ruta: str, intentos: int = 5, espera: float = 0.5) -> bool:
         ultimo = actual
         time.sleep(espera)
     return False
+
+
+def _archivo_abandonado(ruta: str) -> bool:
+    """
+    True si el archivo lleva demasiado tiempo vacío como para seguir esperándolo.
+
+    Un ZIP que se corta a medio escribir —un corte del lado del SFS, disco lleno—
+    queda en 0 bytes para siempre. _archivo_estable() nunca lo da por bueno, asi que
+    el barrido lo saltaba en cada ciclo con el mismo INFO de "aún se está escribiendo"
+    sin que nadie lo resolviera. Visto en produccion el 2026-09-05: horas repitiendo
+    esa linea.
+
+    Y no era solo ruido en el log: _tiene_cdr() solo mira que el archivo exista, asi
+    que ese ZIP vacio hacia que recuperar_cdr_pendientes() diera por recuperado el CDR
+    y no volviera a consultarle a SUNAT. El comprobante quedaba en enviado=0 aunque
+    SUNAT lo hubiera aceptado, sin ninguna via de salida.
+
+    El umbral de tiempo es lo que separa un archivo abandonado de uno que recien
+    empieza: los dos miden 0 bytes, y la unica diferencia es hace cuanto.
+    """
+    try:
+        if os.path.getsize(ruta) > 0:
+            return False
+        edad = time.time() - os.path.getmtime(ruta)
+    except OSError:
+        return False
+    return edad > MINUTOS_CDR_VACIO * 60
 
 
 def procesar_respuestas():
@@ -2660,6 +2797,18 @@ def _barrer_rpta():
             nombre = os.path.basename(ruta)
             try:
                 if not _archivo_estable(ruta):
+                    # Un archivo vacío que ya no va a completarse no puede quedarse en
+                    # RPTA: además de repetir este aviso para siempre, le hace creer a
+                    # _tiene_cdr() que el CDR ya está y bloquea la reconsulta a SUNAT.
+                    if _archivo_abandonado(ruta):
+                        logger.warning(
+                            "CDR %s lleva más de %d min en 0 bytes; quedó a medio escribir. "
+                            "Se aparta en errores/ para que se pueda volver a consultar a SUNAT.",
+                            nombre, MINUTOS_CDR_VACIO,
+                        )
+                        _mover(ruta, DIR_ERRORES)
+                        err += 1
+                        continue
                     # Lo retoma el barrido periódico de hilo_cdr; no cuenta como error.
                     logger.info("CDR %s aún se está escribiendo; se retoma luego.", nombre)
                     continue
