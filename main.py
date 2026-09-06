@@ -1375,6 +1375,22 @@ def _texto_de_nodo(xml: str, etiqueta: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _codigo_de_fault(cuerpo: str) -> str:
+    """
+    Código de SUNAT dentro del faultcode de un error SOAP.
+
+    Viene pegado al espacio de nombres —"soap-env:Client.0127"— y es lo único que
+    distingue un rechazo con veredicto de una falla pasajera. Sin extraerlo, los dos
+    llegaban como None a quien llama y no habia forma de saber si convenia reintentar
+    o si SUNAT ya habia dicho la ultima palabra.
+    """
+    m = re.search(r"<(?:\w+:)?faultcode>(.*?)</(?:\w+:)?faultcode>", cuerpo, re.S)
+    if not m:
+        return ""
+    n = re.search(r"(\d{3,4})\s*$", m.group(1).strip())
+    return n.group(1) if n else ""
+
+
 def consultar_estado_sunat(ruc: str, tipo: str, numeracion: str):
     """
     Pregunta a SUNAT si un comprobante está registrado.
@@ -1578,6 +1594,11 @@ _SOBRE_TICKET = """<?xml version="1.0" encoding="UTF-8"?>
 # que el 98 significa que SUNAT todavía lo está procesando.
 _TICKET_CON_CDR   = ("0", "98", "99")
 _TICKET_EN_PROCESO = "98"
+# Un ticket se consume al consultarlo: a la segunda vez SUNAT responde con este
+# código y ya no hay CDR que recuperar por esa vía. Es el único veredicto definitivo
+# de la consulta de tickets —todo lo demás merece otro intento— y por eso vale la
+# pena distinguirlo en vez de tratarlo como una falla más.
+_TICKET_NO_EXISTE = "0127"
 
 
 def _url_bill_service() -> str:
@@ -1612,9 +1633,15 @@ def consultar_ticket_sunat(ruc: str, ticket: str):
     """
     Pregunta a SUNAT por el resultado de un ticket de resumen.
 
-    Devuelve (codigo, mensaje, cdr_zip). Ante cualquier fallo devuelve
-    (None, motivo, None) y quien llama debe tratarlo como "todavía no sé": el
-    resumen queda como está y se vuelve a consultar en el próximo ciclo.
+    Devuelve (codigo, mensaje, cdr_zip). Un None en el código significa "todavía no
+    sé" —falla de transporte, credenciales, servicio caído— y quien llama debe
+    reintentar más tarde.
+
+    Cuando SUNAT rechaza con un fault codificado, ese código SÍ vuelve: es la única
+    forma de distinguir un ticket que ya se consumió (0127, definitivo) de un
+    "Internal Error" pasajero. Aplastar los dos en None hacía que un resumen trabado
+    se reintentara para siempre o no se reintentara nunca, según de qué lado se
+    errara.
     """
     if not (SOL_USUARIO and SOL_CLAVE):
         return None, "faltan SOL_USUARIO y SOL_CLAVE en el .env", None
@@ -1635,8 +1662,9 @@ def consultar_ticket_sunat(ruc: str, ticket: str):
     except urllib.error.HTTPError as e:
         cuerpo = e.read().decode("utf-8", "replace")
         detalle = _texto_de_nodo(cuerpo, "faultstring") or f"HTTP {e.code}"
+        codigo_fault = _codigo_de_fault(cuerpo)
         logger.warning("Consulta del ticket %s rechazada por SUNAT: %s", ticket, detalle)
-        return None, detalle, None
+        return codigo_fault or None, detalle, None
     except Exception as e:
         logger.warning("No se pudo consultar el ticket %s: %s", ticket, e)
         return None, str(e), None
@@ -1654,18 +1682,35 @@ def consultar_ticket_sunat(ruc: str, ticket: str):
 
 
 def _resumenes_con_ticket(ruc_emisor: str) -> list:
-    """[(num_docu, ticket)] de los resúmenes enviados que esperan respuesta."""
+    """
+    [(num_docu, ticket)] de los resúmenes que todavía pueden resolverse por su ticket.
+
+    Se pide que el resumen NO esté cerrado y que conserve ticket, en vez de exigir
+    los estados '08'/'09' como antes. El motivo: si la consulta del ticket falla
+    —SUNAT devolviendo "Internal Error", por ejemplo— el SFS deja el resumen en '05',
+    y con el filtro viejo eso lo sacaba de esta lista para siempre. El ticket seguía
+    guardado y seguía siendo válido, pero nadie volvía a usarlo.
+
+    Eso paso en produccion el 2026-09-06: siete resumenes quedaron en '05' por una
+    falla pasajera de SUNAT y retuvieron 1239 boletas durante 12 horas, cuando los
+    siete tickets respondian "aceptado" al consultarlos a mano.
+
+    Un ticket ya consumido tambien entra acá, y esta bien: SUNAT contesta 0127 y de
+    eso se encarga recuperar_cdr_resumenes(), que lo distingue de una consulta que
+    fallo y merece otro intento.
+    """
     if not os.path.exists(SFS_BD_PATH):
         return []
+    marcas = _marcas(len(_ESTADOS_CERRADOS))
     try:
         with _sfs_bd() as sfs:
             return [
                 (_texto(num), _texto(tk))
                 for num, tk in sfs.execute(
-                    "SELECT NUM_DOCU, NUM_TICKET FROM DOCUMENTO "
-                    "WHERE NUM_RUC=? AND TIP_DOCU=? AND IND_SITU IN ('08','09') "
-                    "AND NUM_TICKET IS NOT NULL AND NUM_TICKET <> ''",
-                    (ruc_emisor, _TIPO_RC),
+                    f"SELECT NUM_DOCU, NUM_TICKET FROM DOCUMENTO "
+                    f"WHERE NUM_RUC=? AND TIP_DOCU=? AND IND_SITU NOT IN ({marcas}) "
+                    f"AND NUM_TICKET IS NOT NULL AND NUM_TICKET <> ''",
+                    (ruc_emisor, _TIPO_RC, *_ESTADOS_CERRADOS),
                 )
             ]
     except sqlite3.Error:
@@ -1719,10 +1764,31 @@ def recuperar_cdr_resumenes(ruc_emisor: str):
         _ultima_consulta[(_TIPO_RC, numeracion)] = ahora
 
         codigo, mensaje, cdr = consultar_ticket_sunat(ruc_emisor, ticket)
-        if codigo is None:
-            logger.info("Ticket %s de %s: sin respuesta útil (%s); se reintenta.",
-                        ticket, numeracion, mensaje)
+        if codigo == _TICKET_NO_EXISTE:
+            # Definitivo: el ticket se consumió y ya no hay nada que preguntarle a
+            # SUNAT. No se reintenta —daría siempre lo mismo— y se reporta, porque
+            # sus boletas siguen retenidas y solo una persona puede decidir qué
+            # hacer con ellas (ver _reportar_resumenes_trabados).
+            logger.error(
+                "El ticket %s del resumen %s ya no existe en SUNAT (%s). Sus boletas "
+                "siguen retenidas: hay que verificar en el portal si el resumen fue "
+                "aceptado antes de tocar nada.",
+                ticket, numeracion, mensaje,
+            )
             continue
+        if codigo is None:
+            veces = _contar_consulta_fallida(_TIPO_RC, numeracion, "sin codigo", mensaje)
+            if veces >= MAX_CONSULTAS_FALLIDAS:
+                logger.error(
+                    "El ticket %s del resumen %s lleva %d consultas sin respuesta útil "
+                    "(%s). REQUIERE REVISIÓN MANUAL: sus boletas siguen retenidas.",
+                    ticket, numeracion, veces, mensaje,
+                )
+            else:
+                logger.info("Ticket %s de %s: sin respuesta útil (%s); se reintenta (%d/%d).",
+                            ticket, numeracion, mensaje, veces, MAX_CONSULTAS_FALLIDAS)
+            continue
+        _olvidar_consulta_fallida(_TIPO_RC, numeracion)
         if codigo == _TICKET_EN_PROCESO:
             logger.info("SUNAT todavía procesa el resumen %s (ticket %s).", numeracion, ticket)
             continue
@@ -2100,6 +2166,65 @@ def _rdi_presente(ruc_emisor: str, numeracion_rc: str) -> bool:
     """
     base = _nombre_archivo_rc(ruc_emisor, numeracion_rc)
     return os.path.exists(os.path.join(SFS_DATA_DIR, f"{base}.RDI"))
+
+
+def _reportar_resumenes_trabados(ruc_emisor: str):
+    """
+    Avisa por cada resumen que retiene boletas y no termina de resolverse.
+
+    _avisar_resumen_sin_rastro() ya cubre el resumen que desaparecio de la bandeja
+    del SFS, pero no el que sigue ahi en un estado que no avanza. Ese caso no
+    generaba una sola linea: los resumenes no son filas de Comprobantes, asi que
+    nunca llegan al bloque de BLOQUEADOS que arma el ciclo, y el unico rastro era el
+    conteo de pendientes sin nada que lo explicara.
+
+    Es exactamente lo que dejo pasar el incidente del 2026-09-06: siete resumenes
+    trabados retuvieron 1239 boletas durante 12 horas sin un solo WARNING.
+
+    Se avisa desde _GRACIA_REGISTRO_RC_SEG para no gritar por un resumen que acaba de
+    generarse y todavia esta en curso normal.
+    """
+    en_vuelo = _docs_en_vuelo(ruc_emisor)
+    trabados = []
+    for numeracion_rc, entrada in _leer_resumenes().get("resumenes", {}).items():
+        situ, obse = en_vuelo.get((_TIPO_RC, numeracion_rc), ("", ""))
+        if not situ or situ in _ESTADOS_CERRADOS:
+            continue          # sin rastro lo cubre _avisar_resumen_sin_rastro; cerrado no molesta
+        try:
+            generado = datetime.strptime(entrada.get("generado", ""), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        horas = (datetime.now() - generado).total_seconds() / 3600
+        if horas * 3600 < _GRACIA_REGISTRO_RC_SEG:
+            continue
+        trabados.append((numeracion_rc, situ, len(entrada.get("boletas", [])), horas, obse))
+
+    if not trabados:
+        return
+    retenidas = sum(t[2] for t in trabados)
+    logger.warning(
+        "%d resumen(es) sin resolverse retienen %d boleta(s), que no se pueden "
+        "reagrupar hasta que se cierren:", len(trabados), retenidas,
+    )
+    for numeracion_rc, situ, cuantas, horas, obse in sorted(trabados, key=lambda t: -t[3]):
+        logger.warning(
+            "    %s [%s] — %d boleta(s), %.1f h sin cerrar: %s",
+            numeracion_rc, _nombre_situ_rc(situ), cuantas, horas, obse or "sin detalle",
+        )
+
+
+def _nombre_situ_rc(situ: str) -> str:
+    """
+    Nombre del estado tal como se lee en un resumen, no en un comprobante.
+
+    _NOMBRE_SITU traduce el '05' como "anulado", que es lo que significa para una
+    factura. En un resumen ese estado lo deja el SFS cuando la consulta del ticket
+    no le sirvio, y nada se anulo: mostrar "anulado" manda a buscar algo que no
+    paso, justo en el aviso que existe para orientar a quien lo lee.
+    """
+    if situ == "05":
+        return "05, consulta del ticket sin resolver"
+    return _NOMBRE_SITU.get(situ, situ)
 
 
 def _avisar_resumen_sin_rastro(numeracion_rc: str, entrada: dict, boletas: list):
@@ -2979,6 +3104,9 @@ def ciclo_generacion():
             logger.exception("Error generando el resumen diario de boletas")
 
         _reportar_clasificacion(fuera_alcance, omitidos, bloqueados)
+        # Va aparte porque los resúmenes no son filas de Comprobantes y por eso nunca
+        # entran en la lista de bloqueados que arma el bucle de arriba.
+        _reportar_resumenes_trabados(ruc_emisor)
 
         if docs_generados:
             logger.info("%d comprobante(s) generados, entregando al SFS...", len(docs_generados))
