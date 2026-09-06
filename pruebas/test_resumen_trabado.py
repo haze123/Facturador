@@ -256,6 +256,56 @@ m.recuperar_cdr_resumenes(RUC)
 check(GUARDADOS == [RC], "el CDR se recupera igual")
 check(cuenta_actual() == 0, "y la racha se olvida al llegar el CDR")
 
+# --- 8. un resumen con el CDR ya procesado se cierra ---------------------------
+# _cerrar_resumen_en_sfs() solo corre al procesar un CDR, y recuperar_cdr_resumenes()
+# saltea con `continue` todo resumen que ya tenga CDR en disco. Un resumen con el CDR
+# archivado y la fila abierta quedaba entre esas dos: nadie lo reconsultaba, nadie lo
+# reprocesaba, nadie lo cerraba. Permanente.
+print("\n[8] resumen con el CDR ya procesado")
+
+
+def poner_cdr(carpeta):
+    ruta = os.path.join(carpeta, "R%s-%s-%s.zip" % (RUC, m._TIPO_RC, RC))
+    with open(ruta, "wb") as fh:
+        fh.write(b"PK\x03\x04")
+    return ruta
+
+
+def situ_de(ruta_bd):
+    c = sqlite3.connect(ruta_bd)
+    fila = c.execute("SELECT IND_SITU FROM DOCUMENTO WHERE NUM_DOCU=?", (RC,)).fetchone()
+    c.close()
+    return fila[0]
+
+
+CONSULTADOS = []
+m.consultar_ticket_sunat = lambda ruc, ticket: CONSULTADOS.append(ticket) or (None, "x", None)
+
+limpiar()
+ruta_bd = bd_sfs([(RC, "05", "TICKET-123", "Internal Error (from server)")])
+poner_cdr(m.DIR_PROCESADOS)
+CONSULTADOS.clear()
+m.recuperar_cdr_resumenes(RUC)
+check(situ_de(ruta_bd) == "03",
+      "con el CDR en procesados/ queda cerrado (quedo en '%s')" % situ_de(ruta_bd))
+check(CONSULTADOS == [], "y no vuelve a consultarle el ticket a SUNAT")
+
+# Ya cerrado, se apagan los dos sintomas que se veian en produccion.
+resumenes(["B003-%06d" % i for i in range(1, 1240)], hace_horas=12)
+check(m._resumenes_con_ticket(RUC) == [], "deja de aparecer entre los que tienen ticket")
+check(con_log(lambda: m._reportar_resumenes_trabados(RUC)) == [],
+      "deja de reportarse como trabado")
+
+# El CDR en RPTA todavia no se repartio entre las boletas: cerrar ahi daria el
+# resumen por bueno con sus boletas en enviado=0.
+limpiar()
+ruta_bd = bd_sfs([(RC, "05", "TICKET-123", "Internal Error (from server)")])
+poner_cdr(m.SFS_RPTA_DIR)
+m._ultima_consulta.clear()
+m.recuperar_cdr_resumenes(RUC)
+check(situ_de(ruta_bd) == "05",
+      "con el CDR aun en RPTA NO se cierra (quedo en '%s')" % situ_de(ruta_bd))
+
 if FALLAS:
     print(str(FALLAS) + " FALLA(S)")
     sys.exit(1)
