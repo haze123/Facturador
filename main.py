@@ -1775,6 +1775,21 @@ def recuperar_cdr_resumenes(ruc_emisor: str):
     ahora = time.monotonic()
     for numeracion, ticket in _resumenes_con_ticket(ruc_emisor):
         if _tiene_cdr(ruc_emisor, _TIPO_RC, numeracion):
+            # Con el CDR ya archivado, el resumen deberia estar cerrado en la bandeja
+            # —lo cierra _actualizar_sql_cdr() al procesarlo—, pero si por lo que sea
+            # no lo esta, nada volveria a moverlo: este continue corta antes de
+            # reconsultar, el CDR ya no vuelve a RPTA y el hilo CDR no lo reprocesa,
+            # asi que _cerrar_resumen_en_sfs() no llega a correr nunca. El resumen se
+            # quedaba en su estado abierto de forma permanente, reconsultandose no
+            # —eso lo frena este mismo corte— pero si reportandose como trabado en
+            # cada ciclo, diciendo que retiene boletas que ya estan cerradas.
+            #
+            # Solo con el CDR en procesados/, no en RPTA: que el archivo exista no
+            # significa que el hilo CDR ya lo haya repartido entre las boletas, y
+            # cerrar antes daria el resumen por bueno con sus boletas todavia en
+            # enviado=0.
+            if _cdr_ya_procesado(ruc_emisor, _TIPO_RC, numeracion):
+                _cerrar_resumen_en_sfs(ruc_emisor, numeracion)
             continue
         previo = _ultima_consulta.get((_TIPO_RC, numeracion))
         if previo is not None and ahora - previo < _COOLDOWN_CONSULTA_SEG:
@@ -1878,6 +1893,22 @@ def _tiene_cdr(ruc: str, tip: str, num: str) -> bool:
         except OSError:
             continue
     return False
+
+
+def _cdr_ya_procesado(ruc: str, tip: str, num: str) -> bool:
+    """
+    True si el CDR ya paso por el hilo CDR y quedo archivado.
+
+    La distincion con _tiene_cdr() importa: que el archivo este en RPTA solo dice
+    que se bajo, no que se haya repartido entre las boletas. Recien cuando el
+    barrido lo procesa sin errores lo mueve a procesados/, y esa mudanza es la
+    unica evidencia de que el CDR ya hizo su trabajo.
+    """
+    ruta = os.path.join(DIR_PROCESADOS, f"R{ruc}-{tip}-{num}.zip")
+    try:
+        return os.path.getsize(ruta) > 0
+    except OSError:
+        return False
 
 
 def _eliminar_data_files(nom_arch: str):
