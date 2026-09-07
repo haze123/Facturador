@@ -393,8 +393,12 @@ RED = "Hubo un problema al invocar servicio SUNAT: Could not send Message."
 limpiar()
 MARCADOS.clear()
 ruta_bd = bd_sfs([(RC, "06", "", RED)])
+resumenes(["B003-000001"])
 m.resetear_rechazados(None, RUC)
-check(MARCADOS == [RC], "sin ticket vuelve a la cola (%s)" % MARCADOS)
+# Un RC vuelve a la cola descartandose --sus boletas se reagrupan en uno nuevo--, no
+# con marcar_enviado(), que con la numeracion de un resumen no matchea ninguna fila.
+check(RC not in (json.load(open(m._RESUMENES_PATH)).get("resumenes") or {}),
+      "sin ticket se descarta para volver a armarse")
 c = sqlite3.connect(ruta_bd)
 quedan = c.execute("SELECT COUNT(*) FROM DOCUMENTO WHERE NUM_DOCU=?", (RC,)).fetchone()[0]
 c.close()
@@ -421,6 +425,39 @@ m.resetear_rechazados(None, RUC)
 check(llamadas == [("01", "F003-000123")],
       "una factura si se consulta con estado_en_sunat (%s)" % llamadas)
 check(MARCADOS == ["F003-000123"], "y vuelve a la cola como antes")
+
+# --- 12. reencolar un resumen tiene que liberar sus boletas de verdad ----------
+# Reencolarlo borra su fila de la bandeja, y sin rastro _boletas_en_resumenes_activos()
+# retiene ante la duda --correctamente, porque ahi no sabe que paso--. Si al descartar
+# el resumen no se olvida tambien su entrada en resumenes.json, sus boletas quedan
+# retenidas por algo que ya no existe: un bloqueo cambiado por otro.
+print("\n[12] las boletas se liberan al descartar el resumen")
+BOLETAS_RC = ["B003-%06d" % i for i in range(1, 201)]
+
+limpiar()
+MARCADOS.clear()
+m.estado_en_sunat = explota
+bd_sfs([(RC, "06", "", RED)])
+resumenes(BOLETAS_RC)
+registros = con_log(lambda: m.resetear_rechazados(None, RUC))
+check(m._boletas_en_resumenes_activos(RUC) == set(),
+      "sin ticket, las 200 boletas quedan libres para un resumen nuevo")
+check(RC not in (json.load(open(m._RESUMENES_PATH)).get("resumenes") or {}),
+      "y el resumen descartado sale de resumenes.json")
+texto = " ".join(t for _, t in registros)
+check("200" in texto, "el log dice cuantas boletas vuelven a la cola")
+check(MARCADOS == [],
+      "no se llama marcar_enviado con la numeracion del RC: no es fila de Comprobantes")
+
+# Con ticket no se descarta nada: SUNAT lo recibio y sus boletas siguen ligadas.
+limpiar()
+bd_sfs([(RC, "06", "TICKET-123", RED)])
+resumenes(BOLETAS_RC)
+m.resetear_rechazados(None, RUC)
+check(len(m._boletas_en_resumenes_activos(RUC)) == 200,
+      "con ticket las boletas siguen retenidas")
+check(RC in (json.load(open(m._RESUMENES_PATH)).get("resumenes") or {}),
+      "y el resumen sigue registrado")
 
 if FALLAS:
     print(str(FALLAS) + " FALLA(S)")
