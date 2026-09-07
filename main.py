@@ -111,6 +111,14 @@ _CODIGOS_CONSULTA_FALLIDA = ("0100", "0125", "0126")
 # tarda un minuto: los dos se ven igual en el log.
 MAX_CONSULTAS_FALLIDAS = int(os.getenv("MAX_CONSULTAS_FALLIDAS", "10"))
 
+# Cuántas horas puede un ticket contestar "todavía lo estoy procesando" antes de que
+# el aviso escale. SUNAT normalmente tarda minutos, así que 3 horas es holgado de
+# sobra; el numero importa por el otro lado, porque un resumen estuvo 24 horas asi
+# --con 200 boletas retenidas y ya muerto del lado de SUNAT-- sin que nada lo
+# señalara. El max(1, ...) evita que un 0 en el .env convierta cada consulta normal
+# en una alarma.
+HORAS_TICKET_EN_PROCESO = max(1, int(os.getenv("HORAS_TICKET_EN_PROCESO", "3")))
+
 # Cuánto puede quedarse un CDR en 0 bytes antes de darlo por abandonado. Tiene que
 # ser holgado frente a lo que tarda el SFS en escribir un ZIP —segundos— para no
 # apartar uno que todavía se está escribiendo.
@@ -1483,6 +1491,44 @@ def _contar_consulta_fallida(tipo: str, numeracion: str, codigo: str, mensaje: s
         return veces
 
 
+def _horas_en_proceso(numeracion: str) -> float:
+    """
+    Horas que lleva un ticket contestando "todavía lo estoy procesando".
+
+    Se anota la primera vez y de ahí se mide. Va en reintentos.json y no en memoria
+    por el mismo motivo que el resto del archivo: PM2 reinicia el daemon solo, y un
+    contador en memoria arrancaría de cero en cada reinicio —justo cuando lo que hace
+    falta saber es que esto lleva horas—.
+
+    La cuenta arranca al primer "en proceso" y no cuando se genero el resumen: lo que
+    interesa es hace cuanto que SUNAT viene diciendo lo mismo, no cuanto hace que
+    existe el documento.
+    """
+    clave = f"proceso:{numeracion}"
+    ahora = datetime.now()
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        registro = datos.get(clave) or {}
+        desde = registro.get("desde")
+        if not desde:
+            datos[clave] = {"desde": ahora.strftime("%Y-%m-%d %H:%M:%S")}
+            _guardar_reintentos(datos)
+            return 0.0
+    try:
+        return (ahora - datetime.strptime(desde, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600
+    except ValueError:
+        return 0.0
+
+
+def _olvidar_en_proceso(numeracion: str):
+    """El ticket dejó de estar en proceso: la cuenta de horas ya no importa."""
+    clave = f"proceso:{numeracion}"
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        if datos.pop(clave, None) is not None:
+            _guardar_reintentos(datos)
+
+
 def _olvidar_consulta_fallida(tipo: str, numeracion: str):
     """SUNAT respondió algo concluyente: la racha de consultas fallidas ya no importa."""
     clave = f"consulta:{tipo}-{numeracion}"
@@ -1602,13 +1648,39 @@ _SOBRE_TICKET = """<?xml version="1.0" encoding="UTF-8"?>
 # Códigos de getStatus (distintos de los de getStatusCdr): 0 y 99 traen el CDR —el
 # 99 es el de un resumen procesado CON errores, y su CDR explica cuáles—, mientras
 # que el 98 significa que SUNAT todavía lo está procesando.
+#
+# Van SIN los ceros a la izquierda porque se comparan contra _norm_codigo_ticket().
+# SUNAT no es consistente consigo mismo en este mismo servicio: verificado en
+# producción el 2026-09-06, la aceptación vuelve como '0' —un carácter— y el "en
+# proceso" como '0098' —cuatro—. Con las constantes escritas a mano, '0098' == '98'
+# daba False siempre y la rama de "en proceso" era código muerto: la respuesta más
+# común de SUNAT se contaba como consulta fallida y terminaba reportando REVISIÓN
+# MANUAL sobre un resumen que estaba avanzando normalmente.
 _TICKET_CON_CDR   = ("0", "98", "99")
 _TICKET_EN_PROCESO = "98"
 # Un ticket se consume al consultarlo: a la segunda vez SUNAT responde con este
 # código y ya no hay CDR que recuperar por esa vía. Es el único veredicto definitivo
 # de la consulta de tickets —todo lo demás merece otro intento— y por eso vale la
 # pena distinguirlo en vez de tratarlo como una falla más.
-_TICKET_NO_EXISTE = "0127"
+_TICKET_NO_EXISTE = "127"
+
+
+def _norm_codigo_ticket(codigo) -> str:
+    """
+    El código de getStatus sin los ceros de la izquierda, para poder compararlo.
+
+    Existe porque SUNAT devuelve el mismo código en anchos distintos según la
+    respuesta ('0' contra '0098'), y comparar el texto crudo hacía fallar la
+    comparación justo en el caso más frecuente.
+
+    El '0' se conserva como '0' y no se convierte en cadena vacía: vacío significa
+    "SUNAT no dijo nada" —una falla de transporte— y cero significa "aceptado". Son
+    dos cosas opuestas y aplastarlas daría por bueno un envío que nunca respondió.
+    """
+    texto = _texto(codigo)
+    if not texto:
+        return ""
+    return texto.lstrip("0") or "0"
 
 
 def _url_bill_service() -> str:
@@ -1728,6 +1800,33 @@ def _resumenes_con_ticket(ruc_emisor: str) -> list:
         return []
 
 
+def _ticket_de_resumen(ruc_emisor: str, numeracion: str) -> str:
+    """
+    Ticket guardado de un resumen, o "" si no tiene.
+
+    Sirve como evidencia de si SUNAT llegó a recibirlo: el ticket lo escribe el SFS
+    con lo que devuelve sendSummary, así que sin ticket el envío no llegó. Es lo que
+    permite decidir si un resumen trabado se puede volver a armar sin arriesgar
+    declarar las mismas boletas dos veces.
+    """
+    if not os.path.exists(SFS_BD_PATH):
+        return ""
+    try:
+        with _sfs_bd() as sfs:
+            fila = sfs.execute(
+                "SELECT NUM_TICKET FROM DOCUMENTO "
+                "WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=?",
+                (ruc_emisor, _TIPO_RC, numeracion),
+            ).fetchone()
+    except sqlite3.Error:
+        # Ante la duda se responde "tiene ticket": eso frena el reenvío, que es el
+        # lado seguro. Decir que no tiene habilitaría a declarar de nuevo algo que
+        # quizá SUNAT ya recibió.
+        logger.exception("No se pudo leer el ticket del resumen %s.", numeracion)
+        return "desconocido"
+    return _texto(fila[0]) if fila else ""
+
+
 def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str):
     """
     Da por cerrado el resumen en la bandeja del SFS una vez que su CDR está en RPTA.
@@ -1797,6 +1896,7 @@ def recuperar_cdr_resumenes(ruc_emisor: str):
         _ultima_consulta[(_TIPO_RC, numeracion)] = ahora
 
         codigo, mensaje, cdr = consultar_ticket_sunat(ruc_emisor, ticket)
+        codigo = _norm_codigo_ticket(codigo)
         if codigo == _TICKET_NO_EXISTE:
             # Definitivo: el ticket se consumió y ya no hay nada que preguntarle a
             # SUNAT. No se reintenta —daría siempre lo mismo— y se reporta, porque
@@ -1816,8 +1916,26 @@ def recuperar_cdr_resumenes(ruc_emisor: str):
         # jamás llegaba al tope: el resumen se reconsultaba para siempre sin que nadie
         # se enterara, que es justo lo que MAX_CONSULTAS_FALLIDAS venía a evitar.
         if codigo == _TICKET_EN_PROCESO:
+            # "Todavía lo estoy procesando" no es una falla, así que no gasta el
+            # presupuesto de consultas fallidas. Pero tampoco puede repetirse en un
+            # INFO tranquilo para siempre: un ticket que dice esto durante 24 horas
+            # está muerto del lado de SUNAT, no encolado —verificado el 2026-09-06,
+            # cuando otro resumen enviado ese mismo día se proceso en minutos—.
+            # Por eso se lleva desde cuándo, y pasado el umbral el aviso escala.
             _olvidar_consulta_fallida(_TIPO_RC, numeracion)
-            logger.info("SUNAT todavía procesa el resumen %s (ticket %s).", numeracion, ticket)
+            horas = _horas_en_proceso(numeracion)
+            if horas >= HORAS_TICKET_EN_PROCESO:
+                logger.error(
+                    "El ticket %s del resumen %s lleva %.1f h en 'en proceso' y "
+                    "retiene %d boleta(s). REQUIERE REVISIÓN MANUAL: verificar en el "
+                    "portal de SUNAT si el resumen se declaró. NO se reenvía solo: ya "
+                    "tiene ticket, así que SUNAT lo recibió y reenviarlo declararía "
+                    "las mismas boletas dos veces.",
+                    ticket, numeracion, horas, len(_boletas_de_resumen(numeracion)),
+                )
+            else:
+                logger.info("SUNAT todavía procesa el resumen %s (ticket %s, %.1f h).",
+                            numeracion, ticket, horas)
             continue
         if not (cdr and codigo in _TICKET_CON_CDR):
             # Sin CDR no hay veredicto, venga o no con código: cuenta contra el tope.
@@ -1837,6 +1955,8 @@ def recuperar_cdr_resumenes(ruc_emisor: str):
                 )
             continue
         _olvidar_consulta_fallida(_TIPO_RC, numeracion)
+        # Llegó el CDR: si venía de una racha de "en proceso", esa cuenta ya no importa.
+        _olvidar_en_proceso(numeracion)
         # Vale tanto para el aceptado como para el rechazado: el parser del CDR
         # decide cuál es, igual que con cualquier otro comprobante.
         # El resumen NO se cierra acá: recién cuando el hilo CDR termine de
@@ -2468,16 +2588,40 @@ def resetear_rechazados(conn, ruc_emisor: str):
                 # Un "no se pudo enviar" no distingue entre "nunca salió" y "salió y
                 # la respuesta se perdió". Reenviar el segundo caso duplica el
                 # comprobante ante SUNAT, y eso solo se deshace con una nota de
-                # crédito: se le pregunta a SUNAT antes de tocar nada. Un
-                # 'desconocido' NO habilita el reenvío (ver estado_en_sunat).
-                estado, cdr, mensaje = estado_en_sunat(ruc_emisor, tip_docu, num_docu)
-                if estado == "registrado":
-                    _guardar_cdr(ruc_emisor, tip_docu, num_docu, cdr, mensaje)
-                    continue
-                if estado != "no_registrado":
-                    cortes, minutos = _anotar_espera_de_red(num_docu, tip_docu, _texto(des_obse))
-                    esperando.append((tip_docu, num_docu, minutos))
-                    continue
+                # crédito, así que hace falta una evidencia antes de tocar nada.
+                #
+                # Para un resumen esa evidencia NO es estado_en_sunat(): esa consulta
+                # va contra billConsultService, que solo acepta comprobantes
+                # individuales, y con tip_docu='RC' SUNAT contesta "0009: EL tipo de
+                # comprobante debe de ser (01, 07, 08, ...)". RC no está en esa lista
+                # y nunca va a estarlo, así que la respuesta no dice nada del
+                # documento y el resumen quedaba reintentando una consulta imposible
+                # para siempre —RC-20260906-016 acumuló 54 consultas así, con sus
+                # boletas sin declarar—.
+                #
+                # La evidencia para un resumen es el ticket: lo escribe el SFS cuando
+                # SUNAT responde a sendSummary, así que su ausencia significa que el
+                # envío no llegó. Es el equivalente del 0127 que autoriza a reenviar
+                # un comprobante suelto. Al revés, un resumen CON ticket ya fue
+                # recibido y no se reenvía por acá: lo resuelve
+                # recuperar_cdr_resumenes() consultando ese ticket.
+                if tip_docu == _TIPO_RC:
+                    if _ticket_de_resumen(ruc_emisor, num_docu):
+                        cortes, minutos = _anotar_espera_de_red(
+                            num_docu, tip_docu, _texto(des_obse))
+                        esperando.append((tip_docu, num_docu, minutos))
+                        continue
+                    # Sin ticket: SUNAT no lo recibió y se puede volver a armar.
+                else:
+                    estado, cdr, mensaje = estado_en_sunat(ruc_emisor, tip_docu, num_docu)
+                    if estado == "registrado":
+                        _guardar_cdr(ruc_emisor, tip_docu, num_docu, cdr, mensaje)
+                        continue
+                    if estado != "no_registrado":
+                        cortes, minutos = _anotar_espera_de_red(
+                            num_docu, tip_docu, _texto(des_obse))
+                        esperando.append((tip_docu, num_docu, minutos))
+                        continue
                 cortes, minutos = _anotar_espera_de_red(num_docu, tip_docu, _texto(des_obse))
                 _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
                                      limpiar_error=False)
