@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main as m                                            # noqa: E402
@@ -39,15 +40,16 @@ def check(cond, msg):
     print(("  OK    " if cond else "  FALLA "), msg)
 
 
-def bd_sfs(filas):
-    """filas: [(num_docu, ind_situ, num_ticket, des_obse)]"""
+def bd_sfs(filas, tipo=None):
+    """filas: [(num_docu, ind_situ, num_ticket, des_obse)]; tipo por defecto, RC."""
+    tipo = tipo or m._TIPO_RC
     ruta = os.path.join(TMP, "sfs%d.db" % time.time_ns())
     c = sqlite3.connect(ruta)
     c.execute("CREATE TABLE DOCUMENTO (NUM_RUC TEXT, TIP_DOCU TEXT, NUM_DOCU TEXT, "
               "NOM_ARCH TEXT, IND_SITU TEXT, DES_OBSE TEXT, NUM_TICKET TEXT, FEC_ENVI TEXT)")
     c.executemany("INSERT INTO DOCUMENTO (NUM_RUC, TIP_DOCU, NUM_DOCU, NOM_ARCH, "
                   "IND_SITU, DES_OBSE, NUM_TICKET) VALUES (?,?,?,?,?,?,?)",
-                  [(RUC, m._TIPO_RC, n, n, s, o, t) for n, s, t, o in filas])
+                  [(RUC, tipo, n, n, s, o, t) for n, s, t, o in filas])
     c.commit()
     c.close()
     m.SFS_BD_PATH = ruta
@@ -305,6 +307,120 @@ m._ultima_consulta.clear()
 m.recuperar_cdr_resumenes(RUC)
 check(situ_de(ruta_bd) == "05",
       "con el CDR aun en RPTA NO se cierra (quedo en '%s')" % situ_de(ruta_bd))
+
+# --- 9. los codigos de SUNAT vienen en dos anchos distintos --------------------
+# El exito vuelve como '0' y el "en proceso" como '0098', del mismo servicio. Con
+# las constantes comparadas al texto crudo, '0098' == '98' daba False y la rama de
+# "en proceso" era codigo muerto: la respuesta mas comun se contaba como falla.
+print("\n[9] normalizacion del codigo del ticket")
+check(m._norm_codigo_ticket("0098") == m._TICKET_EN_PROCESO, "'0098' es 'en proceso'")
+check(m._norm_codigo_ticket("98") == m._TICKET_EN_PROCESO, "'98' tambien")
+check(m._norm_codigo_ticket("0") in m._TICKET_CON_CDR, "'0' sigue siendo aceptado")
+check(m._norm_codigo_ticket("0127") == m._TICKET_NO_EXISTE, "'0127' sigue siendo definitivo")
+check(m._norm_codigo_ticket("") == "" and m._norm_codigo_ticket(None) == "",
+      "vacio y None no se confunden con '0': significan que SUNAT no dijo nada")
+
+limpiar()
+bd_sfs([(RC, "08", "TICKET-123", "")])
+m.consultar_ticket_sunat = lambda ruc, ticket: ("0098", "", None)
+for _ in range(m.MAX_CONSULTAS_FALLIDAS + 2):
+    m._ultima_consulta.clear()
+    m.recuperar_cdr_resumenes(RUC)
+reg = json.load(open(m._REINTENTOS_PATH)) if os.path.exists(m._REINTENTOS_PATH) else {}
+check((reg.get("consulta:%s-%s" % (m._TIPO_RC, RC)) or {}).get("consultas", 0) == 0,
+      "un '0098' repetido NO gasta el presupuesto de consultas fallidas")
+
+# --- 10. un ticket eterno en "en proceso" escala ------------------------------
+print("\n[10] el ticket en proceso tiene limite de tiempo")
+limpiar()
+bd_sfs([(RC, "08", "TICKET-123", "")])
+resumenes(["B003-%06d" % i for i in range(1, 201)], hace_horas=24)
+m.consultar_ticket_sunat = lambda ruc, ticket: ("0098", "", None)
+registros = con_log(lambda: m.recuperar_cdr_resumenes(RUC))
+check(all(n < logging.ERROR for n, _ in registros),
+      "recien empezado no hace ruido")
+
+# Se envejece la marca para no esperar horas reales.
+datos = json.load(open(m._REINTENTOS_PATH))
+viejo = datetime.now() - timedelta(hours=m.HORAS_TICKET_EN_PROCESO + 1)
+datos["proceso:%s" % RC] = {"desde": viejo.strftime("%Y-%m-%d %H:%M:%S")}
+with open(m._REINTENTOS_PATH, "w", encoding="utf-8") as fh:
+    json.dump(datos, fh)
+
+m._ultima_consulta.clear()
+registros = con_log(lambda: m.recuperar_cdr_resumenes(RUC))
+texto = " ".join(t for _, t in registros)
+check(any(n >= logging.ERROR for n, _ in registros), "pasado el umbral escala a ERROR")
+check("200" in texto, "dice cuantas boletas retiene")
+check("NO se reenvia" in texto or "NO se reenvía" in texto,
+      "y deja explicito que no se reenvia solo")
+
+# Cuando por fin llega el CDR, la cuenta de horas se olvida.
+GUARDADOS.clear()
+m.consultar_ticket_sunat = lambda ruc, ticket: ("0", "aceptado", b"PK\x03\x04")
+m._ultima_consulta.clear()
+m.recuperar_cdr_resumenes(RUC)
+check(GUARDADOS == [RC], "el CDR se recupera")
+check("proceso:%s" % RC not in json.load(open(m._REINTENTOS_PATH)),
+      "y la cuenta de horas se limpia")
+
+# --- 11. un resumen en '06' no se consulta como si fuera una factura ----------
+# estado_en_sunat() va contra billConsultService, que no acepta tipo RC: responde
+# 0009 y el resumen quedaba reintentando una consulta imposible para siempre.
+print("\n[11] resumen en '06': el ticket decide, no estado_en_sunat")
+
+
+def explota(*a, **k):
+    raise AssertionError("estado_en_sunat no debe llamarse para un resumen")
+
+
+MARCADOS = []
+
+
+class FakeBD:
+    @staticmethod
+    def marcar_enviado(conn, num, enviado=True, limpiar_error=True):
+        MARCADOS.append(num)
+        return 1
+
+
+m._bd = lambda: FakeBD()
+m._escribir_bd = lambda fn, conn, *a, **k: fn(conn, *a, **k)
+m.estado_en_sunat = explota
+RED = "Hubo un problema al invocar servicio SUNAT: Could not send Message."
+
+# Sin ticket: SUNAT no lo recibio, se puede volver a armar.
+limpiar()
+MARCADOS.clear()
+ruta_bd = bd_sfs([(RC, "06", "", RED)])
+m.resetear_rechazados(None, RUC)
+check(MARCADOS == [RC], "sin ticket vuelve a la cola (%s)" % MARCADOS)
+c = sqlite3.connect(ruta_bd)
+quedan = c.execute("SELECT COUNT(*) FROM DOCUMENTO WHERE NUM_DOCU=?", (RC,)).fetchone()[0]
+c.close()
+check(quedan == 0, "y se saca de la bandeja para regenerarse")
+
+# Con ticket: SUNAT ya lo recibio, reenviarlo duplicaria las boletas.
+limpiar()
+MARCADOS.clear()
+ruta_bd = bd_sfs([(RC, "06", "TICKET-123", RED)])
+m.resetear_rechazados(None, RUC)
+check(MARCADOS == [], "con ticket NO se reenvia")
+c = sqlite3.connect(ruta_bd)
+quedan = c.execute("SELECT COUNT(*) FROM DOCUMENTO WHERE NUM_DOCU=?", (RC,)).fetchone()[0]
+c.close()
+check(quedan == 1, "y sigue en la bandeja")
+
+# Una factura conserva el camino de siempre: ahi estado_en_sunat SI corresponde.
+limpiar()
+MARCADOS.clear()
+bd_sfs([("F003-000123", "06", "", RED)], tipo="01")
+llamadas = []
+m.estado_en_sunat = lambda ruc, tip, num: llamadas.append((tip, num)) or ("no_registrado", None, "")
+m.resetear_rechazados(None, RUC)
+check(llamadas == [("01", "F003-000123")],
+      "una factura si se consulta con estado_en_sunat (%s)" % llamadas)
+check(MARCADOS == ["F003-000123"], "y vuelve a la cola como antes")
 
 if FALLAS:
     print(str(FALLAS) + " FALLA(S)")
