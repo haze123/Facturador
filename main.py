@@ -2288,6 +2288,29 @@ def _registrar_resumen(numeracion_rc: str, boletas: list):
         _guardar_resumenes(datos)
 
 
+def _olvidar_resumen(numeracion_rc: str) -> list:
+    """
+    Borra el registro de un resumen y devuelve las boletas que tenía.
+
+    Solo corresponde cuando hay certeza de que SUNAT nunca lo recibió —un envío que
+    fallo sin llegar a devolver ticket—, porque libera sus boletas para que se
+    reagrupen en un resumen nuevo. Es la misma intervención que hasta ahora había que
+    hacer a mano sobre resumenes.json.
+
+    Sin esto, reencolar un resumen no alcanzaba: al borrar su fila de la bandeja del
+    SFS quedaba sin rastro, y _boletas_en_resumenes_activos() retiene ante la falta
+    de rastro —correctamente, porque ahí no sabe qué paso—. Las boletas quedaban
+    retenidas por un resumen que ya no existía: un bloqueo cambiado por otro.
+    """
+    with _lock_resumenes:
+        datos = _leer_resumenes()
+        entrada = (datos.get("resumenes") or {}).pop(numeracion_rc, None)
+        if entrada is None:
+            return []
+        _guardar_resumenes(datos)
+    return entrada.get("boletas", [])
+
+
 def _boletas_de_resumen(numeracion_rc: str) -> list:
     entrada = _leer_resumenes().get("resumenes", {}).get(numeracion_rc) or {}
     return entrada.get("boletas", [])
@@ -2623,8 +2646,22 @@ def resetear_rechazados(conn, ruc_emisor: str):
                         esperando.append((tip_docu, num_docu, minutos))
                         continue
                 cortes, minutos = _anotar_espera_de_red(num_docu, tip_docu, _texto(des_obse))
-                _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
-                                     limpiar_error=False)
+                if tip_docu == _TIPO_RC:
+                    # Un resumen no es una fila de Comprobantes: marcar_enviado() con
+                    # su numeración no matchea nada. Lo que hay que devolver a la cola
+                    # son sus boletas, y para eso alcanza con olvidar el resumen —el
+                    # ciclo siguiente las reagrupa en uno nuevo—. Sin esto, borrar la
+                    # fila del SFS dejaba al resumen sin rastro y sus boletas seguían
+                    # retenidas por algo que ya no existía.
+                    boletas_libres = _olvidar_resumen(num_docu)
+                    logger.warning(
+                        "El resumen %s no llegó a obtener ticket, así que SUNAT no lo "
+                        "recibió: se descarta y sus %d boleta(s) vuelven a la cola "
+                        "para armar uno nuevo.", num_docu, len(boletas_libres),
+                    )
+                else:
+                    _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
+                                         limpiar_error=False)
                 sfs.execute(
                     f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
                     f"AND IND_SITU IN ({marcas})",
