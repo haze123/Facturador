@@ -2698,6 +2698,31 @@ def _rdi_presente(ruc_emisor: str, numeracion_rc: str) -> bool:
     return os.path.exists(os.path.join(SFS_DATA_DIR, f"{base}.RDI"))
 
 
+def _descartar_archivos_de_resumen(ruc_emisor: str, numeracion_rc: str):
+    """
+    Saca de DATA el .RDI/.TRD de un resumen que se descarta.
+
+    Descartar un resumen libera sus boletas para que se reagrupen en uno nuevo, y eso
+    solo es seguro si el original no puede volver a salir por su cuenta. Borrar la fila
+    de DOCUMENTO no alcanza: esa tabla es lo que el daemon mira, pero quien realmente
+    envía es el SFS, y el SFS trabaja sobre los archivos de DATA. Peor todavía, es el
+    propio daemon quien se los vuelve a servir: sincronizar_bandeja_sfs() lo obliga a
+    releer DATA en cada ciclo, el archivo huérfano se registra de nuevo en la bandeja
+    con su numeración original, y _activar_pendientes_sfs_bd() lo manda.
+
+    El resultado son dos envíos del mismo contenido —el resumen original resucitado y
+    el nuevo que armó el daemon con las mismas boletas— sin que ninguna vía sepa de la
+    otra. Producción, 2026-09-10: el original salió aceptado y el nuevo volvió con
+    "2282: Existe documento ya informado anteriormente". No hubo declaración doble
+    porque SUNAT dedupica por contenido, pero eso es suerte, no garantía.
+
+    Es el mismo par que ya hace recuperar_cdr_pendientes() cuando SUNAT dice no tener
+    un comprobante: se borra la fila Y los archivos, juntos. Ver también
+    _borrar_si_existe(), que documenta este mismo riesgo para el caso de regenerar.
+    """
+    _eliminar_data_files(_nombre_archivo_rc(ruc_emisor, numeracion_rc))
+
+
 def _reportar_resumenes_trabados(ruc_emisor: str):
     """
     Avisa por cada resumen que retiene boletas y no termina de resolverse.
@@ -2997,6 +3022,7 @@ def resetear_rechazados(conn, ruc_emisor: str):
                     # fila del SFS dejaba al resumen sin rastro y sus boletas seguían
                     # retenidas por algo que ya no existía.
                     boletas_libres = _olvidar_resumen(num_docu)
+                    _descartar_archivos_de_resumen(ruc_emisor, num_docu)
                     logger.warning(
                         "El resumen %s no llegó a obtener ticket, así que SUNAT no lo "
                         "recibió: se descarta y sus %d boleta(s) vuelven a la cola "
@@ -3033,6 +3059,7 @@ def resetear_rechazados(conn, ruc_emisor: str):
                     esperando.append((tip_docu, num_docu, 0))
                     continue
                 boletas_libres = _olvidar_resumen(num_docu)
+                _descartar_archivos_de_resumen(ruc_emisor, num_docu)
                 logger.warning(
                     "El resumen %s quedó en error sin llegar a obtener ticket (%s). "
                     "SUNAT no lo recibió: se descarta y sus %d boleta(s) vuelven a la "

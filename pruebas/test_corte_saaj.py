@@ -36,6 +36,8 @@ logging.disable(logging.CRITICAL)
 TMP = tempfile.mkdtemp()
 m._REINTENTOS_PATH = os.path.join(TMP, "reintentos.json")
 m._RESUMENES_PATH = os.path.join(TMP, "resumenes.json")
+m.SFS_DATA_DIR = os.path.join(TMP, "DATA")
+os.makedirs(m.SFS_DATA_DIR, exist_ok=True)
 m.EMISOR_RUC_OVERRIDE = RUC = "20612016527"
 
 SAAJ = "Nro. Ticket: Problem writing SAAJ model to stream: e-factura.sunat.gob.pe"
@@ -111,11 +113,25 @@ def entrada(num_docu):
             .get(num_docu) or {})
 
 
+def data_files(num_docu):
+    """Deja el .RDI/.TRD como los escribe generar_resumen_diario()."""
+    base = m._nombre_archivo_rc(RUC, num_docu)
+    for ext in ("RDI", "TRD"):
+        open(os.path.join(m.SFS_DATA_DIR, "%s.%s" % (base, ext)), "w").write("x")
+    return base
+
+
+def en_data(base, ext):
+    return os.path.exists(os.path.join(m.SFS_DATA_DIR, "%s.%s" % (base, ext)))
+
+
 def limpiar():
     MARCADOS.clear()
     for p in (m._REINTENTOS_PATH, m._RESUMENES_PATH):
         if os.path.exists(p):
             os.remove(p)
+    for f in os.listdir(m.SFS_DATA_DIR):
+        os.remove(os.path.join(m.SFS_DATA_DIR, f))
 
 
 FALLAS = 0
@@ -150,6 +166,7 @@ check(not m._es_falla_de_red(LEER),
 print("\n[2] el resumen del incidente libera sus 1195 boletas")
 limpiar()
 m._registrar_resumen("RC-20260910-125", BOLETAS)
+base = data_files("RC-20260910-125")
 ruta = bd("RC-20260910-125", "06", SAAJ)
 m.resetear_rechazados(None, RUC)
 check(m._boletas_en_resumenes_activos(RUC) == set(),
@@ -158,6 +175,13 @@ check(bool(entrada("RC-20260910-125").get("descartado")),
       "el resumen queda marcado descartado, conservando su mapeo")
 check(MARCADOS == [], "no se llama a marcar_enviado() con una numeracion RC")
 
+# Sin esto queda una carrera: el SFS envia desde los archivos de DATA, no desde la
+# tabla, y sincronizar_bandeja_sfs() lo obliga a releer esa carpeta en cada ciclo. El
+# .RDI huerfano volvia a registrarse con la numeracion original y salia otra vez,
+# mientras el daemon armaba uno nuevo con las mismas boletas. Produccion 2026-09-10.
+check(not en_data(base, "RDI"), "el .RDI sale de DATA: el SFS ya no puede reenviarlo")
+check(not en_data(base, "TRD"), "y el .TRD tambien")
+
 
 # --- 3. lo mismo con un motivo que NO reconocemos ----------------------------
 # Es la mitad que importa a futuro: la lista es corta a proposito, asi que el camino
@@ -165,6 +189,7 @@ check(MARCADOS == [], "no se llama a marcar_enviado() con una numeracion RC")
 print("\n[3] un motivo desconocido tampoco deja el resumen muerto")
 limpiar()
 m._registrar_resumen("RC-20260910-126", BOLETAS)
+base = data_files("RC-20260910-126")
 ruta = bd("RC-20260910-126", "06", "Algo que todavia no sabemos leer")
 registros = con_log(lambda: m.resetear_rechazados(None, RUC))
 check(m._boletas_en_resumenes_activos(RUC) == set(),
@@ -176,6 +201,7 @@ check(any("sin llegar a obtener ticket" in r for r in registros),
 check(any("Algo que todavia no sabemos leer" in r for r in registros),
       "y deja a la vista el motivo que no supimos clasificar")
 check(MARCADOS == [], "sin marcar_enviado() inutil")
+check(not en_data(base, "RDI"), "sus archivos tambien salen de DATA")
 
 
 # --- 4. un resumen CON ticket no se toca -------------------------------------
@@ -184,6 +210,7 @@ check(MARCADOS == [], "sin marcar_enviado() inutil")
 print("\n[4] un resumen con ticket se deja para recuperar_cdr_resumenes()")
 limpiar()
 m._registrar_resumen("RC-20260910-127", BOLETAS)
+base = data_files("RC-20260910-127")
 ruta = bd("RC-20260910-127", "06", "Algo que todavia no sabemos leer", ticket="123456")
 m.resetear_rechazados(None, RUC)
 check(sigue_en_bandeja(ruta, "RC-20260910-127"),
@@ -192,6 +219,9 @@ check(not entrada("RC-20260910-127").get("descartado"),
       "no se descarta: SUNAT ya lo tiene")
 check(m._boletas_en_resumenes_activos(RUC) == set(BOLETAS),
       "y sus boletas siguen retenidas, que es lo correcto")
+# Los archivos NO se tocan: solo se borran al descartar. Borrarlos de un resumen que
+# SUNAT ya recibio le sacaria al SFS lo unico con que puede terminar de procesarlo.
+check(en_data(base, "RDI"), "y su .RDI se conserva: no se descarto nada")
 
 
 # --- 5. una factura sigue por su camino de siempre (sin regresion) -----------

@@ -116,6 +116,20 @@ Tres reglas del formato que el `.RDI` no perdona:
 
 SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una viene en su propio `<cac:DocumentResponse>`, que el esquema declara repetible. El daemon los recorre todos, guarda la observación en la `Factura` que corresponde y lo avisa en el log.
 
+### Reencolar un resumen trabado a mano
+
+Quien envía a SUNAT **no es el daemon, es el SFS** — y el SFS trabaja sobre los archivos de `SFS_DATA_DIR`, no sobre la tabla `DOCUMENTO`. Un resumen vive entonces en tres lugares, y reencolarlo a mano exige limpiar **los tres juntos y en el mismo momento**:
+
+1. su fila en `DOCUMENTO` (la bandeja del SFS),
+2. su entrada en `resumenes.json` (el mapeo de qué boletas lleva),
+3. su `.RDI` y `.TRD` en `SFS_DATA_DIR`.
+
+**Dejar el archivo atrás es lo que abre la carrera.** `sincronizar_bandeja_sfs()` obliga al SFS a releer `DATA` en cada ciclo: el `.RDI` huérfano se registra de nuevo en la bandeja con su **numeración original** y sale otra vez, mientras el daemon —que ya dio el resumen por perdido— arma uno nuevo con las mismas boletas. Las dos vías mandan el mismo contenido a SUNAT sin que ninguna sepa de la otra.
+
+Pasó en producción el 2026-09-10: el resumen original salió aceptado y el nuevo volvió con `2282 - Existe documento ya informado anteriormente`. No hubo declaración doble porque SUNAT deduplica por contenido — pero eso es suerte, no garantía, y una declaración doble solo se deshace con una comunicación de baja.
+
+Cuando el daemon descarta un resumen por su cuenta ya limpia los tres (`_descartar_archivos_de_resumen()`). Esto aplica a la intervención manual.
+
 ### Cuando el daemon se niega a generar el resumen
 
 Si un envío falla **sin devolver ticket**, el daemon da por hecho que SUNAT no lo recibió y devuelve sus boletas a la cola. Esa inferencia no siempre vale: durante un bloqueo prolongado un envío puede haber llegado igual y quedar encolado del lado de SUNAT, que lo acepta al recuperarse. Por eso la entrada de `resumenes.json` **no se borra**, solo se marca descartada — es el único registro de qué boletas llevaba, y sin él un CDR tardío no puede cerrar nada. Si ese CDR llega, el daemon cierra las boletas y avisa en el log; si además ya habían viajado en otro resumen, lo dice con `ERROR`, porque hay un **duplicado ante SUNAT que solo se deshace con una comunicación de baja**.
