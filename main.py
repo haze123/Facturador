@@ -2698,6 +2698,31 @@ def _rdi_presente(ruc_emisor: str, numeracion_rc: str) -> bool:
     return os.path.exists(os.path.join(SFS_DATA_DIR, f"{base}.RDI"))
 
 
+def _descartar_archivos_de_resumen(ruc_emisor: str, numeracion_rc: str):
+    """
+    Saca de DATA el .RDI/.TRD de un resumen que se descarta.
+
+    Descartar un resumen libera sus boletas para que se reagrupen en uno nuevo, y eso
+    solo es seguro si el original no puede volver a salir por su cuenta. Borrar la fila
+    de DOCUMENTO no alcanza: esa tabla es lo que el daemon mira, pero quien realmente
+    envía es el SFS, y el SFS trabaja sobre los archivos de DATA. Peor todavía, es el
+    propio daemon quien se los vuelve a servir: sincronizar_bandeja_sfs() lo obliga a
+    releer DATA en cada ciclo, el archivo huérfano se registra de nuevo en la bandeja
+    con su numeración original, y _activar_pendientes_sfs_bd() lo manda.
+
+    El resultado son dos envíos del mismo contenido —el resumen original resucitado y
+    el nuevo que armó el daemon con las mismas boletas— sin que ninguna vía sepa de la
+    otra. Producción, 2026-09-10: el original salió aceptado y el nuevo volvió con
+    "2282: Existe documento ya informado anteriormente". No hubo declaración doble
+    porque SUNAT dedupica por contenido, pero eso es suerte, no garantía.
+
+    Es el mismo par que ya hace recuperar_cdr_pendientes() cuando SUNAT dice no tener
+    un comprobante: se borra la fila Y los archivos, juntos. Ver también
+    _borrar_si_existe(), que documenta este mismo riesgo para el caso de regenerar.
+    """
+    _eliminar_data_files(_nombre_archivo_rc(ruc_emisor, numeracion_rc))
+
+
 def _reportar_resumenes_trabados(ruc_emisor: str):
     """
     Avisa por cada resumen que retiene boletas y no termina de resolverse.
@@ -2847,6 +2872,17 @@ def _limpiar_reintento(numeracion: str):
 # arregla esperando.
 _SENALES_DE_RED = (
     "could not send message",
+    # SAAJ es la capa SOAP de Java del SFS. "Problem writing SAAJ model to stream:
+    # e-factura.sunat.gob.pe" es que no pudo ni escribir la solicitud: el envio nunca
+    # salio. Confirmado en produccion (corte del 2026-09-10), donde dejo 6 resumenes
+    # sin salida reteniendo 1195 boletas.
+    #
+    # Dice "writing" a proposito y no "saaj model" a secas: SAAJ tambien lanza un
+    # "Problem READING SAAJ model from stream", y ese es el caso opuesto —la solicitud
+    # SI salio y lo que fallo fue leer la respuesta—. Ahi el envio pudo haber llegado a
+    # SUNAT, y tratarlo como corte de red autorizaria a reenviarlo: exactamente el
+    # duplicado que el resto de este archivo se esfuerza en evitar.
+    "problem writing saaj model",
     "connection timed out",
     "connect timed out",
     "read timed out",
@@ -2986,6 +3022,7 @@ def resetear_rechazados(conn, ruc_emisor: str):
                     # fila del SFS dejaba al resumen sin rastro y sus boletas seguían
                     # retenidas por algo que ya no existía.
                     boletas_libres = _olvidar_resumen(num_docu)
+                    _descartar_archivos_de_resumen(ruc_emisor, num_docu)
                     logger.warning(
                         "El resumen %s no llegó a obtener ticket, así que SUNAT no lo "
                         "recibió: se descarta y sus %d boleta(s) vuelven a la cola "
@@ -3000,6 +3037,41 @@ def resetear_rechazados(conn, ruc_emisor: str):
                     (ruc_emisor, tip_docu, num_docu, *_ESTADOS_ERROR),
                 )
                 reintentados.append((tip_docu, num_docu, f"corte {cortes}"))
+                continue
+
+            # De acá para abajo el motivo NO es de red: un rechazo real, o —lo que
+            # importa— uno que todavía no sabemos leer. La lista de _SENALES_DE_RED es
+            # corta a propósito, así que esta rama es donde cae lo desconocido, y para
+            # un resumen era un pozo: marcar_enviado() con una numeración RC no matchea
+            # ninguna fila de Comprobantes, el DELETE lo sacaba de la bandeja, y como
+            # nadie llamaba a _olvidar_resumen() su entrada quedaba sin marcar. El
+            # resumen desaparecía de todos lados menos de resumenes.json, donde seguía
+            # reteniendo sus boletas para siempre. Producción, 2026-09-10: 6 resúmenes
+            # así, 1195 boletas del día anterior retenidas por algo que ya no existía.
+            #
+            # Se decide con el ticket, el mismo criterio que la rama de red de arriba.
+            if tip_docu == _TIPO_RC:
+                if _ticket_de_resumen(ruc_emisor, num_docu):
+                    # SUNAT ya lo recibió: su CDR llega detrás de ese ticket y lo
+                    # resuelve recuperar_cdr_resumenes(). El ticket se lee de esta misma
+                    # fila, así que borrarla —lo que hacía antes— dejaba al resumen sin
+                    # nada que consultar y sin forma de cerrarse nunca.
+                    esperando.append((tip_docu, num_docu, 0))
+                    continue
+                boletas_libres = _olvidar_resumen(num_docu)
+                _descartar_archivos_de_resumen(ruc_emisor, num_docu)
+                logger.warning(
+                    "El resumen %s quedó en error sin llegar a obtener ticket (%s). "
+                    "SUNAT no lo recibió: se descarta y sus %d boleta(s) vuelven a la "
+                    "cola para armar uno nuevo.",
+                    num_docu, _texto(des_obse)[:120], len(boletas_libres),
+                )
+                sfs.execute(
+                    f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
+                    f"AND IND_SITU IN ({marcas})",
+                    (ruc_emisor, tip_docu, num_docu, *_ESTADOS_ERROR),
+                )
+                reintentados.append((tip_docu, num_docu, "resumen descartado"))
                 continue
 
             # Se consulta antes de sumar: al agotarse, el documento se queda en '10'
