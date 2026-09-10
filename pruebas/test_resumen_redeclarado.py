@@ -36,7 +36,7 @@ m.DIR_PROCESADOS = os.path.join(m.SFS_RPTA_DIR, "procesados")
 os.makedirs(m._SFS_FIRMA_DIR, exist_ok=True)
 os.makedirs(m.DIR_PROCESADOS, exist_ok=True)
 m.EMISOR_RUC_OVERRIDE = RUC = "20609785269"
-m._cerrar_resumen_en_sfs = lambda ruc, num: None
+m._cerrar_resumen_en_sfs = lambda ruc, num, veredicto="": None
 
 MARCADOS = []
 PENDIENTES = []

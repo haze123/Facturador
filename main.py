@@ -419,6 +419,11 @@ _CDR_ACEPTADOS = {"ACEPTADO", "OBSERVADO"}
 # es text y no tiene límite, pero un mensaje enorme de SUNAT no aporta nada.
 _MAX_ERRORS_SQL = 4000
 
+# DOCUMENTO.DES_OBSE del SFS es VARCHAR(250). SQLite no lo hace cumplir, pero la
+# aplicacion Java si lo lee con ese ancho: pasarse es arriesgarse a que lo corte de
+# una forma que no controlamos.
+_MAX_DES_OBSE = 250
+
 # Serializa el barrido de RPTA: watchdog lanza una llamada por cada CDR que aparece
 # y todas recorren el directorio completo (ver procesar_respuestas).
 _lock_cdr = threading.Lock()
@@ -1868,7 +1873,56 @@ def _ticket_de_resumen(ruc_emisor: str, numeracion: str) -> str:
     return _texto(fila[0]) if fila else ""
 
 
-def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str):
+def _veredicto_cdr(parsed: dict) -> str:
+    """
+    Lo que SUNAT contestó, en una línea, para DES_OBSE de la bandeja del SFS.
+
+    Ese campo es lo primero que mira una persona cuando algo sale mal, así que tiene
+    que decir la verdad. Hasta el 2026-09-09 se escribía un "Aceptado (CDR procesado)"
+    fijo, también cuando el CDR era un rechazo: quedaron 40 resúmenes rotulados
+    "Aceptado" de los cuales 39 SUNAT los había rechazado —34 con el código 2282,
+    "Existe documento ya informado anteriormente"—.
+
+    No hubo daño funcional: sus boletas siguieron en enviado=0, que es lo correcto. El
+    daño fue de diagnóstico. Ese texto llevó a concluir que había 143 boletas
+    declaradas 40 veces y que hacía falta una comunicación de baja ante SUNAT, cuando
+    en realidad SUNAT había rechazado los repetidos y no había ningún duplicado. La
+    conclusión correcta recién apareció al abrir los CDR archivados a mano.
+    """
+    estado = _texto(parsed.get("status")) or "PROCESADO"
+    texto = estado.capitalize()
+    codigo = _texto(parsed.get("codigo"))
+    if codigo:
+        texto += f" — código {codigo}"
+    descripcion = _texto(parsed.get("descripcion"))
+    if descripcion:
+        texto += f": {descripcion}"
+    return texto[:_MAX_DES_OBSE]
+
+
+def _veredicto_archivado(ruc: str, tip: str, num: str) -> str:
+    """
+    Veredicto leído del CDR que ya está en disco, para cerrar sin tener que afirmarlo.
+
+    Hace falta donde se cierra un documento por el solo hecho de que su CDR existe
+    —ver _activar_pendientes_sfs_bd() y el rescate de recuperar_cdr_resumenes()—: ahí
+    no hay un `parsed` a mano, y suponer "aceptado" es exactamente lo que hacía mentir
+    a la bandeja. Si el archivo no se puede leer, el texto lo dice en vez de inventar
+    un veredicto.
+    """
+    for carpeta in (DIR_PROCESADOS, SFS_RPTA_DIR):
+        ruta = os.path.join(carpeta, f"R{ruc}-{tip}-{num}.zip")
+        try:
+            with zipfile.ZipFile(ruta) as z:
+                xmls = [n for n in z.namelist() if n.lower().endswith(".xml")]
+                if xmls:
+                    return _veredicto_cdr(parsear_xml_cdr(z.read(xmls[0])))
+        except (OSError, zipfile.BadZipFile, ET.ParseError):
+            continue
+    return "CDR procesado; ver el CDR archivado"
+
+
+def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str, veredicto: str = ""):
     """
     Da por cerrado el resumen en la bandeja del SFS una vez que su CDR está en RPTA.
 
@@ -1892,13 +1946,19 @@ def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str):
     """
     if not os.path.exists(SFS_BD_PATH):
         return
+    # El '03' es el mismo para un aceptado y para un rechazado —significa "ya no me
+    # ocupo de esto"—, así que el único lugar donde se puede leer qué contestó SUNAT
+    # es este texto. Quien llama pasa el veredicto que ya tiene; si no lo tiene, se lo
+    # lee del CDR archivado en vez de suponerlo.
+    obse = veredicto or _veredicto_archivado(ruc_emisor, _TIPO_RC, numeracion)
     try:
         with _sfs_bd(escritura=True) as sfs:
             sfs.execute(
-                f"UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE='Aceptado (CDR procesado)' "
+                f"UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE=? "
                 f"WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
                 f"AND IND_SITU IN ({_marcas(len(_ESTADOS_RESUMEN_ABIERTO))})",
-                (ruc_emisor, _TIPO_RC, numeracion, *_ESTADOS_RESUMEN_ABIERTO),
+                (obse[:_MAX_DES_OBSE], ruc_emisor, _TIPO_RC, numeracion,
+                 *_ESTADOS_RESUMEN_ABIERTO),
             )
     except sqlite3.Error:
         logger.exception("No se pudo cerrar el resumen %s en la bandeja del SFS.", numeracion)
@@ -2130,10 +2190,13 @@ def _activar_pendientes_sfs_bd(ruc_emisor: str, ya_procesados: list):
             if (tip, num) in ya_keys:
                 continue
             if _tiene_cdr(ruc_emisor, tip, num):
+                # Se cierra porque el CDR existe, no porque diga que fue aceptado: hay
+                # que leerlo para no rotular "Aceptado" algo que SUNAT rechazó.
                 sfs.execute(
-                    "UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE='Aceptado (CDR procesado)' "
+                    "UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE=? "
                     "WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? AND IND_SITU IN ('01','02')",
-                    (ruc_emisor, tip, num),
+                    (_veredicto_archivado(ruc_emisor, tip, num)[:_MAX_DES_OBSE],
+                     ruc_emisor, tip, num),
                 )
                 _eliminar_data_files(nom_arch or f"{ruc_emisor}-{tip}-{num}")
                 continue
@@ -3322,7 +3385,7 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
         # Recién ahora el resumen esta terminado de verdad: sus boletas limpias ya
         # quedaron cerradas. Marcarlo antes liberaba las boletas mientras todavia
         # figuraban pendientes, y se generaba otro resumen con ellas.
-        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
+        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion, _veredicto_cdr(parsed))
         logger.info(
             "Resumen %s aceptado: %d boleta(s) marcadas enviado=1%s.",
             numeracion, filas,
@@ -3369,8 +3432,10 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
                              detalle[:_MAX_ERRORS_SQL])
         # Aunque haya sido rechazado, el ticket ya se consumio: dejarlo abierto
         # haria que se lo siguiera consultando en vano en cada ciclo. El motivo
-        # del rechazo queda en Factura.errors, que es donde se consulta.
-        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
+        # del rechazo queda en Factura.errors, que es donde se consulta —y tambien
+        # en la bandeja del SFS, que es lo primero que alguien mira: este es
+        # justamente el camino que rotulaba "Aceptado" un resumen rechazado.
+        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion, _veredicto_cdr(parsed))
         return filas > 0
 
     filas = _escribir_bd(_bd().guardar_error, conn, numeracion,
