@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 logs/
-facturador.log
+facturador.log*
 reintentos.json
 resumenes.json
 

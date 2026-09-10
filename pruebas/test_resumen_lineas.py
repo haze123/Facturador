@@ -1,4 +1,4 @@
-import os, sys, tempfile, json
+import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["SFS_DATA_DIR"] = tempfile.mkdtemp()
 import main, logging
@@ -22,7 +22,7 @@ class FakeBD:
     marcar_enviados = staticmethod(fake_marcar_enviados)
 main._bd = lambda: FakeBD()
 main._escribir_bd = lambda fn, conn, *a: fn(conn, *a)
-main._cerrar_resumen_en_sfs = lambda ruc, num: None
+main._cerrar_resumen_en_sfs = lambda ruc, num, veredicto="": None
 main.EMISOR_RUC_OVERRIDE = "20609785269"
 
 def reset():

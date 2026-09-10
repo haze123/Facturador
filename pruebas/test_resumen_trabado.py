@@ -397,8 +397,13 @@ resumenes(["B003-000001"])
 m.resetear_rechazados(None, RUC)
 # Un RC vuelve a la cola descartandose --sus boletas se reagrupan en uno nuevo--, no
 # con marcar_enviado(), que con la numeracion de un resumen no matchea ninguna fila.
-check(RC not in (json.load(open(m._RESUMENES_PATH)).get("resumenes") or {}),
+# La entrada NO se borra: se marca descartada. Borrarla dejaba sin mapeo a un CDR que
+# llegara tarde, y de ahi salia el bucle de redeclaracion del 2026-09-09.
+entrada_rc = (json.load(open(m._RESUMENES_PATH)).get("resumenes") or {}).get(RC) or {}
+check(bool(entrada_rc.get("descartado")),
       "sin ticket se descarta para volver a armarse")
+check(entrada_rc.get("boletas") == ["B003-000001"],
+      "y conserva que boletas llevaba, para un CDR tardio")
 c = sqlite3.connect(ruta_bd)
 quedan = c.execute("SELECT COUNT(*) FROM DOCUMENTO WHERE NUM_DOCU=?", (RC,)).fetchone()[0]
 c.close()
@@ -442,8 +447,9 @@ resumenes(BOLETAS_RC)
 registros = con_log(lambda: m.resetear_rechazados(None, RUC))
 check(m._boletas_en_resumenes_activos(RUC) == set(),
       "sin ticket, las 200 boletas quedan libres para un resumen nuevo")
-check(RC not in (json.load(open(m._RESUMENES_PATH)).get("resumenes") or {}),
-      "y el resumen descartado sale de resumenes.json")
+check(bool(((json.load(open(m._RESUMENES_PATH)).get("resumenes") or {}).get(RC) or {})
+           .get("descartado")),
+      "y el resumen queda marcado como descartado, sin perder su mapeo")
 texto = " ".join(t for _, t in registros)
 check("200" in texto, "el log dice cuantas boletas vuelven a la cola")
 check(MARCADOS == [],
