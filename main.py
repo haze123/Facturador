@@ -406,11 +406,11 @@ _ESPERA_XML_SEG        = 2   # tras pedir la generación del XML
 _ESPERA_REINTENTO_SEG  = 3   # antes de reintentar un envío que falló
 _ESPERA_ENTRE_DOCS_SEG = 1   # para no saturar al SFS documento tras documento
 
-# Estados de la columna Comprobante.enviado, que es boolean: no admite un estado
-# intermedio. El "entregado al SFS, esperando CDR" se deduce de la BD del SFS,
-# ver _docs_en_vuelo().
+# Estado de la columna Comprobante.enviado, que es boolean: no admite un estado
+# intermedio. True significa "SUNAT devolvió un CDR de aceptación" y lo escriben
+# los adaptadores por su cuenta; el "entregado al SFS, esperando CDR" no se guarda
+# acá, se deduce de la BD del SFS (ver _docs_en_vuelo()).
 ENVIADO_PENDIENTE = False   # por generar / reintentar
-ENVIADO_ACEPTADO  = True    # SUNAT devolvió un CDR de aceptación
 
 # Estados de CDR que dan por buena la emisión (SUNAT acepta con y sin observaciones)
 _CDR_ACEPTADOS = {"ACEPTADO", "OBSERVADO"}
