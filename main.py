@@ -53,6 +53,10 @@ DB_TIMEOUT_SEG = int(os.getenv("DB_TIMEOUT_SEG", "30"))
 # Rutas SFS
 SFS_DATA_DIR = p if os.path.exists(p := os.getenv("SFS_DATA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\DATA")) else os.path.join(_BASE, "sunat_archivos", "DATA")
 SFS_RPTA_DIR = p if os.path.exists(p := os.getenv("SFS_RPTA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\RPTA")) else os.path.join(_BASE, "sunat_archivos", "RPTA")
+# Donde el SFS deja el XML firmado de cada documento. Se deriva de DATA en vez de
+# configurarse aparte porque son hermanas dentro de sunat_archivos/sfs: si alguien
+# mueve la instalacion, DATA ya trae la ruta nueva y esta la sigue sola.
+_SFS_FIRMA_DIR = os.path.join(os.path.dirname(SFS_DATA_DIR), "FIRMA")
 
 SFS_BD_PATH  = os.getenv("SFS_BD_PATH",  r"C:\SFS_v-2.1\bd\BDFacturador.db")
 SFS_BASE_URL = os.getenv("SFS_BASE_URL", "http://localhost:9000")
@@ -208,6 +212,29 @@ MOTIVO_NOTA_POR_DEFECTO = os.getenv("MOTIVO_NOTA_POR_DEFECTO", "").strip()
 # El max(1, ...) no es paranoia: con un 0 en el .env el resumen salia vacio, y con
 # un negativo descartaba boletas en silencio.
 MAX_BOLETAS_RESUMEN = max(1, min(int(os.getenv("MAX_BOLETAS_RESUMEN", "200")), 500))
+
+# Frenos contra el bucle de redeclaración. Visto en produccion el 2026-09-09, tras un
+# bloqueo de SUNAT de ~19 horas: 84 resumenes en un dia —lo normal son 2— y 143 boletas
+# declaradas 40 veces cada una, sin que nada lo notara ni lo frenara en horas.
+#
+# El ciclo era: el envio falla sin ticket, se descarta el resumen, las boletas vuelven a
+# la cola, se arma otro, SUNAT contesta "2282 - Existe documento ya informado
+# anteriormente", y otra vez. Cada vuelta suma un duplicado ante SUNAT, y un duplicado
+# solo se deshace con una comunicacion de baja: por eso acá conviene errar por frenar de
+# mas. Detenerse y pedir intervencion cuesta una demora; seguir declarando cuesta un
+# tramite por cada boleta.
+#
+# Son dos topes porque atajan el problema en momentos distintos: el de declaraciones
+# frena el lote concreto que esta girando en falso, y el diario es la red de seguridad
+# por si el bucle aparece de una forma que no previmos.
+MAX_DECLARACIONES_BOLETA = max(1, int(os.getenv("MAX_DECLARACIONES_BOLETA", "3")))
+MAX_RESUMENES_DIA = max(1, int(os.getenv("MAX_RESUMENES_DIA", "20")))
+
+# Cuanto se conserva la entrada de un resumen ya resuelto en resumenes.json. El margen
+# es amplio a proposito: ese archivo es el unico registro de que boletas llevo cada
+# resumen, y es lo que permitio reconstruir las 143 del incidente del 2026-09-09.
+# Perderlo temprano deja ciego al proximo diagnostico, y lo que se ahorra son kilobytes.
+DIAS_RETENCION_RESUMENES = max(1, int(os.getenv("DIAS_RETENCION_RESUMENES", "30")))
 
 # Techo del backoff con el que se reintenta un comprobante trabado por un corte de
 # red. No gasta presupuesto de reintentos (ver _es_falla_de_red), así que necesita
@@ -1179,6 +1206,21 @@ def generar_resumen_diario(conn, ruc_emisor: str):
         )
 
     hoy = datetime.now()
+    numeraciones = [b["numeracion_comprobante"] for b in boletas]
+
+    # Antes de armar nada: si este mismo lote ya viene girando en falso, frenar. Sin
+    # esto el ciclo armó, mandó y descartó 84 resúmenes en un día (2026-09-09),
+    # declarando las mismas boletas una y otra vez ante SUNAT.
+    motivo = _motivo_para_frenar(numeraciones, hoy.strftime("%Y%m%d"))
+    if motivo:
+        logger.error(
+            "NO se genera el resumen diario: %s. REQUIERE REVISIÓN MANUAL: verificar en "
+            "el portal de SUNAT cuáles de esas boletas ya están declaradas antes de "
+            "volver a intentarlo; cada intento de más es un duplicado que solo se "
+            "deshace con una comunicación de baja.", motivo,
+        )
+        return None
+
     fecha_resumen = hoy.strftime("%Y-%m-%d")
     numeracion_rc = _siguiente_numeracion_rc(hoy.strftime("%Y%m%d"))
     base = _nombre_archivo_rc(ruc_emisor, numeracion_rc)
@@ -1194,7 +1236,6 @@ def generar_resumen_diario(conn, ruc_emisor: str):
     escribir_archivo(os.path.join(SFS_DATA_DIR, f"{base}.RDI"), "".join(lineas_rdi))
     escribir_archivo(os.path.join(SFS_DATA_DIR, f"{base}.TRD"), "".join(lineas_trd))
 
-    numeraciones = [b["numeracion_comprobante"] for b in boletas]
     _registrar_resumen(numeracion_rc, numeraciones)
     # Con un tope de 200 la lista entera hacia una linea de log de miles de
     # caracteres por resumen. El detalle completo vive en resumenes.json.
@@ -2290,25 +2331,242 @@ def _registrar_resumen(numeracion_rc: str, boletas: list):
 
 def _olvidar_resumen(numeracion_rc: str) -> list:
     """
-    Borra el registro de un resumen y devuelve las boletas que tenía.
+    Libera las boletas de un resumen que no llegó a SUNAT y devuelve cuáles eran,
+    CONSERVANDO el registro de qué llevaba.
 
-    Solo corresponde cuando hay certeza de que SUNAT nunca lo recibió —un envío que
-    fallo sin llegar a devolver ticket—, porque libera sus boletas para que se
-    reagrupen en un resumen nuevo. Es la misma intervención que hasta ahora había que
-    hacer a mano sobre resumenes.json.
+    Corresponde cuando el envío falló sin devolver ticket, porque libera sus boletas
+    para que se reagrupen en un resumen nuevo. Sin esto, reencolar un resumen no
+    alcanzaba: al borrar su fila de la bandeja del SFS quedaba sin rastro, y
+    _boletas_en_resumenes_activos() retiene ante la falta de rastro —correctamente,
+    porque ahí no sabe qué paso—. Las boletas quedaban retenidas por un resumen que ya
+    no existía: un bloqueo cambiado por otro.
 
-    Sin esto, reencolar un resumen no alcanzaba: al borrar su fila de la bandeja del
-    SFS quedaba sin rastro, y _boletas_en_resumenes_activos() retiene ante la falta
-    de rastro —correctamente, porque ahí no sabe qué paso—. Las boletas quedaban
-    retenidas por un resumen que ya no existía: un bloqueo cambiado por otro.
+    Hasta el 2026-09-09 esto hacía un pop() de la entrada, y eso son dos cosas
+    distintas pegadas en una: LIBERAR las boletas —correcto— y OLVIDAR cuáles eran
+    —nunca correcto—. La inferencia "sin ticket ⇒ SUNAT no lo recibió" no siempre
+    vale: durante un bloqueo de ~19 horas varios envíos sí habían llegado y quedaron
+    encolados del lado de SUNAT, que los aceptó al recuperarse. Ese CDR tardío llegaba
+    a _actualizar_sql_cdr() y se encontraba sin mapeo, así que no podía cerrar nada;
+    las boletas seguían en enviado=0, el ciclo las reagrupaba, y arrancaba el bucle de
+    redeclaración que dejó 143 boletas declaradas 40 veces.
+
+    Por eso la entrada se marca como descartada en vez de borrarse: es el único dato
+    que permite honrar un CDR que llegue después. La poda de _podar_resumenes() se
+    encarga de que el archivo no crezca sin fin.
     """
     with _lock_resumenes:
         datos = _leer_resumenes()
-        entrada = (datos.get("resumenes") or {}).pop(numeracion_rc, None)
+        entrada = (datos.get("resumenes") or {}).get(numeracion_rc)
         if entrada is None:
             return []
+        entrada["descartado"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _guardar_resumenes(datos)
     return entrada.get("boletas", [])
+
+
+def _resumen_descartado(numeracion_rc: str) -> str:
+    """Cuándo se descartó este resumen, o "" si sigue vigente."""
+    entrada = _leer_resumenes().get("resumenes", {}).get(numeracion_rc) or {}
+    return _texto(entrada.get("descartado"))
+
+
+def _marcar_resumen_cerrado(numeracion_rc: str, boletas: list = None):
+    """
+    Deja constancia de que este resumen ya cerró sus boletas.
+
+    Es la única evidencia positiva de que se resolvió: la fila del SFS se limpia con
+    el tiempo, y sin esto no habría forma de distinguir un resumen terminado de uno
+    que quedó a medias. La poda lo necesita para no borrar entradas que todavía
+    pueden hacer falta, y _boletas_en_resumenes_activos() para no avisar de un
+    resumen "sin rastro" que en realidad terminó bien.
+    """
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _lock_resumenes:
+        datos = _leer_resumenes()
+        resumenes = datos.setdefault("resumenes", {})
+        # Puede no existir si el mapeo se reconstruyó desde FIRMA/: se crea igual, para
+        # que quede el registro de qué boletas se cerraron y con qué resumen.
+        entrada = resumenes.setdefault(numeracion_rc, {"boletas": list(boletas or []),
+                                                       "generado": ahora})
+        entrada["cerrado"] = ahora
+        entrada.pop("descartado", None)   # llegó su CDR: ya no está descartado
+        _guardar_resumenes(datos)
+
+
+def _resumenes_que_repiten(numeracion_rc: str, boletas: list) -> list:
+    """
+    Otros resúmenes vigentes que declaran alguna de estas mismas boletas.
+
+    Sirve para reconocer un duplicado ante SUNAT sin consultarle nada: si el CDR de un
+    resumen descartado llega aceptado y sus boletas ya viajaron en otro resumen, esas
+    boletas están declaradas dos veces y alguien va a tener que dar una de baja.
+    """
+    propias = set(boletas)
+    repiten = []
+    for otro, entrada in _leer_resumenes().get("resumenes", {}).items():
+        if otro == numeracion_rc or entrada.get("descartado"):
+            continue
+        if propias.intersection(entrada.get("boletas", [])):
+            repiten.append(otro)
+    return sorted(repiten)
+
+
+def _boletas_desde_firma(ruc_emisor: str, numeracion_rc: str) -> list:
+    """
+    Reconstruye qué boletas llevaba un resumen leyendo su XML firmado en FIRMA/.
+
+    Último recurso para cuando la entrada de resumenes.json ya no está: el XML es lo
+    que se le declaró a SUNAT, así que su lista de <cbc:ID> es la fuente autoritativa.
+    Así se recuperaron a mano las 143 boletas del incidente del 2026-09-09, y así se
+    pueden cerrar los CDR tardíos de los resúmenes que se descartaron ANTES de este
+    arreglo —esas entradas ya se borraron y no hay forma de recuperarlas de otro lado—.
+
+    El <cbc:ID> del propio resumen (RC-YYYYMMDD-NNN) no entra: el patrón exige los 4
+    caracteres de una serie SUNAT, y el del resumen tiene solo 2 letras antes del guión.
+    """
+    ruta = os.path.join(_SFS_FIRMA_DIR, f"{_nombre_archivo_rc(ruc_emisor, numeracion_rc)}.xml")
+    try:
+        root = ET.parse(ruta).getroot()
+    except (OSError, ET.ParseError):
+        return []
+    boletas = []
+    for elem in root.iter():
+        if not isinstance(elem.tag, str) or elem.tag.split("}")[-1].lower() != "id":
+            continue
+        texto = _texto(elem.text)
+        if re.fullmatch(r"[A-Z][A-Z0-9]{3}-\d+", texto):
+            boletas.append(texto)
+    return list(dict.fromkeys(boletas))   # sin duplicados y en el orden del XML
+
+
+def _motivo_para_frenar(boletas: list, fecha: str) -> str:
+    """
+    Por qué NO se debería armar otro resumen ahora mismo, o "" si se puede.
+
+    El 2026-09-09 el ciclo armó, mandó y descartó 84 resúmenes en un día sin que nada
+    lo notara: cada vuelta declaraba otra vez las mismas 143 boletas, y ninguna alarma
+    distinguía eso de la operación normal. Frenar y pedir intervención cuesta una
+    demora; seguir girando cuesta una comunicación de baja por cada boleta duplicada.
+
+    Se mira cuántas veces se declaró cada boleta candidata y cuántos resúmenes lleva el
+    día. Lo primero ataja el lote concreto que está girando en falso —es la señal más
+    directa—; lo segundo es la red de seguridad por si el bucle vuelve de otra forma.
+    """
+    veces = {}
+    buscadas = set(boletas)
+    for entrada in _leer_resumenes().get("resumenes", {}).values():
+        for b in buscadas.intersection(entrada.get("boletas", [])):
+            veces[b] = veces.get(b, 0) + 1
+
+    repetidas = sorted(b for b, v in veces.items() if v >= MAX_DECLARACIONES_BOLETA)
+    if repetidas:
+        muestra = ", ".join(repetidas[:_MAX_BLOQUEADOS_LOG])
+        if len(repetidas) > _MAX_BLOQUEADOS_LOG:
+            muestra += f" ... y {len(repetidas) - _MAX_BLOQUEADOS_LOG} mas"
+        return (
+            f"{len(repetidas)} boleta(s) ya se declararon {MAX_DECLARACIONES_BOLETA} "
+            f"veces o mas sin cerrarse: {muestra}"
+        )
+
+    prefijo = f"{_TIPO_RC}-{fecha}-"
+    del_dia = sum(1 for n in _leer_resumenes().get("resumenes", {}) if n.startswith(prefijo))
+    if del_dia >= MAX_RESUMENES_DIA:
+        return f"ya se generaron {del_dia} resúmenes hoy (tope {MAX_RESUMENES_DIA})"
+    return ""
+
+
+def _numeraciones_pendientes(conn, numeraciones) -> set:
+    """Cuáles de estas numeraciones siguen en enviado=0."""
+    buscadas = set(numeraciones)
+    return {n for f in _bd().pendientes(conn)
+            if (n := _texto(f.get("numeracion_comprobante"))) in buscadas}
+
+
+def _resumen_vencido(numeracion_rc: str, entrada: dict, ahora: datetime) -> bool:
+    """
+    True si esta entrada ya cumplió su función y superó el margen de retención.
+
+    Una entrada hace falta mientras su resumen pueda todavía resolverse: hasta que su
+    CDR llegue y cierre sus boletas, más un margen holgado por si llega tarde —que es
+    justamente el caso que _olvidar_resumen() viene a cubrir—.
+
+    Un resumen SIN resolver no se poda por viejo que sea: ahí la antigüedad es
+    exactamente la señal de que algo quedó trabado, y borrarlo perdería el único
+    registro de qué boletas retiene.
+    """
+    try:
+        generado = datetime.strptime(_texto(entrada.get("generado")), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False   # sin fecha legible no se toca nada
+    if (ahora - generado).days < DIAS_RETENCION_RESUMENES:
+        return False
+    if entrada.get("cerrado") or entrada.get("descartado"):
+        return True
+    # Sin marca propia, el CDR en disco alcanza como prueba de que se resolvió: cubre
+    # las entradas anteriores a que existieran esas marcas.
+    return _tiene_cdr(EMISOR_RUC_OVERRIDE, _TIPO_RC, numeracion_rc)
+
+
+def _podar_resumenes(conn):
+    """
+    Saca de resumenes.json las entradas ya resueltas que pasaron el margen.
+
+    Hasta el 2026-09-09 nada podaba ese archivo: la única eliminación era el pop() de
+    _olvidar_resumen(), que es justamente lo que este arreglo dejó de hacer. Sin una
+    política de retención el archivo solo crece —199 KB y 8.432 referencias a boletas
+    al momento del incidente, con entradas de 11 días atrás que ya no cumplían ninguna
+    función—.
+
+    Corre una vez por día porque es mantenimiento, no parte del flujo: así la consulta
+    de pendientes que necesita no se repite en cada ciclo.
+
+    Dos entradas nunca se podan, por viejas que sean: una cuyo resumen siga sin
+    resolverse (ver _resumen_vencido) y una cuyas boletas sigan en enviado=0 aunque el
+    resumen figure cerrado —pasa cuando SUNAT observó alguna línea y esa boleta quedó
+    afuera, y su mapeo es lo que permite entender por qué—.
+    """
+    ahora = datetime.now()
+    datos = _leer_resumenes()
+    try:
+        ultima = datetime.strptime(_texto(datos.get("ultima_poda")), "%Y-%m-%d %H:%M:%S")
+        if (ahora - ultima).total_seconds() < 24 * 3600:
+            return
+    except ValueError:
+        pass   # nunca se podó, o la marca está ilegible: se poda ahora
+
+    vencidas = {n: e for n, e in (datos.get("resumenes") or {}).items()
+                if _resumen_vencido(n, e, ahora)}
+    pendientes = _numeraciones_pendientes(
+        conn, {b for e in vencidas.values() for b in e.get("boletas", [])},
+    ) if vencidas else set()
+
+    podadas, retenidas = [], []
+    with _lock_resumenes:
+        datos = _leer_resumenes()      # releer bajo el lock: el ciclo pudo tocarlo
+        resumenes = datos.setdefault("resumenes", {})
+        for numeracion_rc in vencidas:
+            entrada = resumenes.get(numeracion_rc)
+            if entrada is None:
+                continue
+            if any(b in pendientes for b in entrada.get("boletas", [])):
+                retenidas.append(numeracion_rc)
+                continue
+            resumenes.pop(numeracion_rc, None)
+            podadas.append(numeracion_rc)
+        datos["ultima_poda"] = ahora.strftime("%Y-%m-%d %H:%M:%S")
+        _guardar_resumenes(datos)
+
+    if podadas:
+        logger.info(
+            "Poda de %s: se sacaron %d resumen(es) resueltos de mas de %d dias; "
+            "quedan %d.", os.path.basename(_RESUMENES_PATH), len(podadas),
+            DIAS_RETENCION_RESUMENES, len(resumenes),
+        )
+    if retenidas:
+        logger.warning(
+            "%d resumen(es) viejos se conservan porque todavia tienen boletas en "
+            "enviado=0: %s", len(retenidas), ", ".join(retenidas[:_MAX_BLOQUEADOS_LOG]),
+        )
 
 
 def _boletas_de_resumen(numeracion_rc: str) -> list:
@@ -2334,6 +2592,17 @@ def _boletas_en_resumenes_activos(ruc_emisor: str) -> set:
     activas = set()
     for numeracion_rc, entrada in _leer_resumenes().get("resumenes", {}).items():
         boletas = entrada.get("boletas", [])
+        # Descartado: sus boletas ya volvieron a la cola a propósito, retenerlas acá
+        # las dejaría sin poder entrar a ningún resumen nuevo. La entrada sigue en el
+        # archivo solo para poder honrar un CDR que llegue tarde (ver
+        # _olvidar_resumen), no para bloquear nada.
+        #
+        # Cerrado: sus boletas quedaron en enviado=1 y obtener_boletas_para_resumen()
+        # ya las filtra por su cuenta. Hace falta mirarlo acá igual porque la fila del
+        # SFS se limpia con el tiempo, y sin esta marca la entrada caía en la rama de
+        # "sin rastro" de abajo y avisaba en cada ciclo de un resumen que terminó bien.
+        if entrada.get("descartado") or entrada.get("cerrado"):
+            continue
         situ, _ = en_vuelo.get((_TIPO_RC, numeracion_rc), ("", ""))
         if situ and situ not in _ESTADOS_CERRADOS:
             activas.update(boletas)
@@ -2997,12 +3266,40 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
         # cierre es un fan-out a todas las que se guardaron en resumenes.json cuando
         # se generó, no un UPDATE de una sola fila.
         boletas = _boletas_de_resumen(numeracion)
+        descartado = _resumen_descartado(numeracion)
+        if not boletas:
+            # Antes de darse por vencido, reconstruir desde el XML firmado: las
+            # entradas que borró la versión anterior de _olvidar_resumen() ya no están,
+            # y sus CDR tardíos tienen que poder cerrar sus boletas igual.
+            boletas = _boletas_desde_firma(EMISOR_RUC_OVERRIDE, numeracion)
+            if boletas:
+                logger.warning(
+                    "El resumen %s no figura en %s; sus %d boleta(s) se reconstruyeron "
+                    "desde el XML firmado en FIRMA/.",
+                    numeracion, os.path.basename(_RESUMENES_PATH), len(boletas),
+                )
         if not boletas:
             logger.error(
                 "CDR aceptado del resumen %s pero no hay boletas registradas para él "
-                "en resumenes.json; quedan en enviado=0.", numeracion,
+                "en %s ni se pudo reconstruir desde FIRMA/; quedan en enviado=0.",
+                numeracion, os.path.basename(_RESUMENES_PATH),
             )
             return False
+
+        if descartado:
+            # SUNAT sí lo había recibido: se lo descartó dando por hecho que no, porque
+            # el envío falló sin devolver ticket. Ahora hay que avisarlo fuerte, porque
+            # si esas boletas ya viajaron en otro resumen aceptado están declaradas dos
+            # veces ante SUNAT y eso solo se deshace con una comunicación de baja.
+            repiten = _resumenes_que_repiten(numeracion, boletas)
+            logger.error(
+                "El resumen %s se había descartado el %s por no obtener ticket, pero "
+                "SUNAT lo aceptó: sus %d boleta(s) se cierran igual.%s",
+                numeracion, descartado, len(boletas),
+                (" ATENCIÓN: esas boletas también se declararon en %s, así que hay un "
+                 "duplicado ante SUNAT que requiere comunicación de baja."
+                 % ", ".join(repiten)) if repiten else "",
+            )
 
         # Separa las que SUNAT registró de verdad (limpias) de las que su propia
         # línea vino con código — esas NO se marcan enviado=1 aunque el resumen
@@ -3018,6 +3315,10 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
 
         _limpiar_reintento(numeracion)
         _limpiar_reintentos(limpias)
+        # Deja constancia de que este resumen ya cerró: es lo que distingue una entrada
+        # terminada de una a medias cuando su fila del SFS ya se limpió, y sin eso la
+        # poda no sabría cuál puede sacar del archivo.
+        _marcar_resumen_cerrado(numeracion, boletas)
         # Recién ahora el resumen esta terminado de verdad: sus boletas limpias ya
         # quedaron cerradas. Marcarlo antes liberaba las boletas mientras todavia
         # figuraban pendientes, y se generaba otro resumen con ellas.
@@ -3338,6 +3639,14 @@ def ciclo_generacion():
                 docs_generados.append(resumen_doc)
         except Exception:
             logger.exception("Error generando el resumen diario de boletas")
+
+        # Mantenimiento de resumenes.json, no parte del flujo: se hace después de
+        # generar para que una falla acá nunca impida emitir un resumen, y por su
+        # cuenta corre una sola vez al día (ver _podar_resumenes).
+        try:
+            _podar_resumenes(conn)
+        except Exception:
+            logger.exception("Error podando %s", os.path.basename(_RESUMENES_PATH))
 
         _reportar_clasificacion(fuera_alcance, omitidos, bloqueados)
         # Va aparte porque los resúmenes no son filas de Comprobantes y por eso nunca
